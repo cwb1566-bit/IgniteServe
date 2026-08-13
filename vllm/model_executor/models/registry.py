@@ -4,7 +4,10 @@
 Whenever you add an architecture to this page, please also update
 `tests/models/registry.py` with example HuggingFace models for it.
 """
+import hashlib
 import importlib
+import importlib.util
+import json
 import os
 import pickle
 import subprocess
@@ -12,7 +15,7 @@ import sys
 import tempfile
 from abc import ABC, abstractmethod
 from collections.abc import Set
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from typing import Callable, Optional, TypeVar, Union
 
@@ -301,6 +304,83 @@ class _ModelInfo:
         )
 
 
+def _model_info_cache_key(module_name: str, class_name: str) -> Optional[str]:
+    """Build a disk-cache key for a lazily-registered model's ``_ModelInfo``.
+
+    Returns ``None`` (i.e. caching disabled) unless startup optimizations are
+    enabled. The key is invalidated by vLLM version changes and by edits to the
+    model's source file (mtime + size), so a stale cache is never used.
+    """
+    try:
+        from vllm.compilation.startup_resources import (
+            startup_optimizations_enabled)
+        if not startup_optimizations_enabled():
+            return None
+    except Exception:
+        return None
+
+    parts = [module_name, class_name]
+    try:
+        from vllm.version import __version__ as vllm_version
+        parts.append(vllm_version)
+    except Exception:
+        parts.append("unknown")
+
+    # Include the model source file's mtime+size so local code edits
+    # automatically invalidate the cache. Resolved via find_spec, which does
+    # NOT import the (heavy) model module itself.
+    try:
+        spec = importlib.util.find_spec(module_name)
+        if spec is not None and spec.origin and os.path.isfile(spec.origin):
+            st = os.stat(spec.origin)
+            parts.append(str(st.st_mtime_ns))
+            parts.append(str(st.st_size))
+    except Exception:
+        pass
+
+    return hashlib.sha256("|".join(parts).encode()).hexdigest()[:32]
+
+
+def _model_info_cache_file(key: str):
+    from vllm.compilation.startup_resources import resource_dir
+    return resource_dir("model_info_cache") / f"{key}.json"
+
+
+def _load_cached_model_info(module_name: str,
+                            class_name: str) -> Optional["_ModelInfo"]:
+    key = _model_info_cache_key(module_name, class_name)
+    if key is None:
+        return None
+    try:
+        path = _model_info_cache_file(key)
+        if not path.is_file():
+            return None
+        with open(path) as f:
+            data = json.load(f)
+        return _ModelInfo(**data)
+    except Exception:
+        logger.warning("Failed to load cached model info for %s:%s",
+                       module_name, class_name, exc_info=True)
+        return None
+
+
+def _store_cached_model_info(module_name: str, class_name: str,
+                             info: "_ModelInfo") -> None:
+    key = _model_info_cache_key(module_name, class_name)
+    if key is None:
+        return
+    try:
+        path = _model_info_cache_file(key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{key}.{os.getpid()}.tmp")
+        with open(tmp, "w") as f:
+            json.dump(asdict(info), f)
+        os.replace(tmp, path)
+    except Exception:
+        logger.warning("Failed to store cached model info for %s:%s",
+                       module_name, class_name, exc_info=True)
+
+
 class _BaseRegisteredModel(ABC):
 
     @abstractmethod
@@ -345,8 +425,16 @@ class _LazyRegisteredModel(_BaseRegisteredModel):
 
     # Performed in another process to avoid initializing CUDA
     def inspect_model_cls(self) -> _ModelInfo:
-        return _run_in_subprocess(
+        # Fast path: reuse a previously-computed result from disk to avoid
+        # spawning a fresh Python subprocess (which re-imports vllm + torch)
+        # on every cold start. Only active when startup optimizations are on.
+        cached = _load_cached_model_info(self.module_name, self.class_name)
+        if cached is not None:
+            return cached
+        info = _run_in_subprocess(
             lambda: _ModelInfo.from_model_cls(self.load_model_cls()))
+        _store_cached_model_info(self.module_name, self.class_name, info)
+        return info
 
     def load_model_cls(self) -> type[nn.Module]:
         mod = importlib.import_module(self.module_name)

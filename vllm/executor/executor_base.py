@@ -29,7 +29,7 @@ class ExecutorBase(ABC):
     """Base class for all executors.
 
     An executor is responsible for executing the model on one device,
-    or it can be a distributed executor 
+    or it can be a distributed executor
     that can execute the model on multiple devices.
     """
 
@@ -38,6 +38,7 @@ class ExecutorBase(ABC):
     def __init__(
         self,
         vllm_config: VllmConfig,
+        defer_init: bool = False,
     ) -> None:
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
@@ -50,9 +51,28 @@ class ExecutorBase(ABC):
         self.speculative_config = vllm_config.speculative_config
         self.prompt_adapter_config = vllm_config.prompt_adapter_config
         self.observability_config = vllm_config.observability_config
-        self._init_executor()
+        self._executor_initialized = False
+        if not defer_init:
+            self.initialize_executor()
         self.is_sleeping = False
         self.sleeping_tags: set[str] = set()
+
+    def initialize_executor(self) -> None:
+        """Initialize the executor once.
+
+        ``defer_init`` is used by the startup DAG to expose executor and
+        worker initialization as real scheduling stages. Existing callers
+        keep the original eager-construction behavior.
+        """
+        if self._executor_initialized:
+            return
+        self._init_executor()
+        self._executor_initialized = True
+
+    @classmethod
+    def supports_deferred_startup(cls) -> bool:
+        """Whether this executor exposes independently callable init stages."""
+        return False
 
     @abstractmethod
     def _init_executor(self) -> None:
@@ -81,7 +101,7 @@ class ExecutorBase(ABC):
 
         Returns:
             A list containing the results from each worker.
-        
+
         Note:
             It is recommended to use this API to only pass control messages,
             and set up data-plane communication to pass data.
@@ -347,7 +367,7 @@ class DistributedExecutorBase(ExecutorBase):
                 run only in the remote TP workers, not the driver worker.
                 It will also be run asynchronously and return a list of futures
                 rather than blocking on the results.
-        
+
         # TODO: simplify and merge with collective_rpc
         """
         raise NotImplementedError

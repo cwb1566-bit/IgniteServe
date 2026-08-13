@@ -1,0 +1,17 @@
+{
+  "candidates": 3500,
+  "target": 2000,
+  "kept": 2000,
+  "models": {
+    "Qwen3-4B": {
+      "ok": 3500,
+      "fail": 0,
+      "fail_reasons": {}
+    },
+    "Llama2-7B": {
+      "ok": 3500,
+      "fail": 0,
+      "fail_reasons": {}
+    }
+  }
+}

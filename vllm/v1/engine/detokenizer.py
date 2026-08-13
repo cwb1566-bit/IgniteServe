@@ -186,6 +186,8 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
                     prompt_suffix = suffix
                     break
 
+        self._prompt_replay_suffix = list(prompt_suffix)
+
         # Prime the stream.
         for tid in prompt_suffix:
             self._protected_step(tid)
@@ -225,22 +227,122 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
 
         return token or ""
 
+    # -----------修改段------------
+    def _is_invalid_prefix_error(self, exc: Exception) -> bool:
+        return INVALID_PREFIX_ERR_MSG in str(exc)
+
+    def _find_safe_replay_suffix(self, token_ids: list[int]) -> list[int]:
+        if len(token_ids) <= 4:
+            return token_ids
+
+        for i in range(4, min(len(token_ids) + 1, 24)):
+            suffix = token_ids[-i:]
+            try:
+                if '锟?' not in self.tokenizer.decode(suffix):
+                    return suffix
+            except Exception:
+                continue
+
+        return token_ids[-min(len(token_ids), 8):]
+
+    def _reset_stream_from_recent_tokens(
+            self, next_token_id: int) -> Optional[str]:
+        history = self.token_ids[:-1]
+        self.stream = DecodeStream(
+            skip_special_tokens=self.skip_special_tokens)
+
+        replay_ids = list(getattr(self, "_prompt_replay_suffix", []))
+        if history:
+            replay_ids.extend(self._find_safe_replay_suffix(history))
+
+        for tid in replay_ids:
+            self.stream.step(self.tokenizer, tid)
+        return self.stream.step(self.tokenizer, next_token_id)
+
     def _protected_step(self, next_token_id: int) -> Optional[str]:
         try:
             token = self.stream.step(self.tokenizer, next_token_id)
         except Exception as e:
-            if str(e) != INVALID_PREFIX_ERR_MSG:
+            if not self._is_invalid_prefix_error(e):
                 raise e
-            # Recover from edge case where tokenizer can produce non-monotonic,
-            # invalid UTF-8 output, which breaks the internal state of
-            # tokenizers' DecodeStream.
-            # See https://github.com/vllm-project/vllm/issues/17448.
+            # Recover from edge cases where tokenizers' DecodeStream loses a
+            # valid prefix around byte-fallback or emoji-like token fragments.
             logger.warning(
                 "Encountered invalid prefix detokenization error"
                 " for request %s, resetting decode stream.", self.request_id)
-            self.stream = DecodeStream(self.skip_special_tokens)
-            token = self.stream.step(self.tokenizer, next_token_id)
+            try:
+                token = self._reset_stream_from_recent_tokens(next_token_id)
+            except Exception as retry_e:
+                logger.error(
+                    "Recovery failed for request %s. Dropping text delta for "
+                    "token %s. Error: %s", self.request_id, next_token_id,
+                    retry_e)
+                self.stream = DecodeStream(
+                    skip_special_tokens=self.skip_special_tokens)
+                token = ""
         return token
+
+    '''
+    def _protected_step(self, next_token_id: int) -> Optional[str]:
+        try:
+            token = self.stream.step(self.tokenizer, next_token_id)
+        except Exception as e:
+            # 如果不是 Invalid prefix 错误，或者你想捕获所有解码异常，可以保留或注释这个 if
+            if str(e) != INVALID_PREFIX_ERR_MSG:
+                # 建议改成不要抛出，而是安全截断，防止其他未预料的解码错误干碎引擎
+                logger.error(f"Unexpected detokenization error for request {self.request_id}: {e}")
+                return ""
+            # 官方的 Warning 日志
+            logger.warning(
+                "Encountered invalid prefix detokenization error"
+                " for request %s, resetting decode stream.", self.request_id)
+            # 重置解码流
+            self.stream = DecodeStream(self.skip_special_tokens)
+
+            # ==========================================
+            # 【核心修复】：为重试加上保护，绝不让异常溢出
+            # ==========================================
+            try:
+                token = self.stream.step(self.tokenizer, next_token_id)
+            except Exception as retry_e:
+                logger.error(
+                    "Recovery failed for request %s. Dropping toxic token %s. Error: %s",
+                    self.request_id, next_token_id, retry_e
+                )
+                # 强行丢弃这个坏 Token，返回空字符串，让引擎安全走向下一步
+                token = ""
+        return token
+    '''
+    # def _protected_step(self, next_token_id: int) -> Optional[str]:
+    #     try:
+    #         token = self.stream.step(self.tokenizer, next_token_id)
+    #     except Exception as e:
+    #         # 捕获异常，记录日志，但不要让它向上传递阻断 Event Loop
+    #         import logging
+    #         logging.warning(f"[Detokenizer Fallback] Skipping bad token {next_token_id} due to: {e}")
+    #
+    #         # 强制将这条请求标记为结束，或者丢弃这个坏 Token
+    #         token = ""  # 忽略这个导致解码失败的字符
+    #         # 或者触发当前请求的 Finish Reason 为 "error"
+    #     return token
+    # -----------修改段------------
+    # 源码
+    # def _protected_step(self, next_token_id: int) -> Optional[str]:
+    #     try:
+    #         token = self.stream.step(self.tokenizer, next_token_id)
+    #     except Exception as e:
+    #         if str(e) != INVALID_PREFIX_ERR_MSG:
+    #             raise e
+    #         # Recover from edge case where tokenizer can produce non-monotonic,
+    #         # invalid UTF-8 output, which breaks the internal state of
+    #         # tokenizers' DecodeStream.
+    #         # See https://github.com/vllm-project/vllm/issues/17448.
+    #         logger.warning(
+    #             "Encountered invalid prefix detokenization error"
+    #             " for request %s, resetting decode stream.", self.request_id)
+    #         self.stream = DecodeStream(self.skip_special_tokens)
+    #         token = self.stream.step(self.tokenizer, next_token_id)
+    #     return token
 
 
 class SlowIncrementalDetokenizer(BaseIncrementalDetokenizer):

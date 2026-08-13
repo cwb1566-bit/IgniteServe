@@ -202,3 +202,25 @@ shellcheck*/
 
 # Ignore moe/marlin_moe gen code
 csrc/moe/marlin_moe_wna16/kernel_*
+
+# IgniteServe runtime resources and local experiment artifacts
+/A100_0606/
+/benchmark_results/
+/vllm_startup_resources/
+/compile_execution_separation.md
+/global_model_cache_map.json
+/multi_model_server_backup.py
+/vllm_metrics.csv
+/=*
+
+# Large local ShareGPT copies. The small validated benchmark subset is kept.
+/benchmarks_custom/ShareGPT_V3_robust.json
+/benchmarks_custom/ShareGPT_V3_unfiltered_cleaned_split.json
+
+# Local exploratory launchers and source snapshots
+/cold_test*.py
+/full_cold_test.sh
+/find_cuda_init.py
+/tools/parallel_compile_experiment/
+*.before_*
+*_backup.py

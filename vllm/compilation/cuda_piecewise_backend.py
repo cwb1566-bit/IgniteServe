@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import time
 from contextlib import ExitStack
 from typing import Any, Callable, Optional
 from unittest.mock import patch
@@ -16,10 +17,11 @@ from vllm.compilation.monitor import end_monitoring_torch_compile
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.operator_pipeline_trace import operator_pipeline_range
 from vllm.utils import weak_ref_tensors
 
 logger = init_logger(__name__)
-
+from vllm.v1.phase_profiler import timer
 
 @dataclasses.dataclass
 class ConcreteSizeEntry:
@@ -98,23 +100,43 @@ class CUDAPiecewiseBackend:
                 use_cudagraph=shape in self.cudagraph_capture_sizes,
             )
 
+    def _run(self, mode: str, runnable: Callable, args: tuple[Any, ...]) -> Any:
+        label = f"piece.{self.piecewise_compile_index}.{mode}"
+        with operator_pipeline_range(label):
+            return runnable(*args)
+
     def check_for_ending_compilation(self):
         if self.is_last_graph and not self.to_be_compiled_sizes:
             # no specific sizes to compile
             # save the hash of the inductor graph for the next run
+            timer.end("compile_profile_run")
+            timer.start("compile_cache_save_to_file")
             self.vllm_backend.compiler_manager.save_to_file()
+            timer.end("compile_cache_save_to_file")
+            timer.start("compile_monitor_end")
             end_monitoring_torch_compile(self.vllm_config)
+            timer.end("compile_monitor_end")
+            timer.start("after_last_piecewise_until_model_forward_end")
 
     def __call__(self, *args) -> Any:
         if not self.first_run_finished:
             self.first_run_finished = True
+            if self.is_first_graph:
+                if "after_backend_return_until_first_piecewise" in timer.start_times:
+                    from vllm.compilation import gap_profiler
+                    gap_profiler.stop()
+                    timer.end("after_backend_return_until_first_piecewise")
+                timer.start("compile_profile_run")
+            output = self._run("general", self.compiled_graph_for_general_shape,
+                               args)
             self.check_for_ending_compilation()
-            return self.compiled_graph_for_general_shape(*args)
+            return output
 
         runtime_shape = args[self.sym_shape_indices[0]]
         if runtime_shape not in self.concrete_size_entries:
             # we don't need to do anything for this shape
-            return self.compiled_graph_for_general_shape(*args)
+            return self._run("general", self.compiled_graph_for_general_shape,
+                             args)
 
         entry = self.concrete_size_entries[runtime_shape]
 
@@ -140,12 +162,26 @@ class CUDAPiecewiseBackend:
 
         # Skip CUDA graphs if this entry doesn't use them OR
         # if we're supposed to skip them globally
-        skip_cuda_graphs = get_forward_context().skip_cuda_graphs
+        forward_context = get_forward_context()
+        skip_cuda_graphs = forward_context.skip_cuda_graphs
         if not entry.use_cudagraph or skip_cuda_graphs:
-            return entry.runnable(*args)
+            output = self._run("eager", entry.runnable, args)
+            if entry.use_cudagraph and forward_context.cudagraph_runtime_warmup:
+                # This target shape just completed a real eager execution.
+                # Count it as the required warmup so the idle controller can
+                # perform capture without repeating dummy model forwards.
+                entry.num_finished_warmup = max(
+                    entry.num_finished_warmup,
+                    self.compilation_config.cudagraph_num_of_warmups,
+                )
+            return output
 
         if entry.cudagraph is None:
             if entry.num_finished_warmup < self.compilation_config.cudagraph_num_of_warmups:  # noqa
+                capture_budget = forward_context.cudagraph_capture_budget
+                if capture_budget is not None:
+                    capture_budget.defer(self.piecewise_compile_index,
+                                         self.total_piecewise_compiles)
                 entry.num_finished_warmup += 1
                 if self.is_first_graph:
                     logger.debug(
@@ -153,7 +189,19 @@ class CUDAPiecewiseBackend:
                         entry.num_finished_warmup,
                         self.compilation_config.cudagraph_num_of_warmups,
                         runtime_shape)
-                return entry.runnable(*args)
+                return self._run("warmup", entry.runnable, args)
+
+            capture_budget = forward_context.cudagraph_capture_budget
+            if (capture_budget is not None
+                    and not capture_budget.try_claim(
+                        self.piecewise_compile_index,
+                        self.total_piecewise_compiles)):
+                if capture_budget.should_stop_before(
+                        self.piecewise_compile_index,
+                        self.total_piecewise_compiles):
+                    from vllm.forward_context import CUDAGraphCaptureStop
+                    raise CUDAGraphCaptureStop
+                return self._run("capture-deferred", entry.runnable, args)
 
             if self.is_first_graph:
                 # Since we capture cudagraph for many different shapes and
@@ -167,8 +215,10 @@ class CUDAPiecewiseBackend:
             ]
             entry.input_addresses = input_addresses
             cudagraph = torch.cuda.CUDAGraph()
+            piece_capture_started = time.perf_counter()
 
-            with ExitStack() as stack:
+            with operator_pipeline_range(
+                    f"piece.{self.piecewise_compile_index}.capture"), ExitStack() as stack:
                 if not self.is_first_graph:
                     # during every model forward, we will capture
                     # many pieces of cudagraphs (roughly one per layer).
@@ -197,7 +247,23 @@ class CUDAPiecewiseBackend:
             entry.output = weak_ref_tensors(output)
             entry.cudagraph = cudagraph
 
+            if capture_budget is not None:
+                capture_budget.mark_captured(
+                    self.piecewise_compile_index,
+                    time.perf_counter() - piece_capture_started,
+                )
+
             compilation_counter.num_cudagraph_captured += 1
+
+            if (capture_budget is not None
+                    and capture_budget.should_stop_after(
+                        self.piecewise_compile_index,
+                        self.total_piecewise_compiles)):
+                # This piece is fully instantiated and published. Stop before
+                # running the uncaptured suffix; the next maintenance pass
+                # replays the captured prefix and resumes at the next piece.
+                from vllm.forward_context import CUDAGraphCaptureStop
+                raise CUDAGraphCaptureStop
 
             # important: we need to return the output, rather than
             # the weak ref of the output, so that pytorch can correctly
@@ -214,5 +280,7 @@ class CUDAPiecewiseBackend:
                 f" Expected {entry.input_addresses}, got {new_input_addresses}"
             )
 
-        entry.cudagraph.replay()
+        with operator_pipeline_range(
+                f"piece.{self.piecewise_compile_index}.replay"):
+            entry.cudagraph.replay()
         return entry.output

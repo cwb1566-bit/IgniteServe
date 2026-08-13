@@ -21,11 +21,31 @@ class UniProcExecutor(ExecutorBase):
 
     uses_ray: bool = False
 
+    @classmethod
+    def supports_deferred_startup(cls) -> bool:
+        return True
+
     def _init_executor(self) -> None:
         """Initialize the worker and load the model.
         """
+        self.initialize_worker_wrapper()
+        self.initialize_worker()
+        self.initialize_device()
+
+    def initialize_worker_wrapper(self) -> None:
+        if hasattr(self, "driver_worker"):
+            return
         self.driver_worker = WorkerWrapperBase(vllm_config=self.vllm_config,
                                                rpc_rank=0)
+
+    def initialize_worker(self) -> None:
+        self.initialize_worker_wrapper()
+        if self.driver_worker.worker is not None:
+            return
+        self.prepare_worker()
+        self.construct_worker()
+
+    def _worker_kwargs(self) -> dict[str, Any]:
         distributed_init_method = get_distributed_init_method(
             get_ip(), get_open_port())
         local_rank = 0
@@ -36,16 +56,53 @@ class UniProcExecutor(ExecutorBase):
             local_rank = int(device_info[1])
         rank = 0
         is_driver_worker = True
-        kwargs = dict(
+        return dict(
             vllm_config=self.vllm_config,
             local_rank=local_rank,
             rank=rank,
             distributed_init_method=distributed_init_method,
             is_driver_worker=is_driver_worker,
         )
-        self.collective_rpc("init_worker", args=([kwargs], ))
+
+    def prepare_worker(self) -> None:
+        self.initialize_worker_wrapper()
+        if getattr(self.driver_worker, "_startup_worker_class", None) is not None:
+            return
+        self.driver_worker.prepare_worker([self._worker_kwargs()])
+
+    def construct_worker(self) -> None:
+        self.prepare_worker()
+        self.driver_worker.construct_worker()
+
+    def initialize_device(self) -> None:
+        self.initialize_worker()
+        worker = self.driver_worker.worker
+        if worker is None:
+            raise RuntimeError("Worker object was not initialized")
+        if getattr(worker, "model_runner", None) is not None:
+            return
         self.collective_rpc("init_device")
-        self.collective_rpc("load_model")
+
+    def initialize_cuda_device(self) -> None:
+        self.initialize_worker()
+        self.collective_rpc("initialize_cuda_device")
+
+    def initialize_distributed_environment(self) -> None:
+        self.initialize_worker()
+        self.collective_rpc("initialize_distributed_environment")
+
+    def initialize_compile_worker_prewarm(self) -> None:
+        self.initialize_worker()
+        self.collective_rpc("initialize_compile_worker_prewarm")
+
+    def initialize_model_runner(self) -> None:
+        self.initialize_worker()
+        self.collective_rpc("initialize_model_runner")
+
+    def initialize_usage_reporting(self) -> None:
+        self.initialize_worker()
+        self.collective_rpc("initialize_usage_reporting")
+        self._executor_initialized = True
 
     def collective_rpc(self,
                        method: Union[str, Callable],
@@ -83,6 +140,10 @@ class ExecutorWithExternalLauncher(UniProcExecutor):
     and they don't need to synchronize the states with each other.
     """
     uses_ray: bool = False
+
+    @classmethod
+    def supports_deferred_startup(cls) -> bool:
+        return False
 
     def _init_executor(self) -> None:
         """Initialize the worker and load the model.
@@ -123,10 +184,10 @@ class ExecutorWithExternalLauncher(UniProcExecutor):
         """
         Determine the number of available KV blocks.
         Add an additional all_reduce to get the min across all ranks.
-        Note that even if we have the same `gpu_memory_utilization` and 
-        `swap_space`, the available memory in every rank might still 
-        differ because NCCL can take different amounts of memory in 
-        different ranks. Therefore, it is necessary to test if all ranks 
+        Note that even if we have the same `gpu_memory_utilization` and
+        `swap_space`, the available memory in every rank might still
+        differ because NCCL can take different amounts of memory in
+        different ranks. Therefore, it is necessary to test if all ranks
         agree on the same KV cache configuration.
         """
         a, b = super().determine_num_available_blocks()

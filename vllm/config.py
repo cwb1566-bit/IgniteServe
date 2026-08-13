@@ -347,8 +347,8 @@ class ModelConfig:
     """Maximum number of data items per modality per prompt. Only applicable
     for multimodal models."""
     media_io_kwargs: dict[str, dict[str, Any]] = field(default_factory=dict)
-    """Additional args passed to process media inputs, keyed by modalities. 
-    For example, to set num_frames for video, set 
+    """Additional args passed to process media inputs, keyed by modalities.
+    For example, to set num_frames for video, set
     `--media-io-kwargs '{"video": {"num_frames": 40} }'` """
     use_async_output_proc: bool = True
     """Whether to use async output processor."""
@@ -448,6 +448,8 @@ class ModelConfig:
         return hashlib.sha256(str(factors).encode()).hexdigest()
 
     def __post_init__(self) -> None:
+        from vllm.v1.phase_profiler import timer
+        timer.start("model_cfg: pre_hf_config")
         # Set the default seed to 0 in V1.
         # NOTE(woosuk): In V0, we set the default seed to None because the
         # driver worker shares the same process as the user process, and thus
@@ -530,9 +532,12 @@ class ModelConfig:
         if isinstance(self.config_format, str):
             self.config_format = ConfigFormat(self.config_format)
 
+        timer.end("model_cfg: pre_hf_config")
+        timer.start("model_cfg: get_config(HF)")
         hf_config = get_config(self.hf_config_path or self.model,
                                self.trust_remote_code, self.revision,
                                self.code_revision, self.config_format)
+        timer.end("model_cfg: get_config(HF)")
 
         if hf_overrides_kw:
             logger.debug("Overriding HF config with %s", hf_overrides_kw)
@@ -546,11 +551,17 @@ class ModelConfig:
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.attention_chunk_size = getattr(self.hf_text_config,
                                             "attention_chunk_size", None)
+        timer.start("model_cfg: _get_encoder_config")
         self.encoder_config = self._get_encoder_config()
+        timer.end("model_cfg: _get_encoder_config")
+        timer.start("model_cfg: get_hf_image_processor_config")
         self.hf_image_processor_config = get_hf_image_processor_config(
             self.model, hf_token=self.hf_token, revision=self.revision)
+        timer.end("model_cfg: get_hf_image_processor_config")
 
+        timer.start("model_cfg: _resolve_task")
         supported_tasks, task = self._resolve_task(self.task)
+        timer.end("model_cfg: _resolve_task")
         self.supported_tasks = supported_tasks
         self.task = task
         if self.task in ("draft", "generate"):
@@ -558,12 +569,15 @@ class ModelConfig:
         else:
             self.truncation_side = "right"
 
+        timer.start("model_cfg: inspect_model_cls")
         model_info, arch = self.registry.inspect_model_cls(self.architectures)
+        timer.end("model_cfg: inspect_model_cls")
         self._model_info = model_info
         self._architecture = arch
 
         self.pooler_config = self._init_pooler_config()
 
+        timer.start("model_cfg: _get_and_verify_dtype")
         self.dtype = _get_and_verify_dtype(
             self.model,
             self.hf_config,
@@ -571,6 +585,7 @@ class ModelConfig:
             is_pooling_model=self.runner_type == "pooling",
             revision=self.revision,
         )
+        timer.end("model_cfg: _get_and_verify_dtype")
 
         # Workaround for Gemma 2 which uses interleaved sliding window
         # attention, but it's not specified in its config. TODO: remove this
@@ -611,7 +626,9 @@ class ModelConfig:
                 sliding_window = None
 
         self.original_max_model_len = self.max_model_len
+        timer.start("model_cfg: get_and_verify_max_len")
         self.max_model_len = self.get_and_verify_max_len(self.max_model_len)
+        timer.end("model_cfg: get_and_verify_max_len")
         self.multimodal_config = self._init_multimodal_config()
         if not self.skip_tokenizer_init:
             self._verify_tokenizer_mode()
@@ -3100,8 +3117,8 @@ class MultiModalConfig:
     """
 
     media_io_kwargs: dict[str, dict[str, Any]] = field(default_factory=dict)
-    """Additional args passed to process media inputs, keyed by modalities. 
-    For example, to set num_frames for video, set 
+    """Additional args passed to process media inputs, keyed by modalities.
+    For example, to set num_frames for video, set
     `--media-io-kwargs '{"video": {"num_frames": 40} }'` """
 
     mm_processor_kwargs: Optional[dict[str, object]] = None
@@ -4032,7 +4049,7 @@ class CompilationConfig:
     - True: inductor compilation is used (custom_ops disabled by default).
         One graph for symbolic shape and one graph per size in compile_sizes
         are compiled using configurations in inductor_compile_config.
-        
+
     This setting is ignored if level<PIECEWISE."""
     compile_sizes: Optional[list[Union[int, str]]] = None
     """Sizes to compile for inductor. In addition
@@ -4330,7 +4347,7 @@ class VllmConfig:
 
     As a shorthand, `-O<n>` can be used to directly specify the compilation
     level `n`: `-O3` is equivalent to `-O.level=3` (same as `-O='{"level":3}'`).
-    Currently, -O <n> and -O=<n> are supported as well but this will likely be 
+    Currently, -O <n> and -O=<n> are supported as well but this will likely be
     removed in favor of clearer -O<n> syntax in the future.
 
     NOTE: level 0 is the default level without any optimization. level 1 and 2

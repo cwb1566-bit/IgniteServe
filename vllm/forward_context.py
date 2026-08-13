@@ -4,7 +4,7 @@
 import time
 from collections import defaultdict
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 import torch
@@ -24,6 +24,10 @@ last_logging_time: float = 0
 forward_start_time: float = 0
 batchsize_logging_interval: float = envs.VLLM_LOG_BATCHSIZE_INTERVAL
 batchsize_forward_time: defaultdict = defaultdict(list)
+
+
+class CUDAGraphCaptureStop(RuntimeError):
+    """Internal control flow after a bounded capture unit is complete."""
 
 
 @dataclass
@@ -80,12 +84,86 @@ class DPMetadata:
 
 
 @dataclass
+class CUDAGraphCaptureBudget:
+    """Per-forward authorization for incremental piecewise graph capture."""
+
+    max_pieces: int
+    deadline_ns: Optional[int] = None
+    claimed_piece_ids: set[int] = field(default_factory=set)
+    captured_piece_ids: set[int] = field(default_factory=set)
+    deferred_piece_ids: set[int] = field(default_factory=set)
+    observed_piece_ids: set[int] = field(default_factory=set)
+    piece_capture_seconds: dict[int, float] = field(default_factory=dict)
+    total_piecewise_compiles: int = 0
+    stop_after_budget: bool = False
+
+    def try_claim(self, piece_id: int, total_pieces: int) -> bool:
+        self.total_piecewise_compiles = max(self.total_piecewise_compiles,
+                                            int(total_pieces))
+        self.observed_piece_ids.add(int(piece_id))
+        if len(self.claimed_piece_ids) >= max(0, self.max_pieces):
+            self.deferred_piece_ids.add(int(piece_id))
+            return False
+        if (self.deadline_ns is not None
+                and time.perf_counter_ns() >= self.deadline_ns):
+            self.deferred_piece_ids.add(int(piece_id))
+            return False
+        self.claimed_piece_ids.add(int(piece_id))
+        return True
+
+    def defer(self, piece_id: int, total_pieces: int) -> None:
+        self.total_piecewise_compiles = max(self.total_piecewise_compiles,
+                                            int(total_pieces))
+        self.observed_piece_ids.add(int(piece_id))
+        self.deferred_piece_ids.add(int(piece_id))
+
+    def should_stop_before(self, piece_id: int, total_pieces: int) -> bool:
+        if not self.stop_after_budget:
+            return False
+        piece_id = int(piece_id)
+        total_pieces = int(total_pieces)
+        self.total_piecewise_compiles = max(
+            self.total_piecewise_compiles, total_pieces)
+        self.deferred_piece_ids.update(range(piece_id, total_pieces))
+        return True
+
+    def mark_captured(self, piece_id: int,
+                      capture_seconds: float = 0.0) -> None:
+        piece_id = int(piece_id)
+        self.captured_piece_ids.add(piece_id)
+        self.deferred_piece_ids.discard(piece_id)
+        self.piece_capture_seconds[piece_id] = float(capture_seconds)
+
+    def should_stop_after(self, piece_id: int, total_pieces: int) -> bool:
+        if not self.stop_after_budget:
+            return False
+        if len(self.captured_piece_ids) < max(0, self.max_pieces):
+            return False
+        piece_id = int(piece_id)
+        total_pieces = int(total_pieces)
+        if piece_id >= total_pieces - 1:
+            return False
+        self.total_piecewise_compiles = max(
+            self.total_piecewise_compiles, total_pieces)
+        self.deferred_piece_ids.update(range(piece_id + 1, total_pieces))
+        return True
+
+    @property
+    def made_progress(self) -> bool:
+        return bool(self.captured_piece_ids)
+
+    @property
+    def pass_complete(self) -> bool:
+        return not self.deferred_piece_ids
+
+
+@dataclass
 class ForwardContext:
     # copy from vllm_config.compilation_config.static_forward_context
     no_compile_layers: dict[str, Any]
     """
-    Type AttentionMetadata for v0, 
-    Type Dict[str, AttentionMetadata] for v1, map from layer_name of each 
+    Type AttentionMetadata for v0,
+    Type Dict[str, AttentionMetadata] for v1, map from layer_name of each
     attention layer to its attention metadata
     set dynamically for each forward pass
     """
@@ -95,6 +173,12 @@ class ForwardContext:
     # set dynamically for each forward pass
     dp_metadata: Optional[DPMetadata] = None
     skip_cuda_graphs: bool = False
+    # A real request is intentionally executing the target shape eagerly so
+    # its kernels and workspaces can serve as CUDA graph warmup.
+    cudagraph_runtime_warmup: bool = False
+    # Optional budget used only by adaptive background capture. Startup
+    # capture leaves this unset and retains the original all-pieces behavior.
+    cudagraph_capture_budget: Optional[CUDAGraphCaptureBudget] = None
 
 
 _forward_context: Optional[ForwardContext] = None
@@ -116,6 +200,8 @@ def set_forward_context(
     num_tokens: Optional[int] = None,
     num_tokens_across_dp: Optional[torch.Tensor] = None,
     skip_cuda_graphs: bool = False,
+    cudagraph_runtime_warmup: bool = False,
+    cudagraph_capture_budget: Optional[CUDAGraphCaptureBudget] = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -141,6 +227,8 @@ def set_forward_context(
         attn_metadata=attn_metadata,
         dp_metadata=dp_metadata,
         skip_cuda_graphs=skip_cuda_graphs,
+        cudagraph_runtime_warmup=cudagraph_runtime_warmup,
+        cudagraph_capture_budget=cudagraph_capture_budget,
     )
 
     try:

@@ -1,0 +1,9 @@
+IgniteServe
+Copyright 2026 Cloud-Native Large Model Systems Group (CGCL),
+Huazhong University of Science and Technology.
+
+This product includes software developed by the vLLM project
+(https://github.com/vllm-project/vllm), licensed under the Apache License 2.0.
+
+IgniteServe is a research derivative of vLLM 0.9.2. The upstream copyright
+and license headers remain applicable to the corresponding source files.

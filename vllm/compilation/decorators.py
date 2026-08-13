@@ -21,7 +21,8 @@ from .monitor import start_monitoring_torch_compile
 logger = init_logger(__name__)
 
 _T = TypeVar("_T", bound=type[nn.Module])
-
+#增
+from vllm.v1.phase_profiler import timer
 
 @overload
 def support_torch_compile(
@@ -79,7 +80,7 @@ def support_torch_compile(
     During runtime, when we actually mark dimensions of tensors,
      it depends on the value of arguments:
 
-    - if it is a single integer (can be negative), the corresponding dimension 
+    - if it is a single integer (can be negative), the corresponding dimension
         of the argument will be marked as dynamic.
     - if it is `None`, ignored.
     - if it is `IntermediateTensors`, all the tensors in the intermediate
@@ -203,11 +204,11 @@ def _support_torch_compile(
             start_monitoring_torch_compile(self.vllm_config)
             logger.debug("Start compiling function %s",
                          self.original_code_object)
-
         # if we don't use custom dispatcher, we can directly call the
         # compiled function and let torch.compile handle the dispatching,
         # with the overhead of guard evaluation and recompilation.
         if len(self.compiled_codes) < 1 or not self.use_custom_dispatcher:
+            timer.start("Tracing")
             # it seems Dynamo reuse the compilation across instances,
             # while we need to make sure the compiled code is not reused.
             # we need to control all the compilation of the model.

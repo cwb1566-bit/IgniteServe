@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from concurrent.futures import Future
-from typing import Callable, Union
+from typing import Callable, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -63,6 +63,9 @@ class Executor(ExecutorBase):
         """
         self.collective_rpc("initialize_from_config",
                             args=(kv_cache_configs, ))
+        # self.collective_rpc("compile_or_warm_up_model")
+
+    def compile_or_warm_up_model(self) -> None:
         self.collective_rpc("compile_or_warm_up_model")
 
     def register_failure_callback(self, callback: FailureCallback):
@@ -71,6 +74,15 @@ class Executor(ExecutorBase):
         failed state.
         """
         pass
+
+    def init_model(self) -> None:
+        self.collective_rpc("init_model")
+
+    def load_weights(self) -> None:
+        self.collective_rpc("load_weights")
+
+    def run_to_trigger_compile(self) -> None:
+        self.collective_rpc("run_to_trigger_compile")
 
     def determine_available_memory(self) -> list[int]:  # in bytes
         output = self.collective_rpc("determine_available_memory")
@@ -94,6 +106,17 @@ class Executor(ExecutorBase):
 
     def profile(self, is_start: bool = True):
         self.collective_rpc("profile", args=(is_start, ))
+
+    def capture_pending_cudagraphs(
+        self,
+        max_pieces_per_shape: Optional[int] = None,
+        deadline_ms: Optional[float] = None,
+    ) -> int:
+        results = self.collective_rpc(
+            "capture_pending_cudagraphs",
+            args=(max_pieces_per_shape, deadline_ms),
+        )
+        return sum(int(result or 0) for result in results)
 
 
 class UniProcExecutor(UniProcExecutorV0, Executor):

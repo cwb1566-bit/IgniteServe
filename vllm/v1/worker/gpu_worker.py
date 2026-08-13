@@ -3,6 +3,7 @@
 """A GPU worker class."""
 import gc
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -27,14 +28,61 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+from vllm.v1.worker import kv_profile_cache
+from vllm.v1.worker.startup_compile import (
+    compile_only_forward, maybe_apply_offline_best_config, startup_compile_mode)
 from vllm.v1.worker.worker_base import WorkerBase
 
 logger = init_logger(__name__)
+
+
+def _start_full_fx_compile_worker_prewarm(vllm_config: VllmConfig) -> None:
+    if os.environ.get("VLLM_ENABLE_SUBPROCESS_COMPILE", "").lower() not in {
+            "1", "true", "yes", "on"}:
+        return
+
+    compilation_config = vllm_config.compilation_config
+    max_workers = getattr(compilation_config, "max_compile_workers", None)
+    max_workers = max_workers or min(os.cpu_count() or 1, 4)
+    os.environ.setdefault("TORCHINDUCTOR_FULL_FX_COMPILE_WORKERS",
+                          str(max_workers))
+    os.environ.setdefault("TORCHINDUCTOR_FX_COMPILE_INNER_THREADS", "1")
+    os.environ.setdefault("TORCHINDUCTOR_FX_COMPILE_PREWARM_CUDA", "1")
+    worker_imports = os.environ.get(
+        "TORCHINDUCTOR_FX_COMPILE_WORKER_IMPORTS", "")
+    import_names = [name for name in worker_imports.split(",") if name]
+    for module_name in ("vllm._custom_ops", "vllm.compilation.pass_manager"):
+        if module_name not in import_names:
+            import_names.append(module_name)
+    os.environ["TORCHINDUCTOR_FX_COMPILE_WORKER_IMPORTS"] = ",".join(
+        import_names)
+
+    try:
+        from torch._inductor.compile_fx_full_subproc import FullFxCompilePool
+
+        FullFxCompilePool.prewarm_workers()
+        logger.info(
+            "Started Full-FX compiler worker import/CUDA prewarm during "
+            "GPU worker initialization.")
+    except Exception as exc:
+        logger.warning("Failed to start Full-FX compiler worker prewarm: %s",
+                       exc)
 
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
     from vllm.v1.core.sched.output import SchedulerOutput
 
+#增
+import time
+import concurrent.futures
+from vllm.distributed.parallel_state import (
+    get_pp_group, get_tp_group, graph_capture, is_global_first_rank,
+    prepare_communication_buffer_for_model)
+from vllm.utils import DeviceMemoryProfiler
+from torch import inference_mode, no_grad
+from vllm.model_executor.model_loader.utils import (
+    initialize_model, process_weights_after_loading, set_default_torch_dtype)
+from vllm.v1.phase_profiler import timer
 
 class Worker(WorkerBase):
 
@@ -118,6 +166,17 @@ class Worker(WorkerBase):
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
     def init_device(self):
+        """Initialize all device-side worker stages in dependency order."""
+        self.initialize_cuda_device()
+        self.initialize_distributed_environment()
+        self.initialize_compile_worker_prewarm()
+        self.initialize_model_runner()
+        self.initialize_usage_reporting()
+
+    def initialize_cuda_device(self) -> None:
+        """Select CUDA, validate capacity, and take the initial snapshot."""
+        if getattr(self, "_startup_cuda_device_ready", False):
+            return
         if self.device_config.device.type == "cuda":
             # torch.distributed.all_reduce does not free the input tensor until
             # the synchronization point. This causes the memory usage to grow
@@ -154,20 +213,42 @@ class Worker(WorkerBase):
         else:
             raise RuntimeError(
                 f"Not support device type: {self.device_config.device}")
-        # Initialize the distributed environment.
+        self._startup_cuda_device_ready = True
+
+    def initialize_distributed_environment(self) -> None:
+        """Create distributed/model-parallel state after CUDA selection."""
+        if getattr(self, "_startup_distributed_ready", False):
+            return
+        self.initialize_cuda_device()
         init_worker_distributed_environment(self.vllm_config, self.rank,
                                             self.distributed_init_method,
                                             self.local_rank)
-        # Set random seed.
         set_random_seed(self.model_config.seed)
+        self._startup_distributed_ready = True
 
-        # Construct the model runner
+    def initialize_compile_worker_prewarm(self) -> None:
+        """Start the reusable FX compilation worker outside model loading."""
+        if getattr(self, "_startup_compile_prewarm_ready", False):
+            return
+        self.initialize_distributed_environment()
+        _start_full_fx_compile_worker_prewarm(self.vllm_config)
+        self._startup_compile_prewarm_ready = True
+
+    def initialize_model_runner(self) -> None:
+        """Construct GPUModelRunner and its persistent runtime buffers."""
+        if getattr(self, "model_runner", None) is not None:
+            return
+        self.initialize_distributed_environment()
         self.model_runner: GPUModelRunner = GPUModelRunner(
             self.vllm_config, self.device)
 
+    def initialize_usage_reporting(self) -> None:
+        if getattr(self, "_startup_usage_reporting_ready", False):
+            return
+        self.initialize_model_runner()
         if self.rank == 0:
-            # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
+        self._startup_usage_reporting_ready = True
 
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
@@ -184,9 +265,108 @@ class Worker(WorkerBase):
         with context:
             self.model_runner.load_model()
 
+    def init_model(self) -> None:
+        self.model_runner.init_model()
+
+    def load_weights(self) -> None:
+        self.model_runner.load_weights()
+
+    def get_startup_state_snapshot(self) -> dict[str, object]:
+        """Return exact worker-local facts used to build the startup DAG."""
+        static_state = self.get_static_startup_resource_snapshot()
+        cached_kv_bytes = os.environ.get(
+            "VLLM_CACHED_AVAILABLE_KV_CACHE_BYTES")
+        kv_value = None
+        kv_key = "explicit"
+        if cached_kv_bytes:
+            try:
+                kv_value = int(cached_kv_bytes)
+            except ValueError:
+                kv_value = None
+        elif kv_profile_cache.enabled():
+            kv_value, kv_key, _, _ = kv_profile_cache.lookup(
+                self.vllm_config, self.device)
+        return {
+            **static_state,
+            "rank": self.rank,
+            "device": str(self.device),
+            "kv_profile_hit": kv_value is not None and kv_value > 0,
+            "kv_profile_key": kv_key,
+        }
+
+    def get_static_startup_resource_snapshot(self) -> dict[str, object]:
+        """Probe filesystem-only resources before CUDA initialization ends."""
+        from vllm.compilation.startup_resources import resource_dir
+
+        def has_entries(path: Path) -> bool:
+            try:
+                return path.exists() and any(path.iterdir())
+            except OSError:
+                return False
+
+        compile_root = Path(os.environ.get(
+            "VLLM_CACHE_ROOT",
+            str(Path.home() / ".cache" / "vllm")))
+        best_config_path = resource_dir("best_config")
+        transformed_path = resource_dir("transformed_code")
+        metadata_path = resource_dir("parallel_compile_metadata")
+        hotspot_path = Path(os.environ.get(
+            "VLLM_CUDA_GRAPH_HOTSPOT_DIR",
+            str(resource_dir("cuda_graph_hotspots"))))
+        return {
+            "rank": self.rank,
+            "compile_cache_present": has_entries(compile_root),
+            "best_config_store_present": has_entries(best_config_path),
+            "transformed_code_store_present": has_entries(transformed_path),
+            "metadata_store_present": has_entries(metadata_path),
+            "hotspot_profile_present": has_entries(hotspot_path),
+        }
+
+    @torch.inference_mode()
+    def run_to_trigger_compile(self) -> None:
+        mode = startup_compile_mode()
+        if mode in {"s0", "stage_separated", "stage_separated_baseline"}:
+            # S0: compile-only and defer the real max-batch execution to
+            # determine_available_memory(). No semantic caches or structural
+            # reuse are enabled unless explicitly overridden.
+            compile_only_forward(self.model_runner, autotune=False)
+            return
+        if mode in {"native", "baseline", "precompile_autotune",
+                    "precompile_autotune_skip_profile"}:
+            # Baseline split path: compile and run Triton autotune here, but do
+            # not execute the max-batch dummy forward again. KV Cache Init will
+            # perform the real profile/warmup when profile caching is disabled.
+            compile_only_forward(self.model_runner, autotune=True)
+            return
+        if mode in {"precompile", "precompile_skip_profile"}:
+            compile_only_forward(self.model_runner, autotune=False)
+            return
+        if mode in {"s4", "a100_optimized", "offline_best_config",
+                    "offline_best_config_skip_profile"}:
+            # S4: search the persisted best-config store (default
+            # vllm_startup_resources/best_config) on every cold start. Load the
+            # cached config on a hit; otherwise autotune now and persist the
+            # winner back into the store. VLLM_OFFLINE_BEST_CONFIG_ROOT remains
+            # an optional extra source but is no longer required.
+            offline_root = os.environ.get("VLLM_OFFLINE_BEST_CONFIG_ROOT")
+            timer.start("S4 Best-Config Resolve")
+            compile_only_forward(
+                self.model_runner,
+                resolve_best_config=True,
+                device=self.model_runner.device,
+                offline_root=offline_root,
+                persist_best_config=True,
+            )
+            timer.end("S4 Best-Config Resolve")
+            return
+        logger.warning(
+            "Unknown VLLM_STARTUP_COMPILE_MODE=%s; falling back to baseline "
+            "compile-only+autotune path.", mode)
+        compile_only_forward(self.model_runner, autotune=True)
+
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
-        """Profiles the peak memory usage of the model to determine how much 
+        """Profiles the peak memory usage of the model to determine how much
         memory can be used for KV cache without OOMs.
 
         The engine will first conduct a profiling of the existing memory usage.
@@ -197,9 +377,62 @@ class Worker(WorkerBase):
             You may limit the usage of GPU memory
             by adjusting the `gpu_memory_utilization` parameter.
         """
+        if os.environ.get("VLLM_ENABLE_SUBPROCESS_COMPILE", "").lower() in {
+                "1", "true", "yes", "on"}:
+            from torch._inductor.compile_fx_full_subproc import FullFxCompilePool
+            shutdown_wait_started = time.perf_counter()
+            shutdown_elapsed_s = FullFxCompilePool.wait_for_shutdown_pool()
+            logger.info(
+                "Parallel compile timing deferred_shutdown_wait_s=%.6f "
+                "shutdown_total_s=%.6f",
+                time.perf_counter() - shutdown_wait_started,
+                shutdown_elapsed_s,
+            )
+
+        GiB = lambda b: b / GiB_bytes
+
+        mode = startup_compile_mode()
+        cached_kv_bytes = os.environ.get("VLLM_CACHED_AVAILABLE_KV_CACHE_BYTES")
+        if cached_kv_bytes:
+            available_kv_cache_memory = int(cached_kv_bytes)
+            logger.info(
+                "Skipping profile_run and using explicit KV cache memory: "
+                "%.2f GiB", GiB(available_kv_cache_memory))
+            return available_kv_cache_memory
+
+        use_persisted_profile_cache = kv_profile_cache.enabled()
+        profile_cache_requested = (
+            mode in {"s4", "a100_optimized", "precompile_skip_profile",
+                     "precompile_autotune_skip_profile",
+                     "offline_best_config_skip_profile"}
+            or os.environ.get("VLLM_SKIP_PROFILE_RUN", "").lower()
+            in {"1", "true", "yes", "on"}
+            or use_persisted_profile_cache
+        )
+        if use_persisted_profile_cache:
+            cached_value, cache_key, _, cache_entry = kv_profile_cache.lookup(
+                self.vllm_config, self.device)
+            if cached_value is not None:
+                logger.info(
+                    "Skipping profile_run using persisted KV profile cache "
+                    "key=%s value=%.2f GiB updated_at=%s",
+                    cache_key[:16], GiB(cached_value),
+                    cache_entry.get("updated_at") if cache_entry else None)
+                return cached_value
+
+            logger.info(
+                "KV profile cache miss; running real profile_run() and "
+                "persisting the result afterwards.")
+        elif profile_cache_requested:
+            logger.warning(
+                "Profile skip was requested, but persisted KV profile cache "
+                "is disabled and VLLM_CACHED_AVAILABLE_KV_CACHE_BYTES is unset; "
+                "falling back to real profile_run().")
+
+        # Cache hits return above without perturbing the CUDA allocator. Only
+        # the real profiling path needs a clean peak-memory accounting window.
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        GiB = lambda b: b / GiB_bytes
 
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
@@ -231,6 +464,15 @@ class Worker(WorkerBase):
         logger.debug(profile_result)
         logger.info("Available KV cache memory: %.2f GiB",
                     GiB(available_kv_cache_memory))
+        if profile_cache_requested:
+            cache_key, cache_path = kv_profile_cache.save(
+                self.vllm_config,
+                self.device,
+                int(available_kv_cache_memory),
+                profile_result=profile_result)
+            logger.info(
+                "Persisted KV profile cache key=%s path=%s value=%.2f GiB",
+                cache_key[:16], cache_path, GiB(available_kv_cache_memory))
         gc.collect()
 
         return int(available_kv_cache_memory)
@@ -264,7 +506,7 @@ class Worker(WorkerBase):
             logger.info("Compile and warming up model for size %d", size)
             self.model_runner._dummy_run(size, skip_eplb=True)
         if not self.model_config.enforce_eager:
-            self.model_runner.capture_model()
+            self.model_runner.pre_capture_model()
 
         # Warm up sampler and preallocate memory buffer for logits and other
         # sampling related tensors of max possible shape to avoid memory
@@ -329,6 +571,51 @@ class Worker(WorkerBase):
 
     def execute_dummy_batch(self) -> None:
         self.model_runner._dummy_run(1)
+
+    def capture_pending_cudagraphs(
+        self,
+        max_pieces_per_shape: Optional[int] = None,
+        deadline_ms: Optional[float] = None,
+    ) -> int:
+        if not self.model_runner.enable_adaptive_cudagraph:
+            return 0
+        controller = self.model_runner.adaptive_cudagraph_controller
+        captured = controller.capture_pending(
+            self.model_runner,
+            max_pieces_per_shape=max_pieces_per_shape,
+            deadline_ms=deadline_ms,
+        )
+        controller.flush_gpu_samples()
+        if captured == 0:
+            controller.export_telemetry()
+        return captured
+
+    def plan_pending_cudagraph_capture(
+        self,
+        slack_ms: float,
+        max_pieces: int,
+        default_fixed_ms: float,
+        default_piece_ms: float,
+        safety_factor: float,
+    ) -> Optional[dict[str, object]]:
+        if not self.model_runner.enable_adaptive_cudagraph:
+            return None
+        controller = self.model_runner.adaptive_cudagraph_controller
+        plan = controller.plan_capture_maintenance(
+            slack_ms=slack_ms,
+            max_pieces=max_pieces,
+            default_fixed_ms=default_fixed_ms,
+            default_piece_ms=default_piece_ms,
+            safety_factor=safety_factor,
+        )
+        return None if plan is None else dict(vars(plan))
+
+    def export_adaptive_cudagraph_telemetry(self) -> None:
+        if not self.model_runner.enable_adaptive_cudagraph:
+            return
+        controller = self.model_runner.adaptive_cudagraph_controller
+        controller.flush_gpu_samples()
+        controller.export_telemetry()
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_runner.add_lora(lora_request)

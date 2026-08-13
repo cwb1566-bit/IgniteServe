@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import threading
 from collections.abc import AsyncGenerator, Mapping
 from copy import copy
 from typing import Any, Optional, Union
@@ -41,7 +42,7 @@ from vllm.v1.metrics.prometheus import shutdown_prometheus
 from vllm.v1.metrics.stats import IterationStats, SchedulerStats
 
 logger = init_logger(__name__)
-
+from vllm.v1.phase_profiler import timer
 
 class AsyncLLM(EngineClient):
 
@@ -102,11 +103,67 @@ class AsyncLLM(EngineClient):
             custom_stat_loggers=stat_loggers,
         )
 
-        # Tokenizer (+ ensure liveness if running in another process).
-        self.tokenizer = init_tokenizer_from_configs(
-            model_config=vllm_config.model_config,
-            scheduler_config=vllm_config.scheduler_config,
-            lora_config=vllm_config.lora_config)
+        # Kick off tokenizer initialization on a background thread so it
+        # overlaps with the EngineCore child process model load/compile.
+        #
+        # NOTE on overlap: the EngineCore child blocks in startup_handshake()
+        # until make_async_mp_client() below answers its HELLO with the init
+        # message; only then does the child start loading/compiling the model,
+        # after which the parent blocks (GIL released inside the zmq poll)
+        # waiting for the READY message. Running the tokenizer load on a
+        # separate thread lets it proceed during that wait. The tokenizer /
+        # processor path is pure CPU/IO and does not touch CUDA, so concurrent
+        # execution alongside the engine handshake is safe.
+        timer.start("Init Tokenier")
+        tokenizer_holder: dict[str, AnyTokenizer] = {}
+        tokenizer_error: dict[str, BaseException] = {}
+
+        def _load_tokenizer_bg() -> None:
+            # Time the tokenizer load on its own (local perf_counter, not the
+            # shared singleton timer which is not thread-safe) so the overlap
+            # saving is observable: compare this against "Engine Core Client".
+            import time as _time
+            _t0 = _time.perf_counter()
+            try:
+                tokenizer_holder["tokenizer"] = init_tokenizer_from_configs(
+                    model_config=vllm_config.model_config,
+                    scheduler_config=vllm_config.scheduler_config,
+                    lora_config=vllm_config.lora_config)
+            except BaseException as exc:  # noqa: BLE001
+                tokenizer_error["error"] = exc
+            finally:
+                logger.info(
+                    "[TIMER] Tokenizer bg-load took %.4f s (overlapped with "
+                    "EngineCore init)", _time.perf_counter() - _t0)
+
+        tokenizer_thread = threading.Thread(target=_load_tokenizer_bg,
+                                            name="TokenizerInit",
+                                            daemon=True)
+        tokenizer_thread.start()
+
+        # EngineCore (starts the engine in background process). This triggers
+        # the child model load/compile, which overlaps with the tokenizer
+        # thread started above.
+        if "Init Runtime" in timer.start_times:
+            timer.end("Init Runtime")
+
+        timer.start("Engine Core Client")
+        self.engine_core = EngineCoreClient.make_async_mp_client(
+            vllm_config=vllm_config,
+            executor_class=executor_class,
+            log_stats=self.log_stats,
+            client_addresses=client_addresses,
+            client_index=client_index,
+        )
+        timer.end("Engine Core Client")
+
+        # Join the background tokenizer load before building components that
+        # depend on it.
+        tokenizer_thread.join()
+        if "error" in tokenizer_error:
+            raise tokenizer_error["error"]
+        self.tokenizer = tokenizer_holder["tokenizer"]
+        timer.end("Init Tokenier")
 
         # Processor (converts Inputs --> EngineCoreRequests).
         self.processor = Processor(
@@ -118,16 +175,6 @@ class AsyncLLM(EngineClient):
         # OutputProcessor (converts EngineCoreOutputs --> RequestOutput).
         self.output_processor = OutputProcessor(self.tokenizer,
                                                 log_stats=self.log_stats)
-
-        # EngineCore (starts the engine in background process).
-
-        self.engine_core = EngineCoreClient.make_async_mp_client(
-            vllm_config=vllm_config,
-            executor_class=executor_class,
-            log_stats=self.log_stats,
-            client_addresses=client_addresses,
-            client_index=client_index,
-        )
         if self.stat_loggers:
             for stat_logger in self.stat_loggers[0]:
                 stat_logger.log_engine_initialized()

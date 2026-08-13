@@ -4,11 +4,12 @@ import os
 import queue
 import signal
 import sys
-import threading
 import time
+from pathlib import Path
 from collections import deque
 from collections.abc import Generator
 from concurrent.futures import Future
+import concurrent.futures
 from contextlib import ExitStack, contextmanager
 from inspect import isclass, signature
 from logging import DEBUG
@@ -51,6 +52,12 @@ HANDSHAKE_TIMEOUT_MINS = 5
 
 _R = TypeVar('_R')  # Return type for collective_rpc
 
+#增
+import threading
+from vllm.v1.phase_profiler import timer
+from vllm.v1.metrics_recorder import recorder
+from vllm.v1.worker.HotspotAnalyzer import HotspotAnalyzer
+from vllm.v1.engine.weight_pagecache import stop_async_weight_prewarm_from_env
 
 class EngineCore:
     """Inner loop of vLLM's Engine."""
@@ -61,31 +68,195 @@ class EngineCore:
                  log_stats: bool,
                  executor_fail_callback: Optional[Callable] = None):
 
+        timer.start("Total Init")
+        requested_dag_mode = os.environ.get(
+            "VLLM_STARTUP_DAG_MODE", "off").strip().lower()
+        deferred_supported = bool(
+            getattr(executor_class, "supports_deferred_startup",
+                    lambda: False)())
+        if (requested_dag_mode == "execute"
+                and vllm_config.parallel_config.world_size == 1
+                and deferred_supported):
+            self._initialize_with_full_startup_dag(
+                vllm_config, executor_class, log_stats,
+                executor_fail_callback)
+            timer.end("Total Init")
+            return
+        if requested_dag_mode == "execute" and not deferred_supported:
+            logger.warning(
+                "Executor %s does not expose deferred startup stages; "
+                "using startup DAG shadow mode.", executor_class.__name__)
+            self._startup_dag_mode_override = "shadow"
         # plugins need to be loaded at the engine/scheduler level too
+        timer.start("Init execution environment")
         from vllm.plugins import load_general_plugins
         load_general_plugins()
 
         self.vllm_config = vllm_config
+        self._adaptive_cudagraph_enabled = os.environ.get(
+            "VLLM_ENABLE_ADAPTIVE_CUDAGRAPH", "").lower() in (
+                "1", "true", "yes", "on")
+        self._adaptive_cudagraph_idle_grace_s = max(
+            0.0,
+            float(
+                os.environ.get("VLLM_ADAPTIVE_CUDAGRAPH_IDLE_GRACE_MS", "10"))
+            / 1000.0)
+        self._adaptive_cudagraph_slo_capture_enabled = (
+            self._adaptive_cudagraph_enabled and os.environ.get(
+                "VLLM_ADAPTIVE_CUDAGRAPH_ENABLE_SLO_CAPTURE",
+                "1").lower() in ("1", "true", "yes", "on"))
+        self._adaptive_cudagraph_tpot_slo_ms = max(
+            0.0,
+            float(
+                os.environ.get("VLLM_ADAPTIVE_CUDAGRAPH_TPOT_SLO_MS",
+                               "100")))
+        self._adaptive_cudagraph_ttft_slo_ms = max(
+            0.0,
+            float(
+                os.environ.get("VLLM_ADAPTIVE_CUDAGRAPH_TTFT_SLO_MS",
+                               "2000")))
+        self._adaptive_cudagraph_prefill_step_estimate_ms = max(
+            0.1,
+            float(
+                os.environ.get(
+                    "VLLM_ADAPTIVE_CUDAGRAPH_PREFILL_STEP_ESTIMATE_MS",
+                    "30")))
+        self._adaptive_cudagraph_allow_waiting = os.environ.get(
+            "VLLM_ADAPTIVE_CUDAGRAPH_ALLOW_WAITING_REQUESTS",
+            "1").lower() in ("1", "true", "yes", "on")
+        self._adaptive_cudagraph_slo_guard_ms = max(
+            0.0,
+            float(
+                os.environ.get("VLLM_ADAPTIVE_CUDAGRAPH_SLO_GUARD_MS", "5")))
+        self._adaptive_cudagraph_capture_estimate_ms = max(
+            0.1,
+            float(
+                os.environ.get(
+                    "VLLM_ADAPTIVE_CUDAGRAPH_CAPTURE_CHUNK_ESTIMATE_MS",
+                    "30")))
+        self._adaptive_cudagraph_slo_interval_steps = max(
+            1,
+            int(
+                os.environ.get(
+                    "VLLM_ADAPTIVE_CUDAGRAPH_SLO_CAPTURE_INTERVAL_STEPS",
+                    "8")))
+        # Zero selects a slack-driven piece budget. A positive value keeps the
+        # fixed-budget mode used by controlled experiments.
+        self._adaptive_cudagraph_slo_pieces = max(
+            0,
+            int(
+                os.environ.get(
+                    "VLLM_ADAPTIVE_CUDAGRAPH_SLO_PIECES_PER_STEP", "0")))
+        self._adaptive_cudagraph_slo_max_pieces = max(
+            1,
+            int(
+                os.environ.get(
+                    "VLLM_ADAPTIVE_CUDAGRAPH_SLO_MAX_PIECES_PER_STEP", "64")))
+        self._adaptive_cudagraph_capture_fixed_estimate_ms = max(
+            0.1,
+            float(
+                os.environ.get(
+                    "VLLM_ADAPTIVE_CUDAGRAPH_CAPTURE_FIXED_ESTIMATE_MS",
+                    "20")))
+        self._adaptive_cudagraph_capture_safety_factor = max(
+            1.0,
+            float(
+                os.environ.get(
+                    "VLLM_ADAPTIVE_CUDAGRAPH_CAPTURE_SAFETY_FACTOR",
+                    "1.05")))
+        self._adaptive_cudagraph_recent_step_ms: deque[float] = deque(
+            maxlen=64)
+        self._adaptive_cudagraph_recent_capture_ms: deque[float] = deque(
+            maxlen=32)
+        self._adaptive_cudagraph_capture_samples: deque[
+            tuple[int, float]] = deque(maxlen=32)
+        self._adaptive_cudagraph_model_steps = 0
+        self._adaptive_cudagraph_last_slo_capture_step = 0
         logger.info("Initializing a V1 LLM engine (v%s) with config: %s",
                     VLLM_VERSION, vllm_config)
 
         self.log_stats = log_stats
-
-        # Setup Model.
         self.model_executor = executor_class(vllm_config)
         if executor_fail_callback is not None:
             self.model_executor.register_failure_callback(
                 executor_fail_callback)
+        timer.end("Init execution environment")
 
+        startup_dag_mode = getattr(
+            self, "_startup_dag_mode_override",
+            os.environ.get("VLLM_STARTUP_DAG_MODE", "off")).strip().lower()
+        if startup_dag_mode not in {"off", "shadow", "execute"}:
+            logger.warning("Unknown VLLM_STARTUP_DAG_MODE=%s; using off",
+                           startup_dag_mode)
+            startup_dag_mode = "off"
+        if (startup_dag_mode == "execute"
+                and self.vllm_config.parallel_config.world_size != 1):
+            logger.warning(
+                "Startup DAG execute mode is currently validated only for "
+                "TP=PP=DP=1; emitting a shadow plan and using the existing "
+                "distributed startup path for world_size=%d.",
+                self.vllm_config.parallel_config.world_size)
+            startup_dag_mode = "shadow"
+        if startup_dag_mode == "execute":
+            self._initialize_with_startup_dag()
+            timer.end("Total Init")
+            return
+        if startup_dag_mode == "shadow":
+            self._write_startup_dag_shadow_plan()
+
+        timer.start("Init Model")
+        self.model_executor.init_model()
+        timer.end("Init Model")
+
+        stop_async_weight_prewarm_from_env("EngineCore.load_weights")
+        self._weight_loading_error = None
+        # timer.start("Loading Weights")
+        # self.model_executor.load_weights()
+        # timer.end("Loading Weights")
+
+        def _load_weights_target():
+            try:
+                self.model_executor.load_weights()
+            except BaseException as exc:
+                self._weight_loading_error = exc
+                raise
+        self._weight_loading_thread = threading.Thread(
+            target=_load_weights_target,
+            daemon=True,
+            name="WeightLoadingThread"
+        )
+        self._weight_loading_thread.start()
+
+        timer.start("Model Compilation")
+        self.model_executor.run_to_trigger_compile()
+        timer.end("Model Compilation")
+
+        timer.start("KV Cache Init")
+        available_gpu_memory = self.model_executor.determine_available_memory()
         # Setup KV Caches and update CacheConfig after profiling.
         num_gpu_blocks, num_cpu_blocks, kv_cache_config = \
-            self._initialize_kv_caches(vllm_config)
+            self._initialize_kv_caches(vllm_config, available_gpu_memory)
 
         vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks
         vllm_config.cache_config.num_cpu_blocks = num_cpu_blocks
         self.collective_rpc("initialize_cache",
                             args=(num_gpu_blocks, num_cpu_blocks))
+        timer.end("KV Cache Init")
 
+        weight_loading_thread = getattr(self, "_weight_loading_thread", None)
+        if (weight_loading_thread is not None
+                and weight_loading_thread.is_alive()):
+            logger.info("Waiting for background weight loading before CUDA "
+                        "graph pre-capture.")
+            weight_loading_thread.join()
+        if self._weight_loading_error is not None:
+            raise self._weight_loading_error
+
+        timer.start("CUDA Graph Pre-capture")
+        self.model_executor.compile_or_warm_up_model()
+        timer.end("CUDA Graph Pre-capture")
+
+        timer.start("Others")
         self.structured_output_manager = StructuredOutputManager(vllm_config)
 
         # Setup scheduler.
@@ -129,17 +300,579 @@ class EngineCore:
             logger.info("Batch queue is enabled with size %d",
                         self.batch_queue_size)
             self.batch_queue = queue.Queue(self.batch_queue_size)
+        timer.end("Others")
+        timer.end("Total Init")
+        model_name = vllm_config.model_config.model.split('/')[-1]
+        # timer.save(
+        #     filepath=f"./analysis_results/IgniteServe_tests/cold_without_caches/total_init_{model_name}_IgniteServe_without_caches.json",
+        #     csv_filepath=f"./analysis_results/IgniteServe_tests/cold_without_caches/timing_summary_{model_name}_IgniteServe_without_caches.csv"
+        # )
+
+    def _initialize_engine_core_fields(self, vllm_config: VllmConfig,
+                                       log_stats: bool) -> None:
+        """Initialize EngineCore-owned state before executor construction."""
+        self.vllm_config = vllm_config
+        self.log_stats = log_stats
+        enabled = os.environ.get(
+            "VLLM_ENABLE_ADAPTIVE_CUDAGRAPH", "").lower() in (
+                "1", "true", "yes", "on")
+        self._adaptive_cudagraph_enabled = enabled
+        self._adaptive_cudagraph_idle_grace_s = max(
+            0.0, float(os.environ.get(
+                "VLLM_ADAPTIVE_CUDAGRAPH_IDLE_GRACE_MS", "10")) / 1000.0)
+        self._adaptive_cudagraph_slo_capture_enabled = (
+            enabled and os.environ.get(
+                "VLLM_ADAPTIVE_CUDAGRAPH_ENABLE_SLO_CAPTURE", "1").lower()
+            in ("1", "true", "yes", "on"))
+        self._adaptive_cudagraph_tpot_slo_ms = max(
+            0.0, float(os.environ.get(
+                "VLLM_ADAPTIVE_CUDAGRAPH_TPOT_SLO_MS", "100")))
+        self._adaptive_cudagraph_ttft_slo_ms = max(
+            0.0, float(os.environ.get(
+                "VLLM_ADAPTIVE_CUDAGRAPH_TTFT_SLO_MS", "2000")))
+        self._adaptive_cudagraph_prefill_step_estimate_ms = max(
+            0.1, float(os.environ.get(
+                "VLLM_ADAPTIVE_CUDAGRAPH_PREFILL_STEP_ESTIMATE_MS", "30")))
+        self._adaptive_cudagraph_allow_waiting = os.environ.get(
+            "VLLM_ADAPTIVE_CUDAGRAPH_ALLOW_WAITING_REQUESTS", "1").lower()
+        self._adaptive_cudagraph_allow_waiting = (
+            self._adaptive_cudagraph_allow_waiting in
+            ("1", "true", "yes", "on"))
+        self._adaptive_cudagraph_slo_guard_ms = max(
+            0.0, float(os.environ.get(
+                "VLLM_ADAPTIVE_CUDAGRAPH_SLO_GUARD_MS", "5")))
+        self._adaptive_cudagraph_capture_estimate_ms = max(
+            0.1, float(os.environ.get(
+                "VLLM_ADAPTIVE_CUDAGRAPH_CAPTURE_CHUNK_ESTIMATE_MS", "30")))
+        self._adaptive_cudagraph_slo_interval_steps = max(
+            1, int(os.environ.get(
+                "VLLM_ADAPTIVE_CUDAGRAPH_SLO_CAPTURE_INTERVAL_STEPS", "8")))
+        self._adaptive_cudagraph_slo_pieces = max(
+            0, int(os.environ.get(
+                "VLLM_ADAPTIVE_CUDAGRAPH_SLO_PIECES_PER_STEP", "0")))
+        self._adaptive_cudagraph_slo_max_pieces = max(
+            1, int(os.environ.get(
+                "VLLM_ADAPTIVE_CUDAGRAPH_SLO_MAX_PIECES_PER_STEP", "64")))
+        self._adaptive_cudagraph_capture_fixed_estimate_ms = max(
+            0.1, float(os.environ.get(
+                "VLLM_ADAPTIVE_CUDAGRAPH_CAPTURE_FIXED_ESTIMATE_MS", "20")))
+        self._adaptive_cudagraph_capture_safety_factor = max(
+            1.0, float(os.environ.get(
+                "VLLM_ADAPTIVE_CUDAGRAPH_CAPTURE_SAFETY_FACTOR", "1.05")))
+        self._adaptive_cudagraph_recent_step_ms = deque(maxlen=64)
+        self._adaptive_cudagraph_recent_capture_ms = deque(maxlen=32)
+        self._adaptive_cudagraph_capture_samples = deque(maxlen=32)
+        self._adaptive_cudagraph_model_steps = 0
+        self._adaptive_cudagraph_last_slo_capture_step = 0
+
+    def _initialize_with_full_startup_dag(
+        self,
+        vllm_config: VllmConfig,
+        executor_class: type[Executor],
+        log_stats: bool,
+        executor_fail_callback: Optional[Callable],
+    ) -> None:
+        """Plan from EngineCore construction and expand after state probing."""
+        from vllm.compilation.startup_resources import resource_dir
+        from vllm.v1.engine.startup_orchestrator import (
+            ResourceAwareDAGExecutor,
+            StartupContext,
+            StartupCostHistory,
+            StartupState,
+            build_bootstrap_startup_dag,
+            build_engine_startup_dag,
+            combine_startup_dags,
+            write_bootstrap_plan,
+            write_plan,
+        )
+
+        root = resource_dir("startup_orchestration")
+        model_name = Path(str(vllm_config.model_config.model)).name
+        plan_path = root / "plans" / (
+            f"{model_name}_{os.getpid()}_{time.time_ns()}.json")
+        history = StartupCostHistory(root / "startup_costs.json")
+        bootstrap_state = StartupState(
+            model=str(vllm_config.model_config.model),
+            compile_mode="bootstrap",
+            kv_profile_hit=False,
+            attributes={
+                "planning_state": "before_worker_state",
+                "executor_class": (executor_class.__module__ + "." +
+                                   executor_class.__qualname__),
+                "device": str(vllm_config.device_config.device),
+                "dtype": str(vllm_config.model_config.dtype),
+                "max_model_len": vllm_config.model_config.max_model_len,
+                "max_num_batched_tokens": (
+                    vllm_config.scheduler_config.max_num_batched_tokens),
+                "max_num_seqs": vllm_config.scheduler_config.max_num_seqs,
+                "tensor_parallel_size": (
+                    vllm_config.parallel_config.tensor_parallel_size),
+                "pipeline_parallel_size": (
+                    vllm_config.parallel_config.pipeline_parallel_size),
+                "data_parallel_size": (
+                    vllm_config.parallel_config.data_parallel_size),
+            },
+        )
+
+        def timed(stage_name, action):
+            def invoke(context):
+                timer.start(stage_name)
+                try:
+                    return action(context)
+                finally:
+                    timer.end(stage_name)
+            return invoke
+
+        def construct_core(_):
+            self._initialize_engine_core_fields(vllm_config, log_stats)
+            logger.info("Initializing a V1 LLM engine (v%s) with config: %s",
+                        VLLM_VERSION, vllm_config)
+
+        def load_plugins(_):
+            from vllm.plugins import load_general_plugins
+            load_general_plugins()
+
+        def executor_shell(_):
+            self.model_executor = executor_class(vllm_config, defer_init=True)
+            if executor_fail_callback is not None:
+                self.model_executor.register_failure_callback(
+                    executor_fail_callback)
+
+        def state_probe(context):
+            state = self._collect_startup_state()
+            static_states = context.get("static_worker_states")
+            if static_states:
+                state.attributes["static_worker_states"] = static_states
+            return context.put("startup_state", state)
+
+        def static_resource_probe(context):
+            snapshots = self.collective_rpc(
+                "get_static_startup_resource_snapshot")
+            return context.put("static_worker_states", snapshots)
+
+        bootstrap_actions = {
+            "engine_core_construct": timed("EngineCore Construct",
+                                             construct_core),
+            "plugins": timed("Plugin Initialization", load_plugins),
+            "executor_shell": timed("Executor Shell", executor_shell),
+            "worker_wrapper": timed(
+                "Worker Wrapper",
+                lambda _: self.model_executor.initialize_worker_wrapper()),
+            "worker_prepare": timed(
+                "Worker Prepare", lambda _: self.model_executor.prepare_worker()),
+            "worker_construct": timed(
+                "Worker Construct",
+                lambda _: self.model_executor.construct_worker()),
+            "static_resource_probe": timed(
+                "Static Resource Probe", static_resource_probe),
+            "cuda_device": timed(
+                "CUDA Device Initialization",
+                lambda _: self.model_executor.initialize_cuda_device()),
+            "distributed_environment": timed(
+                "Distributed Environment",
+                lambda _: self.model_executor.
+                initialize_distributed_environment()),
+            "compile_worker_prewarm": timed(
+                "Compile Worker Prewarm",
+                lambda _: self.model_executor.
+                initialize_compile_worker_prewarm()),
+            "model_runner": timed(
+                "GPU ModelRunner Initialization",
+                lambda _: self.model_executor.initialize_model_runner()),
+            "usage_reporting": timed(
+                "Usage Reporting",
+                lambda _: self.model_executor.initialize_usage_reporting()),
+            "state_probe": timed("Startup State Probe", state_probe),
+        }
+        bootstrap = build_bootstrap_startup_dag(bootstrap_actions)
+        bootstrap_defaults = {
+            name: node.estimated_cost_s for name, node in bootstrap.nodes.items()
+        }
+        bootstrap = build_bootstrap_startup_dag(
+            bootstrap_actions,
+            history.estimates(bootstrap_state, bootstrap_defaults))
+        write_bootstrap_plan(plan_path, bootstrap)
+
+        bootstrap_executor = ResourceAwareDAGExecutor(
+            max_workers=max(1, int(os.environ.get(
+                "VLLM_STARTUP_DAG_BOOTSTRAP_MAX_WORKERS", "2"))),
+            resource_capacities={
+                "worker_rpc": 1,
+                "gpu_runtime": 1,
+                "gpu_memory": 1,
+                "compiler_cpu": 1,
+                "cpu": 2,
+            })
+        context = StartupContext(bootstrap_state)
+        timer.start("Startup DAG Bootstrap")
+        try:
+            bootstrap_results = bootstrap_executor.run(bootstrap, context)
+        finally:
+            timer.end("Startup DAG Bootstrap")
+        history.update(bootstrap_state, bootstrap_results)
+
+        state = context.require("startup_state")
+
+        def init_model(_):
+            self.model_executor.init_model()
+
+        def stop_weight_prewarm(_):
+            stop_async_weight_prewarm_from_env("EngineCore.load_weights")
+
+        def load_weights(_):
+            self.model_executor.load_weights()
+
+        def kv_profile(ctx):
+            return ctx.put(
+                "available_gpu_memory",
+                self.model_executor.determine_available_memory())
+
+        def kv_cache_allocate(ctx):
+            available = ctx.require("available_gpu_memory")
+            gpu_blocks, cpu_blocks, config = self._initialize_kv_caches(
+                self.vllm_config, available)
+            self.vllm_config.cache_config.num_gpu_blocks = gpu_blocks
+            self.vllm_config.cache_config.num_cpu_blocks = cpu_blocks
+            self.collective_rpc("initialize_cache",
+                                args=(gpu_blocks, cpu_blocks))
+            return ctx.put("kv_cache_config", config)
+
+        def structured_output(_):
+            self.structured_output_manager = StructuredOutputManager(
+                self.vllm_config)
+
+        def mm_input_cache(_):
+            self.mm_input_cache_server = MirroredProcessingCache(
+                self.vllm_config.model_config)
+
+        def create_scheduler(ctx):
+            scheduler_cls = self.vllm_config.scheduler_config.scheduler_cls
+            Scheduler = (resolve_obj_by_qualname(scheduler_cls)
+                         if isinstance(scheduler_cls, str) else scheduler_cls)
+            self.scheduler = Scheduler(
+                vllm_config=self.vllm_config,
+                kv_cache_config=ctx.require("kv_cache_config"),
+                structured_output_manager=self.structured_output_manager,
+                include_finished_set=(self.vllm_config.parallel_config.
+                                      data_parallel_size > 1),
+                log_stats=self.log_stats,
+            )
+
+        def create_batch_queue(_):
+            self.batch_queue_size = self.model_executor.max_concurrent_batches
+            self.batch_queue = None
+            if self.batch_queue_size > 1:
+                self.batch_queue = queue.Queue(self.batch_queue_size)
+
+        runtime_actions = {
+            "init_model": timed("Init Model", init_model),
+            "stop_weight_prewarm": stop_weight_prewarm,
+            "load_weights": timed("Loading Weights", load_weights),
+            "compile_model": timed(
+                "Model Compilation",
+                lambda _: self.model_executor.run_to_trigger_compile()),
+            "kv_profile": timed("KV Profile", kv_profile),
+            "kv_cache_allocate": timed("KV Cache Allocation",
+                                         kv_cache_allocate),
+            "cuda_graph_precapture": timed(
+                "CUDA Graph Pre-capture",
+                lambda _: self.model_executor.compile_or_warm_up_model()),
+            "structured_output": timed("Others.Structured Output",
+                                         structured_output),
+            "mm_input_cache": timed("Others.MM Input Cache", mm_input_cache),
+            "scheduler": timed("Others.Scheduler", create_scheduler),
+            "batch_queue": timed("Others.Batch Queue", create_batch_queue),
+            "ready": lambda _: None,
+        }
+        runtime = build_engine_startup_dag(state, runtime_actions)
+        runtime_defaults = {
+            name: node.estimated_cost_s for name, node in runtime.nodes.items()
+        }
+        runtime = build_engine_startup_dag(
+            state, runtime_actions, history.estimates(state, runtime_defaults))
+        expanded = combine_startup_dags(bootstrap, runtime)
+        write_plan(plan_path, state, expanded, bootstrap_results)
+
+        runtime_executor = ResourceAwareDAGExecutor(
+            # Two workers are the minimum needed to preserve the established
+            # compile-only/weight-loading overlap. A one-worker schedule would
+            # execute compile-only against unloaded parameters.
+            max_workers=max(2, int(os.environ.get(
+                "VLLM_STARTUP_DAG_MAX_WORKERS", "2"))),
+            resource_capacities={
+                "worker_rpc": 2,
+                "disk_io": 1,
+                "compiler_cpu": 1,
+                "gpu_compute": 1,
+                "gpu_memory": 1,
+                "cpu": 2,
+            })
+        timer.start("Startup DAG Runtime")
+        try:
+            runtime_results = runtime_executor.run(runtime, context)
+        finally:
+            timer.end("Startup DAG Runtime")
+        history.update(state, runtime_results)
+        all_results = {**bootstrap_results, **runtime_results}
+        write_plan(plan_path, state, expanded, all_results)
+        logger.info(
+            "Full startup DAG finished: plan=%s bootstrap_nodes=%d "
+            "runtime_nodes=%d state=%s", plan_path, len(bootstrap.nodes),
+            len(runtime.nodes), state.signature()[:16])
+
+    def _collect_startup_state(self):
+        from vllm.v1.engine.startup_orchestrator import StartupState
+        from vllm.v1.worker.startup_compile import startup_compile_mode
+
+        worker_states = self.collective_rpc("get_startup_state_snapshot")
+        if not worker_states:
+            raise RuntimeError("No worker startup state was returned")
+
+        def all_workers(key: str) -> bool:
+            return all(bool(state.get(key)) for state in worker_states)
+
+        model_config = self.vllm_config.model_config
+        scheduler_config = self.vllm_config.scheduler_config
+        parallel_config = self.vllm_config.parallel_config
+        return StartupState(
+            model=str(model_config.model),
+            compile_mode=startup_compile_mode(),
+            kv_profile_hit=all_workers("kv_profile_hit"),
+            compile_cache_present=all_workers("compile_cache_present"),
+            best_config_store_present=all_workers(
+                "best_config_store_present"),
+            transformed_code_store_present=all_workers(
+                "transformed_code_store_present"),
+            metadata_store_present=all_workers("metadata_store_present"),
+            hotspot_profile_present=all_workers("hotspot_profile_present"),
+            attributes={
+                "worker_states": worker_states,
+                # The compile-only dummy forward and GraphPickler read module
+                # parameters. Concurrent in-place loading is a data race even
+                # for dense FP16 models, so compilation requires the complete
+                # loader/post-load boundary for every configuration.
+                "compile_requires_finalized_weights": True,
+                "overlap_safe_weight_loading": False,
+                "max_model_len": model_config.max_model_len,
+                "max_num_batched_tokens":
+                    scheduler_config.max_num_batched_tokens,
+                "max_num_seqs": scheduler_config.max_num_seqs,
+                "tensor_parallel_size": parallel_config.tensor_parallel_size,
+                "pipeline_parallel_size":
+                    parallel_config.pipeline_parallel_size,
+                "data_parallel_size": parallel_config.data_parallel_size,
+            },
+        )
+
+    def _startup_orchestration_paths(self) -> tuple[Path, Path]:
+        from vllm.compilation.startup_resources import resource_dir
+
+        root = resource_dir("startup_orchestration")
+        plan_root = root / "plans"
+        model_name = Path(str(self.vllm_config.model_config.model)).name
+        plan_name = f"{model_name}_{os.getpid()}_{time.time_ns()}.json"
+        return root / "startup_costs.json", plan_root / plan_name
+
+    def _write_startup_dag_shadow_plan(self) -> None:
+        from vllm.v1.engine.startup_orchestrator import (
+            StartupCostHistory,
+            build_engine_startup_dag,
+            write_plan,
+        )
+
+        try:
+            state = self._collect_startup_state()
+            history_path, plan_path = self._startup_orchestration_paths()
+            history = StartupCostHistory(history_path)
+            dag = build_engine_startup_dag(state, {})
+            defaults = {
+                name: node.estimated_cost_s for name, node in dag.nodes.items()
+            }
+            costs = history.estimates(state, defaults)
+            dag = build_engine_startup_dag(state, {}, costs)
+            write_plan(plan_path, state, dag)
+            path, predicted_s = dag.critical_path()
+            logger.info(
+                "Startup DAG shadow plan saved: path=%s state=%s "
+                "critical_path=%s predicted_s=%.6f", plan_path,
+                state.signature()[:16], " -> ".join(path), predicted_s)
+        except Exception:
+            # Shadow mode must never change legacy startup availability.
+            logger.exception("Startup DAG shadow planning failed; continuing "
+                             "with the legacy startup path")
+
+    def _initialize_with_startup_dag(self) -> None:
+        from vllm.v1.engine.startup_orchestrator import (
+            ResourceAwareDAGExecutor,
+            StartupContext,
+            StartupCostHistory,
+            build_engine_startup_dag,
+            write_plan,
+        )
+
+        state = self._collect_startup_state()
+        history_path, plan_path = self._startup_orchestration_paths()
+        history = StartupCostHistory(history_path)
+
+        def timed(stage_name, action):
+            def invoke(context):
+                timer.start(stage_name)
+                try:
+                    return action(context)
+                finally:
+                    timer.end(stage_name)
+            return invoke
+
+        def init_model(_):
+            self.model_executor.init_model()
+
+        def stop_weight_prewarm(_):
+            stop_async_weight_prewarm_from_env("EngineCore.load_weights")
+
+        def load_weights(_):
+            self.model_executor.load_weights()
+
+        def compile_model(_):
+            self.model_executor.run_to_trigger_compile()
+
+        def kv_profile(context):
+            return context.put(
+                "available_gpu_memory",
+                self.model_executor.determine_available_memory())
+
+        def kv_cache_allocate(context):
+            available_gpu_memory = context.require("available_gpu_memory")
+            num_gpu_blocks, num_cpu_blocks, kv_cache_config = (
+                self._initialize_kv_caches(
+                    self.vllm_config, available_gpu_memory))
+            self.vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks
+            self.vllm_config.cache_config.num_cpu_blocks = num_cpu_blocks
+            self.collective_rpc("initialize_cache",
+                                args=(num_gpu_blocks, num_cpu_blocks))
+            return context.put("kv_cache_config", kv_cache_config)
+
+        def cuda_graph_precapture(_):
+            self.model_executor.compile_or_warm_up_model()
+
+        def structured_output(_):
+            self.structured_output_manager = StructuredOutputManager(
+                self.vllm_config)
+
+        def mm_input_cache(_):
+            self.mm_input_cache_server = MirroredProcessingCache(
+                self.vllm_config.model_config)
+
+        def create_scheduler(context):
+            scheduler_cls = self.vllm_config.scheduler_config.scheduler_cls
+            Scheduler = (resolve_obj_by_qualname(scheduler_cls)
+                         if isinstance(scheduler_cls, str) else scheduler_cls)
+            if Scheduler is not V1Scheduler:
+                logger.warning(
+                    "Using configured V1 scheduler class %s. This scheduler "
+                    "interface is not public and compatibility may not be "
+                    "maintained.", scheduler_cls)
+            self.scheduler = Scheduler(
+                vllm_config=self.vllm_config,
+                kv_cache_config=context.require("kv_cache_config"),
+                structured_output_manager=self.structured_output_manager,
+                include_finished_set=(
+                    self.vllm_config.parallel_config.data_parallel_size > 1),
+                log_stats=self.log_stats,
+            )
+
+        def create_batch_queue(_):
+            self.batch_queue_size = self.model_executor.max_concurrent_batches
+            self.batch_queue = None
+            if self.batch_queue_size > 1:
+                logger.info("Batch queue is enabled with size %d",
+                            self.batch_queue_size)
+                self.batch_queue = queue.Queue(self.batch_queue_size)
+
+        actions = {
+            "init_model": timed("Init Model", init_model),
+            "stop_weight_prewarm": stop_weight_prewarm,
+            "load_weights": timed("Loading Weights", load_weights),
+            "compile_model": timed("Model Compilation", compile_model),
+            "kv_profile": timed("KV Profile", kv_profile),
+            "kv_cache_allocate": timed("KV Cache Allocation",
+                                        kv_cache_allocate),
+            "cuda_graph_precapture": timed("CUDA Graph Pre-capture",
+                                            cuda_graph_precapture),
+            "structured_output": timed("Others.Structured Output",
+                                       structured_output),
+            "mm_input_cache": timed("Others.MM Input Cache", mm_input_cache),
+            "scheduler": timed("Others.Scheduler", create_scheduler),
+            "batch_queue": timed("Others.Batch Queue", create_batch_queue),
+            "ready": lambda _: None,
+        }
+        initial_dag = build_engine_startup_dag(state, actions)
+        defaults = {
+            name: node.estimated_cost_s
+            for name, node in initial_dag.nodes.items()
+        }
+        costs = history.estimates(state, defaults)
+        dag = build_engine_startup_dag(state, actions, costs)
+        write_plan(plan_path, state, dag)
+        predicted_path, predicted_s = dag.critical_path()
+        logger.info(
+            "Startup DAG execution started: state=%s kv_profile_hit=%s "
+            "critical_path=%s predicted_s=%.6f plan=%s",
+            state.signature()[:16], state.kv_profile_hit,
+            " -> ".join(predicted_path), predicted_s, plan_path)
+
+        executor = ResourceAwareDAGExecutor(
+            max_workers=max(2, int(os.environ.get(
+                "VLLM_STARTUP_DAG_MAX_WORKERS", "2"))),
+            resource_capacities={
+                "worker_rpc": 2,
+                "disk_io": 1,
+                "compiler_cpu": 1,
+                "gpu_compute": 1,
+                "gpu_memory": 1,
+                "cpu": 2,
+            },
+        )
+        timer.start("Startup DAG Execution")
+        context = StartupContext(state)
+        try:
+            results = executor.run(dag, context)
+        finally:
+            timer.end("Startup DAG Execution")
+        history.update(state, results)
+        write_plan(plan_path, state, dag, results)
+
+        actual_path = sorted(
+            results.values(), key=lambda result: result.started_at)
+        logger.info(
+            "Startup DAG execution finished: plan=%s stages=%s",
+            plan_path,
+            ", ".join(
+                f"{result.name}:{result.elapsed_s:.6f}s"
+                for result in actual_path),
+        )
+        # timer.save(
+        #     filepath=f"./analysis_results/IgniteServe_tests/cold_with_caches/total_init_{model_name}_IgniteServe_with_caches.json",
+        #     csv_filepath=f"./analysis_results/IgniteServe_tests/cold_with_caches/timing_summary_{model_name}_IgniteServe_with_caches.csv"
+        # )
+        # timer.save(
+        #     filepath=f"./analysis_results/Startup/cold_without_caches/total_init_{model_name}_vLLM_without_caches.json",
+        #     csv_filepath=f"./analysis_results/Startup/cold_without_caches/timing_summary_{model_name}_vLLM_without_caches.csv"
+        # )
+        # timer.save(
+        #     filepath=f"./analysis_results/Startup/cold_with_caches/total_init_{model_name}_vLLM_with_caches.json",
+        #     csv_filepath=f"./analysis_results/Startup/cold_with_caches/timing_summary_{model_name}_vLLM_with_caches.csv"
+        # )
 
     def _initialize_kv_caches(
-            self, vllm_config: VllmConfig) -> tuple[int, int, KVCacheConfig]:
-        start = time.time()
+            self, vllm_config: VllmConfig, available_gpu_memory) -> tuple[int, int, KVCacheConfig]:
+        # start = time.time()
 
         # Get all kv cache needed by the model
         kv_cache_specs = self.model_executor.get_kv_cache_specs()
 
         # Profiles the peak memory usage of the model to determine how much
         # memory can be allocated for kv cache.
-        available_gpu_memory = self.model_executor.determine_available_memory()
+        # available_gpu_memory = self.model_executor.determine_available_memory()
 
         assert len(kv_cache_specs) == len(available_gpu_memory)
         # Get the kv cache tensor size
@@ -165,12 +898,12 @@ class EngineCore:
         num_cpu_blocks = 0
         scheduler_kv_cache_config = kv_cache_configs[0]
 
-        # Initialize kv cache and warmup the execution
+        # Initialize kv cache
         self.model_executor.initialize_from_config(kv_cache_configs)
 
-        elapsed = time.time() - start
-        logger.info(("init engine (profile, create kv cache, "
-                     "warmup model) took %.2f seconds"), elapsed)
+        # elapsed = time.time() - start
+        # logger.info(("init engine (profile, create kv cache, "
+        #              "warmup model) took %.2f seconds"), elapsed)
         return num_gpu_blocks, num_cpu_blocks, scheduler_kv_cache_config
 
     def add_request(self, request: EngineCoreRequest):
@@ -288,8 +1021,16 @@ class EngineCore:
         return engine_core_outputs, scheduled_batch
 
     def shutdown(self):
+        HotspotAnalyzer.check_and_export(True)
         self.structured_output_manager.clear_backend()
         if self.model_executor:
+            if self._adaptive_cudagraph_enabled:
+                try:
+                    self.model_executor.collective_rpc(
+                        "export_adaptive_cudagraph_telemetry")
+                except Exception:
+                    logger.exception(
+                        "Failed to export adaptive CUDA graph telemetry")
             self.model_executor.shutdown()
         if self.scheduler:
             self.scheduler.shutdown()
@@ -613,7 +1354,25 @@ class EngineCoreProc(EngineCore):
             if logger.isEnabledFor(DEBUG) and self.input_queue.empty():
                 logger.debug("EngineCore waiting for work.")
                 waited = True
-            req = self.input_queue.get()
+            if self._adaptive_cudagraph_enabled:
+                try:
+                    # Give newly arrived work priority over maintenance. Only
+                    # capture after an uninterrupted idle grace period.
+                    req = self.input_queue.get(
+                        timeout=self._adaptive_cudagraph_idle_grace_s)
+                except queue.Empty:
+                    # A producer may enqueue work exactly as the grace timeout
+                    # expires. Recheck before entering a non-preemptive CUDA
+                    # stream-capture window.
+                    if not self.input_queue.empty():
+                        continue
+                    if self.model_executor.capture_pending_cudagraphs() > 0:
+                        # Re-enter the grace period before capturing another
+                        # graph, so a request can preempt the maintenance queue.
+                        continue
+                    req = self.input_queue.get()
+            else:
+                req = self.input_queue.get()
             self._handle_client_request(*req)
 
         if waited:
@@ -628,12 +1387,223 @@ class EngineCoreProc(EngineCore):
         """Called only when there are unfinished local requests."""
 
         # Step the engine core.
+        step_started = time.perf_counter()
         outputs, model_executed = self.step_fn()
+        step_elapsed_ms = (time.perf_counter() - step_started) * 1000.0
+        if model_executed:
+            self._adaptive_cudagraph_recent_step_ms.append(step_elapsed_ms)
+            self._adaptive_cudagraph_model_steps += 1
         # Put EngineCoreOutputs into the output queue.
         for output in (outputs.items() if outputs else ()):
             self.output_queue.put_nowait(output)
 
+        if model_executed:
+            self._maybe_capture_cudagraph_with_slo_slack()
+
         return model_executed
+
+    @staticmethod
+    def _percentile(values: deque[float], quantile: float) -> float:
+        ordered = sorted(values)
+        if not ordered:
+            return 0.0
+        index = int(round((len(ordered) - 1) * quantile))
+        return ordered[index]
+
+    def _request_slo_ms(self, request: Request, key: str,
+                        default: float) -> float:
+        sampling_params = request.sampling_params
+        extra_args = (sampling_params.extra_args
+                      if sampling_params is not None else None)
+        if not extra_args or key not in extra_args:
+            return default
+        try:
+            return max(0.0, float(extra_args[key]))
+        except (TypeError, ValueError):
+            return default
+
+    def _select_slo_capture_piece_budget(
+            self, slack_ms: float) -> tuple[int, float]:
+        """Choose the largest conservative capture unit fitting the slack."""
+        fixed_budget = self._adaptive_cudagraph_slo_pieces
+        if fixed_budget > 0:
+            estimate_ms = (self._percentile(
+                self._adaptive_cudagraph_recent_capture_ms, 0.90)
+                           if self._adaptive_cudagraph_recent_capture_ms else
+                           self._adaptive_cudagraph_capture_estimate_ms)
+            return ((fixed_budget, estimate_ms)
+                    if estimate_ms <= slack_ms else (0, estimate_ms))
+
+        max_pieces = self._adaptive_cudagraph_slo_max_pieces
+        candidates = sorted({
+            pieces
+            for pieces in (1, 2, 4, 8, 16, 32, max_pieces)
+            if pieces <= max_pieces
+        })
+        fixed_ms = min(self._adaptive_cudagraph_capture_fixed_estimate_ms,
+                       self._adaptive_cudagraph_capture_estimate_ms)
+        scalable_ms = max(
+            0.0, self._adaptive_cudagraph_capture_estimate_ms - fixed_ms)
+
+        selected = 0
+        selected_estimate_ms = fixed_ms
+        for candidate in candidates:
+            matching_samples = [
+                elapsed_ms for budget, elapsed_ms in
+                self._adaptive_cudagraph_capture_samples
+                if budget == candidate
+            ]
+            if matching_samples:
+                estimate_ms = (self._percentile(matching_samples, 0.90) *
+                               self._adaptive_cudagraph_capture_safety_factor)
+            else:
+                estimate_ms = (fixed_ms + scalable_ms * candidate /
+                               max_pieces)
+            if estimate_ms <= slack_ms:
+                selected = candidate
+                selected_estimate_ms = estimate_ms
+        return selected, selected_estimate_ms
+
+    def _maybe_capture_cudagraph_with_slo_slack(self) -> None:
+        """Borrow a bounded inter-token gap when every active request fits."""
+        if not self._adaptive_cudagraph_slo_capture_enabled:
+            return
+        parallel_config = self.vllm_config.parallel_config
+        if (parallel_config.world_size != 1
+                or parallel_config.data_parallel_size != 1
+                or self.batch_queue is not None):
+            return
+        if (self._adaptive_cudagraph_model_steps
+                - self._adaptive_cudagraph_last_slo_capture_step
+                < self._adaptive_cudagraph_slo_interval_steps):
+            return
+        if not self.input_queue.empty():
+            return
+
+        running = getattr(self.scheduler, "running", None)
+        waiting = getattr(self.scheduler, "waiting", None)
+        if not running:
+            return
+        if waiting and not self._adaptive_cudagraph_allow_waiting:
+            return
+        # Never spend capture slack before first-token delivery or while a
+        # chunked prefill remains in the active batch.
+        if any(request.num_output_tokens <= 0
+               or request.num_computed_tokens < request.num_prompt_tokens
+               for request in running):
+            return
+        if len(self._adaptive_cudagraph_recent_step_ms) < 4:
+            return
+
+        step_p90_ms = self._percentile(
+            self._adaptive_cudagraph_recent_step_ms, 0.90)
+        tpot_slo_ms = min(
+            self._request_slo_ms(request, "cudagraph_tpot_slo_ms",
+                                 self._adaptive_cudagraph_tpot_slo_ms)
+            for request in running)
+        slack_ms = (tpot_slo_ms - step_p90_ms
+                    - self._adaptive_cudagraph_slo_guard_ms)
+
+        if waiting:
+            max_batched_tokens = max(
+                1, int(
+                    getattr(self.scheduler, "max_num_scheduled_tokens", 1)))
+            queued_prompt_tokens = 0
+            prefill_step_ms = max(
+                step_p90_ms,
+                self._adaptive_cudagraph_prefill_step_estimate_ms)
+            for request in waiting:
+                queued_prompt_tokens += max(
+                    1, request.num_prompt_tokens
+                    - request.num_computed_tokens)
+                prefill_steps_ahead = (
+                    queued_prompt_tokens + max_batched_tokens - 1
+                ) // max_batched_tokens
+                ttft_slo_ms = self._request_slo_ms(
+                    request, "cudagraph_ttft_slo_ms",
+                    self._adaptive_cudagraph_ttft_slo_ms)
+                elapsed_ms = (time.time() - request.arrival_time) * 1000.0
+                waiting_slack_ms = (
+                    ttft_slo_ms - elapsed_ms
+                    - prefill_steps_ahead * prefill_step_ms
+                    - self._adaptive_cudagraph_slo_guard_ms)
+                slack_ms = min(slack_ms, waiting_slack_ms)
+
+        # An optional end-to-end SLO is checked per request. A value of zero
+        # leaves total-latency admission disabled while TPOT remains active.
+        now = time.time()
+        for request in running:
+            e2e_slo_ms = self._request_slo_ms(
+                request, "cudagraph_e2e_slo_ms", 0.0)
+            if e2e_slo_ms <= 0.0:
+                continue
+            remaining_tokens = max(
+                0, request.max_tokens - request.num_output_tokens)
+            elapsed_ms = (now - request.arrival_time) * 1000.0
+            request_slack_ms = (e2e_slo_ms - elapsed_ms
+                                - remaining_tokens * step_p90_ms)
+            slack_ms = min(slack_ms, request_slack_ms)
+
+        default_piece_ms = max(
+            0.01,
+            (self._adaptive_cudagraph_capture_estimate_ms
+             - self._adaptive_cudagraph_capture_fixed_estimate_ms)
+            / self._adaptive_cudagraph_slo_max_pieces,
+        )
+        capture_plans = self.model_executor.collective_rpc(
+            "plan_pending_cudagraph_capture",
+            args=(
+                slack_ms,
+                self._adaptive_cudagraph_slo_max_pieces,
+                self._adaptive_cudagraph_capture_fixed_estimate_ms,
+                default_piece_ms,
+                self._adaptive_cudagraph_capture_safety_factor,
+            ),
+        )
+        plans = [plan for plan in capture_plans if plan is not None]
+        if not plans:
+            return
+        piece_budget = min(int(plan["piece_budget"]) for plan in plans)
+        predicted_capture_ms = max(
+            float(plan["predicted_ms"]) for plan in plans)
+        if piece_budget <= 0 or predicted_capture_ms > slack_ms:
+            return
+        # A final queue check narrows the race with newly arrived work. The
+        # admitted unit is one non-preemptive piece, so the remaining race is
+        # bounded by the measured chunk estimate rather than a whole model.
+        if not self.input_queue.empty():
+            return
+
+        self._adaptive_cudagraph_last_slo_capture_step = (
+            self._adaptive_cudagraph_model_steps)
+        capture_started = time.perf_counter()
+        try:
+            progressed = self.model_executor.capture_pending_cudagraphs(
+                max_pieces_per_shape=piece_budget,
+                deadline_ms=slack_ms,
+            )
+        except Exception:
+            logger.exception(
+                "Adaptive CUDA graph SLO capture maintenance failed")
+            return
+        capture_elapsed_ms = (time.perf_counter() - capture_started) * 1000.0
+        if progressed > 0:
+            self._adaptive_cudagraph_recent_capture_ms.append(
+                capture_elapsed_ms)
+            self._adaptive_cudagraph_capture_samples.append(
+                (piece_budget, capture_elapsed_ms))
+            logger.info(
+                "Adaptive CUDA graph SLO capture progressed: workers=%d "
+                "piece_budget=%d predicted_ms=%.3f elapsed_ms=%.3f "
+                "admitted_slack_ms=%.3f "
+                "step_p90_ms=%.3f tpot_slo_ms=%.3f", progressed,
+                piece_budget, predicted_capture_ms, capture_elapsed_ms,
+                slack_ms, step_p90_ms, tpot_slo_ms)
+            if capture_elapsed_ms > slack_ms:
+                logger.warning(
+                    "Adaptive CUDA graph capture chunk exceeded admitted "
+                    "slack: elapsed_ms=%.3f slack_ms=%.3f",
+                    capture_elapsed_ms, slack_ms)
 
     def _handle_client_request(self, request_type: EngineCoreRequestType,
                                request: Any) -> None:

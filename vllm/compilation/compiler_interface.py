@@ -4,6 +4,7 @@ import contextlib
 import copy
 import hashlib
 import os
+import threading
 from contextlib import ExitStack
 from typing import Any, Callable, Optional
 from unittest.mock import patch
@@ -18,8 +19,8 @@ from vllm.config import VllmConfig
 from vllm.utils import is_torch_equal_or_newer
 
 from .inductor_pass import pass_context
-
-
+from vllm.logger import init_logger
+logger = init_logger(__name__)
 class CompilerInterface:
     """
     The interface for a compiler that can be used by vLLM.
@@ -66,6 +67,7 @@ class CompilerInterface:
         compiler_config: dict[str, Any],
         runtime_shape: Optional[int] = None,
         key: Optional[str] = None,
+        graph_index: int = 0,
     ) -> tuple[Optional[Callable], Optional[Any]]:
         """
         Compile the graph with the given example inputs and compiler config,
@@ -190,6 +192,7 @@ class InductorStandaloneAdaptor(CompilerInterface):
         compiler_config: dict[str, Any],
         runtime_shape: Optional[int] = None,
         key: Optional[str] = None,
+        graph_index: int = 0,
     ) -> tuple[Optional[Callable], Optional[Any]]:
         compilation_counter.num_inductor_compiles += 1
         current_config = {}
@@ -243,6 +246,439 @@ class InductorStandaloneAdaptor(CompilerInterface):
 
         return compiled_graph_wrapper
 
+class ThreadSafeInductorAdaptor(CompilerInterface):
+    """
+    Thread-safe Inductor adaptor used by the parallel compile backend.
+
+    All subgraphs share one cache root, while PyTorch/Inductor still derives
+    per-graph cache entries from the graph hash.
+    """
+    name = "inductor"
+
+    def __init__(self):
+        self._thread_local = threading.local()
+        self._init_lock = threading.Lock()
+        self._cache_initialized = False
+        self.cache_dir: Optional[str] = None
+        self.prefix: Optional[str] = None
+        self.base_cache_dir: Optional[str] = None
+        self.disable_cache: bool = False
+        self.inductor_cache_dir: Optional[str] = None
+        self.triton_cache_dir: Optional[str] = None
+
+    def compute_hash(self, vllm_config: VllmConfig) -> str:
+        """生成当前 Inductor 环境对应的 cache key"""
+        factors = get_inductor_factors()
+        hash_str = hashlib.md5(str(factors).encode(), usedforsecurity=False).hexdigest()[:10]
+        return hash_str
+
+    def initialize_cache(
+        self,
+        cache_dir: str,
+        disable_cache: bool = False,
+        prefix: str = ""
+    ):
+        """
+        懒初始化缓存目录（双重检查锁定）
+
+        所有子图共享同一个缓存目录：
+        - base_cache_dir/inductor_cache
+        - base_cache_dir/triton_cache
+        """
+        # 快速路径：已初始化，无锁直接返回
+        if self._cache_initialized:
+            return
+
+        # 慢速路径：需要初始化
+        with self._init_lock:
+            # 双重检查：防止多个线程同时初始化
+            if self._cache_initialized:
+                return
+
+            thread_id = threading.get_ident()
+            logger.debug(f"[Thread-{thread_id}] Initializing shared cache: {cache_dir}")
+
+            self.cache_dir = cache_dir
+            self.prefix = prefix
+            self.base_cache_dir = cache_dir[:-len(prefix)] if prefix else cache_dir
+            self.disable_cache = disable_cache
+
+            if not disable_cache:
+                # 创建共享的缓存目录（所有子图使用）
+                self.inductor_cache_dir = os.path.join(self.base_cache_dir, "inductor_cache")
+                self.triton_cache_dir = os.path.join(self.base_cache_dir, "triton_cache")
+
+                os.makedirs(self.inductor_cache_dir, exist_ok=True)
+                os.makedirs(self.triton_cache_dir, exist_ok=True)
+
+                # 设置环境变量（全局，所有子图共享）
+                os.environ["TORCHINDUCTOR_CACHE_DIR"] = self.inductor_cache_dir
+                os.environ["TRITON_CACHE_DIR"] = self.triton_cache_dir
+
+                logger.info(
+                    f"Shared cache directories initialized:\n"
+                    f"  - Inductor: {self.inductor_cache_dir}\n"
+                    f"  - Triton: {self.triton_cache_dir}"
+                )
+
+            # 标记已初始化
+            self._cache_initialized = True
+
+    def _init_thread_local_vars(self):
+        """初始化线程本地变量"""
+        if not hasattr(self._thread_local, 'thread_id'):
+            self._thread_local.thread_id = threading.get_ident()
+
+    def compile(
+        self,
+        graph: fx.GraphModule,
+        example_inputs: list[Any],
+        compiler_config: dict[str, Any],
+        runtime_shape: Optional[int] = None,
+        key: Optional[str] = None,
+        graph_index: int = 0,
+    ) -> tuple[Optional[Callable], Optional[Any]]:
+        """
+        线程安全的编译方法（共享缓存目录版本）
+
+        关键点：
+        1. 所有子图使用相同的缓存目录
+        2. Inductor 内部通过 graph hash 区分不同子图
+        3. 无需为每个子图设置不同的环境变量
+        """
+        # 初始化线程本地变量
+        self._init_thread_local_vars()
+        thread_id = self._thread_local.thread_id
+
+        logger.debug(f"[Thread-{thread_id}] Starting compilation for graph_{graph_index}")
+
+        compilation_counter.num_inductor_compiles += 1
+
+        # 深拷贝 graph，避免多线程修改同一个对象
+        graph = copy.deepcopy(graph)
+
+        # 准备配置
+        current_config = {}
+        if compiler_config is not None:
+            current_config.update(compiler_config)
+
+        current_config["fx_graph_cache"] = True
+        current_config["fx_graph_remote_cache"] = False
+
+        # 设置 Inductor 配置（无需锁，PyTorch 内部处理）
+        set_inductor_config(current_config, runtime_shape)
+
+        # 【关键】不修改环境变量，使用全局共享的缓存路径
+        # Inductor 会根据 graph hash 自动在缓存目录中创建子目录
+
+        try:
+            # 根据 PyTorch 版本选择编译方法
+            if torch.__version__ >= "2.6":
+                compiled_graph, hash_str, file_path = self._compile_with_native_concurrent(
+                    graph, example_inputs, current_config, runtime_shape, graph_index
+                )
+            else:
+                # PyTorch 2.5 降级方案
+                compiled_graph, hash_str, file_path = self._compile_with_minimal_patch(
+                    graph, example_inputs, current_config, runtime_shape, graph_index
+                )
+
+        except Exception as e:
+            logger.error(
+                f"[Thread-{thread_id}] Compilation failed for graph_{graph_index}: {e}",
+                exc_info=True
+            )
+            raise
+
+        # 验证
+        if not envs.VLLM_DISABLE_COMPILE_CACHE:
+            if hash_str is None:
+                raise RuntimeError(
+                    f"[Thread-{thread_id}] Failed to compile graph_{graph_index}. "
+                    "The most likely reason for this is that a previous compilation "
+                    "failed, leading to a corrupted compilation artifact. "
+                    "We recommend trying to "
+                    "remove ~/.cache/vllm/torch_compile_cache and try again "
+                    "to see the real issue.")
+            assert file_path is not None, (
+                f"[Thread-{thread_id}] Failed to get the file path of the compiled graph")
+
+        logger.debug(
+            f"[Thread-{thread_id}] Compilation successful for graph_{graph_index}:\n"
+            f"  - Hash: {hash_str}\n"
+            f"  - File: {file_path}"
+        )
+
+        return compiled_graph, (hash_str, file_path)
+
+    def _compile_with_native_concurrent(
+        self,
+        graph: fx.GraphModule,
+        example_inputs: list[Any],
+        config: dict[str, Any],
+        runtime_shape: Optional[int],
+        graph_index: int
+    ) -> tuple[Callable, str, str]:
+        """
+        使用 PyTorch 2.6+ 的原生并发支持（无需全局 Patch 锁）
+
+        所有子图共享相同的缓存目录，Inductor 内部通过 graph hash 区分
+        """
+        from torch._inductor.compile_fx import compile_fx
+        from torch._inductor.codecache import FxGraphCache
+        from torch._functorch._aot_autograd.autograd_cache import AOTAutogradCache
+
+        thread_id = self._thread_local.thread_id
+        logger.debug(f"[Thread-{thread_id}] Using PyTorch 2.6+ native concurrent compile")
+
+        # 初始化用于捕获信息的变量
+        hash_str = None
+        file_path = None
+
+        # 定义劫持函数（仅用于捕获信息，不影响并发）
+        def hijacked_compile_fx_inner(*args, **kwargs):
+            nonlocal hash_str, file_path
+            output = torch._inductor.compile_fx.compile_fx_inner(*args, **kwargs)
+
+            if output is not None:
+                # 从返回值中提取信息
+                hash_str = output._fx_graph_cache_key
+                compiled_fn = output.current_callable
+                file_path = compiled_fn.__code__.co_filename
+
+                # 查找真实的文件路径
+                if self.base_cache_dir and not file_path.startswith(self.base_cache_dir):
+                    for cell in compiled_fn.__closure__ or []:
+                        if callable(cell.cell_contents):
+                            code = cell.cell_contents.__code__
+                            if code.co_filename.startswith(self.base_cache_dir):
+                                file_path = code.co_filename
+                                break
+
+                logger.debug(
+                    f"[Thread-{thread_id}] Captured compilation info for graph_{graph_index}:\n"
+                    f"  - Hash: {hash_str}\n"
+                    f"  - File: {file_path}"
+                )
+
+            return output
+
+        def _get_shape_env() -> AlwaysHitShapeEnv:
+            return AlwaysHitShapeEnv()
+
+        def _check_can_cache(*args, **kwargs):
+            return
+
+        # 【关键】不使用全局锁，直接 Patch（PyTorch 内部处理并发）
+        with ExitStack() as stack:
+            # Patch shape 环境
+            stack.enter_context(
+                patch("torch._inductor.codecache.FxGraphCache._get_shape_env",
+                      _get_shape_env))
+
+            # Patch AOT 缓存的 shape 环境
+            if hasattr(AOTAutogradCache, "_get_shape_env"):
+                stack.enter_context(
+                    patch(
+                        "torch._functorch._aot_autograd.autograd_cache.AOTAutogradCache._get_shape_env",
+                        _get_shape_env))
+
+            # 强制允许缓存
+            stack.enter_context(
+                patch(
+                    "torch._inductor.codecache.FxGraphCache._check_can_cache",
+                    _check_can_cache))
+
+            # Dynamo 指标上下文
+            stack.enter_context(self.metrics_context())
+
+            # 禁用远程缓存
+            stack.enter_context(
+                torch._inductor.config.patch(fx_graph_remote_cache=False))
+            stack.enter_context(
+                torch._functorch.config.patch(enable_remote_autograd_cache=False))
+
+            # 执行编译（并发安全，无全局锁）
+            with pass_context(runtime_shape):
+                compiled_graph = compile_fx(
+                    graph,
+                    example_inputs,
+                    inner_compile=hijacked_compile_fx_inner,
+                    config_patches=config
+                )
+
+        return compiled_graph, hash_str, file_path
+
+    def _compile_with_minimal_patch(
+        self,
+        graph: fx.GraphModule,
+        example_inputs: list[Any],
+        config: dict[str, Any],
+        runtime_shape: Optional[int],
+        graph_index: int
+    ) -> tuple[Callable, str, str]:
+        """
+        PyTorch 2.5 降级方案（使用最小化的 Patch）
+
+        注意：PyTorch 2.5 对并发支持有限，建议升级到 2.6+
+        """
+        from torch._inductor.compile_fx import compile_fx
+        from torch._inductor.codecache import FxGraphCache, compiled_fx_graph_hash
+        from torch._functorch._aot_autograd.autograd_cache import AOTAutogradCache
+
+        thread_id = self._thread_local.thread_id
+        logger.warning(
+            f"[Thread-{thread_id}] Using PyTorch 2.5 (limited concurrency support). "
+            "Consider upgrading to PyTorch 2.6+ for better parallel compilation."
+        )
+
+        # 初始化用于捕获信息的变量
+        hash_str = None
+        file_path = None
+
+        # 定义劫持函数
+        original_load = FxGraphCache.load
+        original_load_name = "torch._inductor.codecache.FxGraphCache.load"
+
+        def hijack_load(*args, **kwargs):
+            nonlocal file_path
+            inductor_compiled_graph = original_load(*args, **kwargs)
+            compiled_fn = inductor_compiled_graph.current_callable
+            file_path = compiled_fn.__code__.co_filename
+
+            if self.base_cache_dir and not file_path.startswith(self.base_cache_dir):
+                for cell in compiled_fn.__closure__ or []:
+                    if not callable(cell.cell_contents):
+                        continue
+                    if cell.cell_contents.__code__.co_filename.startswith(
+                            self.base_cache_dir):
+                        file_path = cell.cell_contents.__code__.co_filename
+                        break
+
+            return inductor_compiled_graph
+
+        def hijack_compiled_fx_graph_hash(*args, **kwargs):
+            nonlocal hash_str
+            out = compiled_fx_graph_hash(*args, **kwargs)
+            hash_str = out[0]
+            return out
+
+        def _get_shape_env() -> AlwaysHitShapeEnv:
+            return AlwaysHitShapeEnv()
+
+        def _check_can_cache(*args, **kwargs):
+            return
+
+        hijacked_compile_fx_inner = torch._inductor.compile_fx.compile_fx_inner
+
+        # PyTorch 2.5 使用最小化的 Patch（无全局锁）
+        with ExitStack() as stack:
+            stack.enter_context(patch(original_load_name, hijack_load))
+
+            stack.enter_context(
+                patch("torch._inductor.codecache.compiled_fx_graph_hash",
+                      hijack_compiled_fx_graph_hash))
+
+            stack.enter_context(
+                patch("torch._inductor.codecache.FxGraphCache._get_shape_env",
+                      _get_shape_env))
+
+            if hasattr(AOTAutogradCache, "_get_shape_env"):
+                stack.enter_context(
+                    patch(
+                        "torch._functorch._aot_autograd.autograd_cache.AOTAutogradCache._get_shape_env",
+                        _get_shape_env))
+
+            stack.enter_context(
+                patch(
+                    "torch._inductor.codecache.FxGraphCache._check_can_cache",
+                    _check_can_cache))
+
+            stack.enter_context(self.metrics_context())
+
+            # 执行编译
+            with pass_context(runtime_shape):
+                compiled_graph = compile_fx(
+                    graph,
+                    example_inputs,
+                    inner_compile=hijacked_compile_fx_inner,
+                    config_patches=config
+                )
+
+        return compiled_graph, hash_str, file_path
+
+    def load(
+        self,
+        handle: Any,
+        graph: fx.GraphModule,
+        example_inputs: list[Any],
+        graph_index: int,
+        runtime_shape: Optional[int] = None
+    ) -> Callable:
+        """加载缓存的编译图（线程安全）"""
+        assert isinstance(handle, tuple)
+        assert isinstance(handle[0], str)
+        assert isinstance(handle[1], str)
+
+        hash_str = handle[0]
+        thread_id = threading.get_ident()
+
+        logger.debug(f"[Thread-{thread_id}] Loading cached graph: hash={hash_str}")
+
+        from torch._functorch._aot_autograd.autograd_cache import AOTAutogradCache
+        from torch._inductor.codecache import FxGraphCache
+
+        with ExitStack() as exit_stack:
+            exit_stack.enter_context(
+                patch("torch._inductor.codecache.FxGraphCache._get_shape_env",
+                      lambda *args, **kwargs: AlwaysHitShapeEnv()))
+
+            if hasattr(AOTAutogradCache, "_get_shape_env"):
+                exit_stack.enter_context(
+                    patch(
+                        "torch._functorch._aot_autograd.autograd_cache.AOTAutogradCache._get_shape_env",
+                        lambda *args, **kwargs: AlwaysHitShapeEnv()))
+
+            exit_stack.enter_context(self.metrics_context())
+
+            if torch.__version__.startswith("2.5"):
+                inductor_compiled_graph = FxGraphCache._lookup_graph(
+                    hash_str, example_inputs, True, False)
+                assert inductor_compiled_graph is not None, (
+                    "Inductor cache lookup failed. Please remove "
+                    "the cache directory and try again.")
+
+            elif torch.__version__ >= "2.6":
+                from torch._inductor.output_code import CompiledFxGraphConstantsWithGm
+                constants = CompiledFxGraphConstantsWithGm(graph)
+                inductor_compiled_graph, _ = FxGraphCache._lookup_graph(
+                    hash_str, example_inputs, True, None, constants)
+                assert inductor_compiled_graph is not None, (
+                    "Inductor cache lookup failed. Please remove "
+                    "the cache directory and try again.")
+
+        # 检查原始图是否返回元组
+        from torch._inductor.compile_fx import graph_returns_tuple
+        returns_tuple = graph_returns_tuple(graph)
+
+        # 返回包装后的可调用对象
+        def compiled_graph(*args):
+            list_args = list(args)
+            graph_output = inductor_compiled_graph(list_args)
+            if returns_tuple:
+                return graph_output
+            else:
+                return graph_output[0]
+
+        return compiled_graph
+
+    def metrics_context(self) -> contextlib.AbstractContextManager:
+        """获取 Dynamo 指标上下文"""
+        if is_torch_equal_or_newer("2.6"):
+            import torch._dynamo.utils
+            return torch._dynamo.utils.get_metrics_context()
+        else:
+            return contextlib.nullcontext()
 
 class InductorAdaptor(CompilerInterface):
     """
@@ -252,8 +688,7 @@ class InductorAdaptor(CompilerInterface):
 
     def compute_hash(self, vllm_config: VllmConfig) -> str:
         factors = get_inductor_factors()
-        hash_str = hashlib.md5(str(factors).encode(),
-                               usedforsecurity=False).hexdigest()[:10]
+        hash_str = hashlib.md5(str(factors).encode(), usedforsecurity=False).hexdigest()[:10]
         return hash_str
 
     def initialize_cache(self,
@@ -283,6 +718,7 @@ class InductorAdaptor(CompilerInterface):
         compiler_config: dict[str, Any],
         runtime_shape: Optional[int] = None,
         key: Optional[str] = None,
+        graph_index: int = 0,
     ) -> tuple[Optional[Callable], Optional[Any]]:
         compilation_counter.num_inductor_compiles += 1
         from torch._inductor.compile_fx import compile_fx
@@ -557,6 +993,7 @@ class EagerAdaptor(CompilerInterface):
         compiler_config: dict[str, Any],
         runtime_shape: Optional[int] = None,
         key: Optional[str] = None,
+        graph_index: int = 0,
     ) -> tuple[Optional[Callable], Optional[Any]]:
         compilation_counter.num_eager_compiles += 1
         # we don't need to compile the graph, just return the graph itself.

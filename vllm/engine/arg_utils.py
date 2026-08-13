@@ -44,6 +44,10 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.utils import (STR_DUAL_CHUNK_FLASH_ATTN_VAL, FlexibleArgumentParser,
                         GiB_bytes, get_ip, is_in_ray_actor)
 
+from vllm.v1.engine.weight_pagecache import (
+    start_async_weight_prewarm,
+    stop_async_weight_prewarm,
+)
 # yapf: enable
 
 logger = init_logger(__name__)
@@ -935,10 +939,20 @@ class EngineArgs:
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
-        # Get the list of attributes of this dataclass.
-        attrs = [attr.name for attr in dataclasses.fields(cls)]
-        # Set the attributes from the parsed arguments.
-        engine_args = cls(**{attr: getattr(args, attr) for attr in attrs})
+        weight_prewarm_proc = None
+        if cls.__name__ == "AsyncEngineArgs":
+            weight_prewarm_proc = start_async_weight_prewarm(args.model)
+        try:
+            # Get the list of attributes of this dataclass.
+            attrs = [attr.name for attr in dataclasses.fields(cls)]
+            # Set the attributes from the parsed arguments.
+            engine_args = cls(**{attr: getattr(args, attr) for attr in attrs})
+        except Exception:
+            stop_async_weight_prewarm(
+                weight_prewarm_proc, "AsyncEngineArgs.from_cli_args error")
+            raise
+        if weight_prewarm_proc is not None:
+            setattr(engine_args, "_weight_prewarm_proc", weight_prewarm_proc)
         return engine_args
 
     def create_model_config(self) -> ModelConfig:
@@ -1060,11 +1074,14 @@ class EngineArgs:
         is incompatible, we raise an error.
         """
         from vllm.platforms import current_platform
+        from vllm.v1.phase_profiler import timer
         current_platform.pre_register_and_update()
 
         device_config = DeviceConfig(
             device=cast(Device, current_platform.device_type))
+        timer.start("cfg: create_model_config")
         model_config = self.create_model_config()
+        timer.end("cfg: create_model_config")
 
         # * If VLLM_USE_V1 is unset, we enable V1 for "supported features"
         #   and fall back to V0 for experimental or unsupported features.
@@ -1283,6 +1300,7 @@ class EngineArgs:
             collect_detailed_traces=self.collect_detailed_traces,
         )
 
+        timer.start("cfg: VllmConfig.__post_init__")
         config = VllmConfig(
             model_config=model_config,
             cache_config=cache_config,
@@ -1300,6 +1318,7 @@ class EngineArgs:
             kv_events_config=self.kv_events_config,
             additional_config=self.additional_config,
         )
+        timer.end("cfg: VllmConfig.__post_init__")
 
         return config
 

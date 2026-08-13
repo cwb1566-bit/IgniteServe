@@ -546,6 +546,13 @@ class WorkerWrapperBase:
         Here we inject some common logic before initializing the worker.
         Arguments are passed to the worker class constructor.
         """
+        self.prepare_worker(all_kwargs)
+        self.construct_worker()
+
+    def prepare_worker(self, all_kwargs: List[Dict[str, Any]]) -> None:
+        """Resolve worker plugins and class without constructing the worker."""
+        if getattr(self, "_startup_worker_class", None) is not None:
+            return
         kwargs = all_kwargs[self.rpc_rank]
         self.vllm_config = kwargs.get("vllm_config", None)
         assert self.vllm_config is not None, (
@@ -590,6 +597,17 @@ class WorkerWrapperBase:
                 logger.info(
                     "Injected %s into %s for extended collective_rpc calls %s",
                     worker_extension_cls, worker_class, extended_calls)
+        self._startup_worker_kwargs = kwargs
+        self._startup_worker_class = worker_class
+
+    def construct_worker(self) -> None:
+        """Construct the worker after ``prepare_worker`` has resolved it."""
+        if self.worker is not None:
+            return
+        worker_class = getattr(self, "_startup_worker_class", None)
+        kwargs = getattr(self, "_startup_worker_kwargs", None)
+        if worker_class is None or kwargs is None or self.vllm_config is None:
+            raise RuntimeError("prepare_worker must run before construct_worker")
         with set_current_vllm_config(self.vllm_config):
             # To make vLLM config available during worker initialization
             self.worker = worker_class(**kwargs)
@@ -604,6 +622,29 @@ class WorkerWrapperBase:
         with set_current_vllm_config(self.vllm_config):
             # To make vLLM config available during device initialization
             self.worker.init_device()  # type: ignore
+
+    def _run_worker_startup_stage(self, method: str) -> Any:
+        if self.worker is None or self.vllm_config is None:
+            raise RuntimeError("Worker must be initialized before " + method)
+        with set_current_vllm_config(self.vllm_config):
+            return getattr(self.worker, method)()
+
+    def initialize_cuda_device(self) -> Any:
+        return self._run_worker_startup_stage("initialize_cuda_device")
+
+    def initialize_distributed_environment(self) -> Any:
+        return self._run_worker_startup_stage(
+            "initialize_distributed_environment")
+
+    def initialize_compile_worker_prewarm(self) -> Any:
+        return self._run_worker_startup_stage(
+            "initialize_compile_worker_prewarm")
+
+    def initialize_model_runner(self) -> Any:
+        return self._run_worker_startup_stage("initialize_model_runner")
+
+    def initialize_usage_reporting(self) -> Any:
+        return self._run_worker_startup_stage("initialize_usage_reporting")
 
     def execute_method(self, method: Union[str, bytes], *args, **kwargs):
         try:
@@ -630,7 +671,7 @@ def extract_previous_hidden_states(
         data: Union[ExecuteModelRequest, Dict[str, torch.Tensor]]) -> \
             Dict[str, torch.Tensor]:
     """If data contains previous_hidden_states, extract it. This returns a dict
-    which can be used directly as additional kwargs in any following 
+    which can be used directly as additional kwargs in any following
     execute_model calls. This is used in draft models like EAGLE."""
     output = {}
 

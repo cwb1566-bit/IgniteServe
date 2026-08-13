@@ -97,21 +97,42 @@ class TorchCompileWrapperWithCustomDispatcher:
         if isinstance(local_cache_dir, str):
             decompiled_file = os.path.join(local_cache_dir,
                                            "transformed_code.py")
-            if not os.path.exists(decompiled_file):
-                try:
-                    # usually the decompilation will succeed for most models,
-                    # as we guarantee a full-graph compilation in Dynamo.
-                    # but there's no 100% guarantee, since decompliation is
-                    # not a reversible process.
-                    import depyf
-                    src = depyf.decompile(new_code)
-                    with open(decompiled_file, "w") as f:
-                        f.write(src)
-
-                    logger.debug("Dynamo transformed code saved to %s",
-                                 decompiled_file)
-                except Exception:
-                    pass
+            try:
+                from vllm.compilation import transformed_code_cache
+                if os.path.exists(decompiled_file):
+                    transformed_code_cache.save(
+                        old_code,
+                        new_code,
+                        decompiled_file,
+                        self.__class__,
+                        local_cache_dir=local_cache_dir)
+                else:
+                    restored, cache_key, _, _ = transformed_code_cache.lookup(
+                        old_code, new_code, decompiled_file, self.__class__)
+                    if restored:
+                        logger.info(
+                            "Reused Dynamo transformed code from semantic "
+                            "cache key=%s into %s", cache_key[:12],
+                            decompiled_file)
+                    else:
+                        # Usually the decompilation will succeed for most
+                        # models, as we guarantee a full-graph compilation in
+                        # Dynamo. There is no 100% guarantee, since
+                        # decompilation is not a reversible process.
+                        import depyf
+                        src = depyf.decompile(new_code)
+                        with open(decompiled_file, "w") as f:
+                            f.write(src)
+                        transformed_code_cache.save(
+                            old_code,
+                            new_code,
+                            decompiled_file,
+                            self.__class__,
+                            local_cache_dir=local_cache_dir)
+                        logger.debug("Dynamo transformed code saved to %s",
+                                     decompiled_file)
+            except Exception:
+                pass
 
         if self.vllm_config.compilation_config.use_cudagraph and \
             "update" in new_code.co_names:

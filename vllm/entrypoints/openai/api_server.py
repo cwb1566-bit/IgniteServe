@@ -42,6 +42,7 @@ from vllm.engine.async_llm_engine import AsyncLLMEngine  # type: ignore
 from vllm.engine.multiprocessing.client import MQLLMEngineClient
 from vllm.engine.multiprocessing.engine import run_mp_engine
 from vllm.engine.protocol import EngineClient
+from vllm.v1.engine.weight_pagecache import stop_async_weight_prewarm
 from vllm.entrypoints.chat_utils import (load_chat_template,
                                          resolve_hf_chat_template,
                                          resolve_mistral_chat_template)
@@ -110,7 +111,7 @@ prometheus_multiproc_dir: tempfile.TemporaryDirectory
 
 # Cannot use __name__ (https://github.com/vllm-project/vllm/pull/4765)
 logger = init_logger('vllm.entrypoints.openai.api_server')
-
+from vllm.v1.phase_profiler import timer
 _running_tasks: set[asyncio.Task] = set()
 
 
@@ -151,14 +152,24 @@ async def build_async_engine_client(
     client_config: Optional[dict[str, Any]] = None,
 ) -> AsyncIterator[EngineClient]:
 
+    timer.start("Init Runtime")
+    weight_prewarm_proc = None
     # Context manager to handle engine_client lifecycle
     # Ensures everything is shutdown and cleaned up on error/exit
-    engine_args = AsyncEngineArgs.from_cli_args(args)
+    try:
+        engine_args = AsyncEngineArgs.from_cli_args(args)
+        weight_prewarm_proc = getattr(engine_args, "_weight_prewarm_proc", None)
 
-    async with build_async_engine_client_from_engine_args(
-            engine_args, args.disable_frontend_multiprocessing,
-            client_config) as engine:
-        yield engine
+        async with build_async_engine_client_from_engine_args(
+                engine_args, args.disable_frontend_multiprocessing,
+                client_config) as engine:
+            stop_async_weight_prewarm(weight_prewarm_proc,
+                                      "engine client ready")
+            weight_prewarm_proc = None
+            yield engine
+    finally:
+        stop_async_weight_prewarm(weight_prewarm_proc,
+                                  "engine client cleanup")
 
 
 @asynccontextmanager
@@ -177,7 +188,9 @@ async def build_async_engine_client_from_engine_args(
 
     # Create the EngineConfig (determines if we can use V1).
     usage_context = UsageContext.OPENAI_API_SERVER
+    timer.start("Init Runtime: create_engine_config")
     vllm_config = engine_args.create_engine_config(usage_context=usage_context)
+    timer.end("Init Runtime: create_engine_config")
 
     # V1 AsyncLLM.
     if envs.VLLM_USE_V1:

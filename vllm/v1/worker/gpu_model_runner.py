@@ -15,6 +15,7 @@ import torch.nn as nn
 from tqdm import tqdm
 
 import vllm.envs as envs
+from vllm import __version__ as vllm_version
 from vllm.attention import AttentionType, get_attn_backend
 from vllm.attention.backends.abstract import AttentionBackend
 from vllm.attention.layer import Attention
@@ -28,14 +29,16 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorBase_V1
 from vllm.distributed.parallel_state import (
     get_pp_group, get_tp_group, graph_capture, is_global_first_rank,
     prepare_communication_buffer_for_model)
-from vllm.forward_context import (DPMetadata, get_forward_context,
-                                  set_forward_context)
+from vllm.forward_context import (CUDAGraphCaptureBudget, DPMetadata,
+                                  get_forward_context, set_forward_context)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.model_executor.model_loader import TensorizerLoader, get_model_loader
 from vllm.model_executor.models.interfaces import (has_step_pooler,
                                                    is_mixture_of_experts)
+from vllm.operator_pipeline_trace import (operator_pipeline_range,
+                                           operator_pipeline_trace_enabled)
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalKwargs, PlaceholderRange
 from vllm.multimodal.utils import group_mm_inputs_by_modality
@@ -86,6 +89,34 @@ else:
 
 logger = init_logger(__name__)
 
+# 增
+import math
+import os
+import csv
+import threading
+from typing import List, Dict, Set, Tuple
+from vllm.model_executor.model_loader.utils import (
+    initialize_model, process_weights_after_loading, set_default_torch_dtype)
+from dataclasses import dataclass, field
+from collections import deque
+from queue import PriorityQueue
+from concurrent.futures import ThreadPoolExecutor, Future
+from vllm.v1.worker.CudaGraphManager import DynamicGraphManager
+from vllm.v1.worker.GraphMatcher import GraphMatcher, MatchResult
+from vllm.v1.worker.HotspotAnalyzer import HotspotAnalyzer, BatchSizeStats
+from vllm.v1.worker.cudagraph_batch_partition import partition_mixed_batch
+from vllm.v1.worker.cudagraph_profile import (
+    build_cudagraph_profile_manifest,
+    ensure_cudagraph_profile_manifest,
+    validate_cudagraph_profile_manifest,
+)
+from vllm.v1.worker.adaptive_cudagraph import (
+    adaptive_cudagraph_controller,
+)
+from vllm.v1.worker.LazyFreezeManager import LazyFreezeManager
+from vllm.v1.phase_profiler import timer
+from vllm.compilation.startup_resources import resource_dir, resource_file
+
 
 class GPUModelRunner(LoRAModelRunnerMixin):
 
@@ -130,6 +161,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.max_num_reqs = scheduler_config.max_num_seqs
 
         # Model-related.
+        self.model = None
         self.num_query_heads = model_config.get_num_attention_heads(
             parallel_config)
         self.hidden_size = model_config.get_hidden_size()
@@ -316,6 +348,120 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # means this layer will perform attention using the keys and values
         # from the KV cache of `shared_kv_cache_layers[layer_name]`.
         self.shared_kv_cache_layers: dict[str, str] = {}
+
+        # Offline hit distributions and GPU costs are configuration-specific.
+        # Never let a manually selected directory silently authorize replay
+        # decisions for a different model, graph mode, or GPU architecture.
+        hotspot_dir = os.environ.get(
+            "VLLM_CUDA_GRAPH_HOTSPOT_DIR",
+            str(resource_dir("cuda_graph_hotspots")),
+        )
+        self.cudagraph_profile_manifest = build_cudagraph_profile_manifest(
+            model_config=self.model_config,
+            cache_config=self.cache_config,
+            scheduler_config=self.scheduler_config,
+            parallel_config=self.parallel_config,
+            compilation_config=self.compilation_config,
+            device_properties=self.device_properties,
+            dtype=self.dtype,
+            torch_version=torch.__version__,
+            vllm_version=vllm_version,
+        )
+        allow_profile_overwrite = os.environ.get(
+            "VLLM_CUDAGRAPH_PROFILE_ALLOW_OVERWRITE", "").lower() in (
+                "1", "true", "yes", "on")
+        (self.cudagraph_profile_compatible,
+         profile_reason) = ensure_cudagraph_profile_manifest(
+             hotspot_dir,
+             self.cudagraph_profile_manifest,
+             allow_overwrite=allow_profile_overwrite,
+         )
+        if self.cudagraph_profile_compatible:
+            logger.info("CUDA graph profile manifest %s: %s", hotspot_dir,
+                        profile_reason)
+        else:
+            logger.warning(
+                "Ignoring incompatible CUDA graph profile resources in %s: "
+                "%s. Use a configuration-specific directory; set "
+                "VLLM_CUDAGRAPH_PROFILE_ALLOW_OVERWRITE=1 only to explicitly "
+                "replace/adopt that directory.", hotspot_dir, profile_reason)
+
+        cost_table_candidates = []
+        explicit_cost_table = os.environ.get("VLLM_CUDAGRAPH_COST_TABLE")
+        if explicit_cost_table:
+            cost_table_candidates.append(explicit_cost_table)
+        for filename in ("cuda_graph_cost_table.csv",
+                         "adaptive_cudagraph_gpu_costs.csv"):
+            cost_table_candidates.append(os.path.join(hotspot_dir, filename))
+
+        cost_table_path = None
+        for candidate in cost_table_candidates:
+            if not os.path.isfile(candidate):
+                continue
+            compatible, reason = validate_cudagraph_profile_manifest(
+                os.path.dirname(os.path.abspath(candidate)),
+                self.cudagraph_profile_manifest,
+            )
+            if compatible:
+                cost_table_path = candidate
+                break
+            logger.warning("Ignoring CUDA graph cost table %s: %s", candidate,
+                           reason)
+
+        self.graphMatcher = GraphMatcher(
+            reversed(self.compilation_config.cudagraph_capture_sizes),
+            max_pad_ratio=float(
+                os.environ.get("VLLM_CUDAGRAPH_MAX_PAD_RATIO", "0.20")),
+            cost_table_path=cost_table_path,
+            min_estimated_saving_ratio=float(
+                os.environ.get(
+                    "VLLM_CUDAGRAPH_MIN_ESTIMATED_SAVING_RATIO", "0.0")),
+        )
+        if cost_table_path:
+            logger.info("CUDA graph runtime cost table loaded from %s",
+                        cost_table_path)
+        self.dynamic_cuda_graph_captured: set[int] = set()
+        self.manager = LazyFreezeManager.get_instance()
+        DynamicGraphManager.runner = self
+        self.adaptive_cudagraph_controller = adaptive_cudagraph_controller
+        self.enable_adaptive_cudagraph = (
+            self.adaptive_cudagraph_controller.enabled)
+        self.enable_cudagraph_split_shadow = os.environ.get(
+            "VLLM_CUDAGRAPH_SPLIT_SHADOW", "").lower() in (
+                "1", "true", "yes", "on")
+        cross_phase_setting = os.environ.get(
+            "VLLM_CUDAGRAPH_DYNAMIC_CROSS_PHASE")
+        if cross_phase_setting is None:
+            # Piecewise graphs exclude attention and are keyed by total token
+            # shape. Reuse newly captured decode graphs for prefill/mixed work
+            # just like startup-captured piecewise graphs. Full graphs remain
+            # phase-bound because they include attention metadata.
+            self.enable_dynamic_cross_phase_replay = (
+                self.enable_adaptive_cudagraph and not self.full_cuda_graph)
+        else:
+            self.enable_dynamic_cross_phase_replay = (
+                cross_phase_setting.lower() in ("1", "true", "yes", "on")
+                and not self.full_cuda_graph)
+        if self.enable_adaptive_cudagraph:
+            self.adaptive_cudagraph_controller.reset()
+            logger.info(
+                "Adaptive CUDA graph controller enabled; legacy dynamic "
+                "capture is disabled for this runner.")
+            if self.enable_cudagraph_split_shadow:
+                logger.info(
+                    "CUDA graph split shadow evaluation enabled; model "
+                    "execution remains unchanged.")
+            if self.enable_dynamic_cross_phase_replay:
+                logger.info(
+                    "Piecewise dynamic CUDA graph cross-phase replay enabled.")
+        self.enable_dynamic_cuda_graph_capture = (
+            not self.enable_adaptive_cudagraph and os.environ.get(
+                "VLLM_DISABLE_DYNAMIC_CUDA_GRAPH_CAPTURE", "").lower() not in
+            ("1", "true", "yes", "on"))
+        if (not self.enable_dynamic_cuda_graph_capture
+                and not self.enable_adaptive_cudagraph):
+            logger.info("Dynamic CUDA graph capture is disabled by "
+                        "VLLM_DISABLE_DYNAMIC_CUDA_GRAPH_CAPTURE.")
 
     def _may_reorder_batch(self, scheduler_output: "SchedulerOutput") -> None:
         """
@@ -1274,6 +1420,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             finished_recving=finished_recving,
         )
 
+    def _classify_cudagraph_batch_phase(
+            self, num_scheduled_tokens: np.ndarray) -> str:
+        """Classify request metadata, rather than inferring phase from size."""
+        num_reqs = len(num_scheduled_tokens)
+        if num_reqs == 0:
+            return "empty"
+        num_computed = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+        num_prompt = self.input_batch.num_prompt_tokens[:num_reqs]
+        has_prefill = num_computed < num_prompt
+        if bool(np.all(has_prefill)):
+            return "prefill"
+        if bool(np.any(has_prefill)):
+            return "mixed"
+        return "decode"
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -1282,6 +1443,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     ) -> Union[ModelRunnerOutput, IntermediateTensors]:
         self._update_states(scheduler_output)
         if not scheduler_output.total_num_scheduled_tokens:
+            # Only drain dynamic CUDA graph captures at a true idle point.
+            # A zero-token scheduler step can still occur while requests are
+            # alive but temporarily unscheduled; dummy graph capture may touch
+            # runner/KV-cache state and must not overlap such requests.
+            no_live_requests = (not self.requests
+                                and not self.input_batch.req_ids)
+            if self.enable_adaptive_cudagraph:
+                if no_live_requests:
+                    self.adaptive_cudagraph_controller.capture_pending(self)
+            elif self.enable_dynamic_cuda_graph_capture:
+                if no_live_requests:
+                    pending_captures = HotspotAnalyzer.get_and_clear_pending_captures()
+                    DynamicGraphManager.capture_queue.update(pending_captures)
+                    DynamicGraphManager.capture_pending_graphs()
             if not has_kv_transfer_group():
                 # Return empty ModelRunnerOutput if there's no work to do.
                 return EMPTY_MODEL_RUNNER_OUTPUT
@@ -1293,12 +1468,159 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          spec_decode_metadata,
          num_scheduled_tokens_np) = (self._prepare_inputs(scheduler_output))
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        ###
+        # 判断是否需要跳过动态CUDA图捕获
+        max_scheduled_tokens_per_req = (
+            int(num_scheduled_tokens_np.max())
+            if len(num_scheduled_tokens_np) > 0 else 0)
+        decode_only_batch = max_scheduled_tokens_per_req == 1
+        skip_dynamic_cuda_graphs = False
+        adaptive_decision = None
+        skip_adaptive_cuda_graphs = False
+        phase = "unknown"
+        if operator_pipeline_trace_enabled():
+            phase = self._classify_cudagraph_batch_phase(
+                num_scheduled_tokens_np)
+        ###
         if (self.use_cuda_graph
                 and num_scheduled_tokens <= self.cudagraph_batch_sizes[-1]):
             # Use piecewise CUDA graphs.
             # Add padding to the batch size.
             num_input_tokens = self.vllm_config.pad_for_cudagraph(
                 num_scheduled_tokens)
+            HotspotAnalyzer.record_batch(num_input_tokens)
+            if self.enable_adaptive_cudagraph:
+                phase = self._classify_cudagraph_batch_phase(
+                    num_scheduled_tokens_np)
+                default_target_shape = num_input_tokens
+                if (self.enable_cudagraph_split_shadow
+                        and phase == "decode"
+                        and self.adaptive_cudagraph_controller
+                        .claim_split_shadow_shape(
+                            phase, num_scheduled_tokens)):
+                    overlap_efficiency = float(
+                        os.environ.get(
+                            "VLLM_CUDAGRAPH_SPLIT_OVERLAP_EFFICIENCY",
+                            "0.20"))
+                    for split_mode in (
+                            "sequential", "ideal_parallel",
+                            "calibrated_parallel"):
+                        split_result = self.graphMatcher.plan_split(
+                            phase,
+                            num_scheduled_tokens,
+                            gamma=float(
+                                os.environ.get(
+                                    "VLLM_CUDAGRAPH_SPLIT_GAMMA", "0.90")),
+                            execution_mode=split_mode,
+                            parallel_overlap_efficiency=overlap_efficiency,
+                        )
+                        (self.adaptive_cudagraph_controller
+                         .record_split_shadow(
+                             phase,
+                             num_scheduled_tokens,
+                             split_mode,
+                             split_result,
+                         ))
+                elif self.enable_cudagraph_split_shadow and phase == "mixed":
+                    num_reqs = len(num_scheduled_tokens_np)
+                    num_computed = (
+                        self.input_batch.num_computed_tokens_cpu[:num_reqs])
+                    num_prompt = self.input_batch.num_prompt_tokens[:num_reqs]
+                    prefill_mask = num_computed < num_prompt
+                    prefill_tokens = int(
+                        num_scheduled_tokens_np[prefill_mask].sum())
+                    decode_tokens = int(
+                        num_scheduled_tokens_np[~prefill_mask].sum())
+                    if (self.adaptive_cudagraph_controller
+                            .claim_phase_separation(prefill_tokens,
+                                                    decode_tokens)):
+                        # Validate a lossless gather/scatter map before costing
+                        # phase separation. Execution still uses the original
+                        # mixed batch until lane-specific buffers are available.
+                        phase_partitions = partition_mixed_batch(
+                            num_scheduled_tokens_np.tolist(),
+                            prefill_mask.tolist(),
+                        )
+                        assert {part.phase for part in phase_partitions} == {
+                            "prefill", "decode"
+                        }
+                        overlap_efficiency = float(
+                            os.environ.get(
+                                "VLLM_CUDAGRAPH_SPLIT_OVERLAP_EFFICIENCY",
+                                "0.20"))
+                        for split_mode in (
+                                "sequential", "ideal_parallel",
+                                "calibrated_parallel"):
+                            separation = self.graphMatcher.plan_phase_separation(
+                                prefill_tokens,
+                                decode_tokens,
+                                gamma=float(
+                                    os.environ.get(
+                                        "VLLM_CUDAGRAPH_SPLIT_GAMMA",
+                                        "0.90")),
+                                execution_mode=split_mode,
+                                parallel_overlap_efficiency=(
+                                    overlap_efficiency),
+                            )
+                            (self.adaptive_cudagraph_controller
+                             .record_phase_separation(split_mode, separation))
+                match_result = self.graphMatcher.find_best_match(
+                    num_scheduled_tokens,
+                    phase=phase,
+                    default_graph_size=default_target_shape,
+                    dynamic_sizes=self.dynamic_cuda_graph_captured,
+                    # In piecewise mode attention remains eager. The captured
+                    # compiled segments depend on total token shape, like the
+                    # startup graphs captured from decode-style dummy inputs.
+                    # Full graphs include attention and remain phase-isolated.
+                    allow_dynamic_cross_phase=(
+                        self.enable_dynamic_cross_phase_replay
+                        and not self.full_cuda_graph),
+                )
+                if match_result.strategy == "eager":
+                    # Continue observing the native registered shape so a
+                    # frequently used decode shape can still become eligible
+                    # for dynamic capture.
+                    target_shape = default_target_shape
+                else:
+                    target_shape = match_result.execution_size
+                adaptive_decision = (
+                    self.adaptive_cudagraph_controller.plan_runtime(
+                        phase=phase,
+                        raw_shape=num_scheduled_tokens,
+                        target_shape=target_shape,
+                        capturable=(
+                            target_shape in self.cudagraph_batch_sizes
+                            and not (
+                                match_result.strategy == "eager"
+                                and match_result.graph_size
+                                == default_target_shape
+                                and match_result.reason.startswith(
+                                    "cost-reject"))),
+                        already_captured=(match_result.strategy != "eager"),
+                        allow_replay=(match_result.strategy != "eager"),
+                    ))
+                num_input_tokens = adaptive_decision.execution_shape
+                skip_adaptive_cuda_graphs = (
+                    adaptive_decision.skip_cudagraph)
+            else:
+                # A full graph includes attention and therefore remains tied
+                # to its decode-only capture metadata. Piecewise graphs leave
+                # attention eager and are safe to reuse by token shape.
+                if (num_input_tokens in self.dynamic_cuda_graph_captured
+                        and not decode_only_batch
+                        and (self.full_cuda_graph
+                             or not self.enable_dynamic_cross_phase_replay)):
+                    skip_dynamic_cuda_graphs = True
+                if num_input_tokens not in self.cuda_graph_captured:
+                    if (self.enable_dynamic_cuda_graph_capture
+                            and decode_only_batch
+                            and HotspotAnalyzer.should_capture(
+                                num_input_tokens)):
+                        HotspotAnalyzer.mark_for_capture(num_input_tokens)
+                        DynamicGraphManager.submit_to_queue(num_input_tokens)
+                    else:
+                        num_input_tokens = num_scheduled_tokens
         else:
             # Eager mode.
             # Pad tokens to multiple of tensor_parallel_size when
@@ -1309,6 +1631,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_input_tokens = round_up(num_scheduled_tokens, tp_size)
             else:
                 num_input_tokens = num_scheduled_tokens
+            HotspotAnalyzer.record_batch(num_input_tokens)
 
         # Padding for DP
         num_pad, num_tokens_across_dp = self.get_dp_padding(num_input_tokens)
@@ -1358,25 +1681,70 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Some attention backends only support CUDA Graphs in pure decode.
         # If attention doesn't support CUDA Graphs for this batch, but we
         # compiled with full CUDA graphs, we have to skip them entirely.
-        skip_cuda_graphs = self.full_cuda_graph and not attention_cuda_graphs
+        skip_cuda_graphs = ((self.full_cuda_graph and not attention_cuda_graphs)
+                            or skip_dynamic_cuda_graphs
+                            or skip_adaptive_cuda_graphs)
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
+        gpu_timing = None
+        graph_execution = (
+            self.use_cuda_graph
+            and num_scheduled_tokens <= self.cudagraph_batch_sizes[-1]
+            and not skip_cuda_graphs
+            and num_input_tokens in self.cuda_graph_captured)
+        if (graph_execution and self.enable_adaptive_cudagraph
+                and phase != "decode"
+                and num_input_tokens in self.dynamic_cuda_graph_captured):
+            self.adaptive_cudagraph_controller.record_cross_phase_replay(
+                phase,
+                num_scheduled_tokens,
+                num_input_tokens,
+            )
+        execution_mode = "graph" if graph_execution else "eager"
+        if (self.enable_adaptive_cudagraph
+                and self.adaptive_cudagraph_controller.reserve_gpu_sample(
+                    phase, execution_mode, num_input_tokens)):
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            gpu_timing = (start_event, end_event)
+            start_event.record()
         with set_forward_context(
                 attn_metadata,
                 self.vllm_config,
                 num_tokens=num_input_tokens,
                 num_tokens_across_dp=num_tokens_across_dp,
                 skip_cuda_graphs=skip_cuda_graphs,
+                cudagraph_runtime_warmup=(
+                    adaptive_decision is not None
+                    and adaptive_decision.mark_runtime_warmup),
         ):
             self.maybe_setup_kv_connector(scheduler_output)
 
-            model_output = self.model(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-            )
+            with operator_pipeline_range(
+                    f"forward.{phase}.{execution_mode}.tokens={num_input_tokens}"):
+                model_output = self.model(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                )
+            if gpu_timing is not None:
+                gpu_timing[1].record()
+                self.adaptive_cudagraph_controller.add_gpu_sample(
+                    phase,
+                    execution_mode,
+                    num_input_tokens,
+                    gpu_timing[0],
+                    gpu_timing[1],
+                )
+
+            if (adaptive_decision is not None
+                    and adaptive_decision.mark_runtime_warmup):
+                self.adaptive_cudagraph_controller.finish_runtime_warmup(
+                    adaptive_decision.phase,
+                    adaptive_decision.target_shape,
+                )
 
             self.maybe_wait_for_kv_save()
             finished_sending, finished_recving = (
@@ -1387,7 +1755,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         else:
             hidden_states = model_output
             aux_hidden_states = None
-
         # Broadcast PP output for external_launcher (torchrun)
         # to make sure we are synced across pp ranks
         # TODO: Support overlapping mirco-batches
@@ -1551,6 +1918,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             get_kv_transfer_group().clear_connector_metadata()
 
         self.eplb_step()
+        # Dynamic CUDA graph capture is intentionally not executed here: this
+        # point still belongs to an active request. Pending captures are drained
+        # only from the idle scheduler branch above.
 
         return ModelRunnerOutput(
             req_ids=self.input_batch.req_ids,
@@ -1771,7 +2141,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         with DeviceMemoryProfiler() as m:  # noqa: SIM117
             time_before_load = time.perf_counter()
             model_loader = get_model_loader(self.load_config)
-            if not hasattr(self, "model"):
+            if not hasattr(self, "model") or self.model is None:
                 logger.info("Loading model from scratch...")
                 self.model = model_loader.load_model(
                     vllm_config=self.vllm_config,
@@ -1812,6 +2182,58 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.device,
                 self.parallel_config,
             )
+
+    def init_model(self):
+        if self.get_model():
+            logger.info("Model was already initialized; skipping init_model.")
+            return
+
+        # 获取上下文
+        context = None
+        if not self.get_model():
+            if self.vllm_config.model_config.enable_sleep_mode:
+                allocator = CuMemAllocator.get_instance()
+                assert allocator.get_current_usage() == 0, (
+                    "Sleep mode can only be used for one instance per process."
+                )
+                context = allocator.use_memory_pool(tag="weights")
+            else:
+                from contextlib import nullcontext
+                context = nullcontext()
+
+        with DeviceMemoryProfiler() as m, context:
+            device_config = self.vllm_config.device_config
+            target_device = torch.device(device_config.device)
+            model_config = self.vllm_config.model_config
+            with set_default_torch_dtype(model_config.dtype), target_device:
+                self.model = initialize_model(
+                    vllm_config=self.vllm_config,
+                    model_config=model_config
+                )
+                # Compilation can overlap raw weight loading. Set eval mode
+                # before both branches start so tracing never observes a
+                # training/eval transition.
+                self.model.eval()
+                # logger.info("the model:%s", self.model)
+        self.model_memory_usage = m.consumed_memory
+        logger.info("Init Model took %.4f GiB", self.model_memory_usage / GiB_bytes)
+        prepare_communication_buffer_for_model(self.model)
+
+    def load_weights(self):
+        timer.start("load_weights")
+        try:
+            model_config = self.vllm_config.model_config
+            load_config = self.vllm_config.load_config
+            model_loader = get_model_loader(load_config)
+            model_loader.load_weights(self.model, model_config=model_config)
+            target_device = torch.device(
+                self.vllm_config.device_config.device)
+            process_weights_after_loading(
+                self.model, model_config, target_device)
+            self.model.eval()
+            torch.cuda.synchronize(self.device)
+        finally:
+            timer.end("load_weights")
 
     def save_tensorized_model(
         self,
@@ -1943,7 +2365,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         Randomize input_ids if VLLM_RANDOMIZE_DP_DUMMY_INPUTS is set.
         This is to help balance expert-selection
          - during profile_run
-         - during DP rank dummy run 
+         - during DP rank dummy run
         """
         dp_size = self.vllm_config.parallel_config.data_parallel_size
         randomize_inputs = envs.VLLM_RANDOMIZE_DP_DUMMY_INPUTS and dp_size > 1
@@ -1967,12 +2389,89 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_ids.fill_(0)
 
     @torch.inference_mode()
+    def _dummy_run_with_single(
+            self,
+            num_tokens: int,
+            capture_attn_cudagraph: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+
+        # Padding for DP
+        num_tokens_across_dp = None
+
+        # Set num_scheduled_tokens based on num_tokens and max_num_seqs
+        # for dummy run with LoRA so that the num_reqs collectively
+        # has num_tokens in total.
+        assert num_tokens <= self.scheduler_config.max_num_batched_tokens
+        max_num_reqs = self.scheduler_config.max_num_seqs
+        num_reqs = min(num_tokens, max_num_reqs)
+        min_tokens_per_req = num_tokens // num_reqs
+        num_scheduled_tokens_list = [min_tokens_per_req] * num_reqs
+        num_scheduled_tokens_list[-1] += num_tokens % num_reqs
+        assert sum(num_scheduled_tokens_list) == num_tokens
+        assert len(num_scheduled_tokens_list) == num_reqs
+        num_scheduled_tokens = np.array(num_scheduled_tokens_list, dtype=np.int32)
+
+        attn_metadata: Optional[dict[str, Any]] = None
+        if capture_attn_cudagraph:
+            # logger.info("...")
+            attn_metadata = {}
+
+            cu_num_tokens = np.cumsum(num_scheduled_tokens, dtype=np.int32)
+            self.query_start_loc_np[0] = 0
+            self.query_start_loc_np[1:num_reqs + 1] = cu_num_tokens
+            self.query_start_loc[:num_reqs + 1].copy_(
+                self.query_start_loc_cpu[:num_reqs + 1], non_blocking=True)
+            self.query_start_loc[num_reqs + 1:].fill_(
+                self.query_start_loc_cpu[num_reqs].item())
+            query_start_loc = self.query_start_loc[:num_reqs + 1]
+            # Make sure max_model_len is used at the graph capture time.
+            self.seq_lens_np[:num_reqs] = self.max_model_len
+            self.seq_lens_np[num_reqs:] = 0
+            self.seq_lens[:num_reqs].copy_(self.seq_lens_cpu[:num_reqs], non_blocking=True)
+            seq_lens = self.seq_lens[:num_reqs]
+
+            common_attn_metadata = CommonAttentionMetadata(
+                query_start_loc=query_start_loc,
+                seq_lens=seq_lens,
+                num_reqs=num_reqs,
+                num_actual_tokens=num_tokens,
+                max_query_len=num_tokens,
+            )
+
+            for kv_cache_group_id, kv_cache_group_spec in enumerate(self.kv_cache_config.kv_cache_groups):
+
+                attn_metadata_i = self.attn_metadata_builders[
+                    kv_cache_group_id].build_for_cudagraph_capture(
+                    common_attn_metadata)
+                for layer_name in kv_cache_group_spec.layer_names:
+                    attn_metadata[layer_name] = attn_metadata_i
+
+        model = self.model
+        input_ids = self.input_ids[:num_tokens]
+        inputs_embeds = None
+        positions = self.positions[:num_tokens]
+        intermediate_tensors = None
+
+        with self.maybe_randomize_inputs(input_ids), set_forward_context(
+                attn_metadata,
+                self.vllm_config,
+                num_tokens=num_tokens,
+                num_tokens_across_dp=num_tokens_across_dp):
+            outputs = model(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds,
+            )
+
+    @torch.inference_mode()
     def _dummy_run(
         self,
         num_tokens: int,
         capture_attn_cudagraph: bool = False,
         skip_eplb: bool = False,
         is_profile: bool = False,
+        cudagraph_capture_budget: Optional[CUDAGraphCaptureBudget] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
         # Padding for DP
@@ -1997,6 +2496,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if capture_attn_cudagraph:
             attn_metadata = {}
 
+            cu_num_tokens = np.cumsum(num_scheduled_tokens, dtype=np.int32)
+            self.query_start_loc_np[0] = 0
+            self.query_start_loc_np[1:num_reqs + 1] = cu_num_tokens
+            self.query_start_loc[:num_reqs + 1].copy_(
+                self.query_start_loc_cpu[:num_reqs + 1], non_blocking=True)
+            self.query_start_loc[num_reqs + 1:].fill_(
+                self.query_start_loc_cpu[num_reqs].item())
             query_start_loc = self.query_start_loc[:num_reqs + 1]
             # Make sure max_model_len is used at the graph capture time.
             self.seq_lens_np[:num_reqs] = self.max_model_len
@@ -2053,13 +2559,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     attn_metadata,
                     self.vllm_config,
                     num_tokens=num_tokens,
-                    num_tokens_across_dp=num_tokens_across_dp):
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    cudagraph_capture_budget=cudagraph_capture_budget):
                 outputs = model(
                     input_ids=input_ids,
                     positions=positions,
                     intermediate_tensors=intermediate_tensors,
                     inputs_embeds=inputs_embeds,
                 )
+            if "after_last_piecewise_until_model_forward_end" in timer.start_times:
+                timer.end("after_last_piecewise_until_model_forward_end")
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
             else:
@@ -2284,7 +2793,31 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.encoder_cache.clear()
         gc.collect()
 
-    def capture_model(self) -> None:
+    def capture_model_for_batch_size_asy(self, batch_size) -> None:
+        with self.manager.fast_capture_scope(), graph_capture(device=self.device):
+            full_cg = self.full_cuda_graph
+            self._dummy_run(batch_size,
+                            capture_attn_cudagraph=full_cg,
+                            skip_eplb=True)
+
+    def capture_model_for_batch_size(self, batch_size) -> None:
+        with self.manager.fast_capture_scope(), graph_capture(device=self.device):
+            full_cg = self.full_cuda_graph
+            warm_start = time.perf_counter()
+            for _ in range(self.compilation_config.cudagraph_num_of_warmups):
+                self._dummy_run(batch_size,
+                                capture_attn_cudagraph=full_cg,
+                                skip_eplb=True)
+            warmup_time = time.perf_counter() - warm_start
+            logger.info("warm_up size %d takes:%.4f", batch_size, warmup_time)
+            capture_start = time.perf_counter()
+            self._dummy_run(batch_size,
+                            capture_attn_cudagraph=full_cg,
+                            skip_eplb=True)
+            capture_time = time.perf_counter() - capture_start
+            logger.info("capture size %d takes:%.4f", batch_size, capture_time)
+
+    def pre_capture_model(self) -> None:
         if not self.use_cuda_graph:
             logger.warning(
                 "Skipping CUDA graph capture. To turn on CUDA graph capture, "
@@ -2297,17 +2830,163 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         start_time = time.perf_counter()
         start_free_gpu_memory = torch.cuda.mem_get_info()[0]
 
+        # ==========================================
+        # 动态加载热点 CUDA 图批次大小 (Top-K)
+        # ==========================================
+        hotspot_csv_paths = []
+        env_hotspot_csv = os.environ.get("VLLM_CUDA_GRAPH_HOTSPOT_CSV")
+        env_hotspot_dir = os.environ.get("VLLM_CUDA_GRAPH_HOTSPOT_DIR")
+        if env_hotspot_csv:
+            hotspot_csv_paths.append(env_hotspot_csv)
+        if env_hotspot_dir:
+            hotspot_csv_paths.append(
+                os.path.join(env_hotspot_dir, "cuda_graph_hits.csv"))
+        hotspot_csv_paths.append(
+            str(resource_file("cuda_graph_hotspots", "cuda_graph_hits.csv")))
+        hotspot_csv_paths.append("./analysis_results/cuda_graph_hits.csv")
+        csv_path = None
+        for path in hotspot_csv_paths:
+            if not os.path.exists(path):
+                continue
+            compatible, reason = validate_cudagraph_profile_manifest(
+                os.path.dirname(os.path.abspath(path)),
+                self.cudagraph_profile_manifest,
+            )
+            if compatible:
+                csv_path = path
+                break
+            logger.warning("Ignoring CUDA graph hotspot CSV %s: %s", path,
+                           reason)
+        top_k_override = os.environ.get("VLLM_CUDA_GRAPH_HOTSPOT_TOP_K")
+        top_k = int(top_k_override) if top_k_override else 10
+
+        force_full_precapture = os.environ.get(
+            "VLLM_FORCE_FULL_CUDAGRAPH_PRECAPTURE", "").lower() in (
+                "1", "true", "yes", "on")
+        if force_full_precapture:
+            self.cuda_graph_captured = list(self.cudagraph_batch_sizes)
+            logger.info(
+                "Forcing full CUDA graph pre-capture for all %d registered "
+                "shapes.", len(self.cuda_graph_captured))
+        elif csv_path is not None:
+            try:
+                sizes_with_hits = []
+                with open(csv_path, 'r', encoding='utf-8') as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        sizes_with_hits.append({
+                            'batch_size': int(row['batch_size']),
+                            'hit_count': int(row['hit_count']),
+                            'capture_priority': float(
+                                row.get('capture_priority', 0.0)),
+                        })
+                # Constraint (current experiment): only pre-capture batch sizes
+                # that are within the registered/capturable cudagraph sizes
+                # (<= max_capture_size, i.e. <= 512). Sizes larger than this come
+                # from the eager branch (num_scheduled_tokens > 512) and are NOT
+                # replayable: the piecewise backend has no concrete_size_entry for
+                # them and the runtime dispatch gate routes >512 requests to eager.
+                # Capturing them is useless and can crash _dummy_run. We therefore
+                # drop them here and let the next smaller capturable sizes fill the
+                # Top-K. (Full >512 grid-mapping enhancement is tracked separately.)
+                capturable_sizes = set(self.cudagraph_batch_sizes)
+                dropped_oversized = sorted({
+                    rec['batch_size']
+                    for rec in sizes_with_hits
+                    if rec['batch_size'] not in capturable_sizes
+                })
+                if dropped_oversized:
+                    logger.warning(
+                        "Ignoring %d non-capturable hotspot batch size(s) "
+                        "(not in cudagraph_capture_sizes, max=%s): %s",
+                        len(dropped_oversized),
+                        max(self.cudagraph_batch_sizes)
+                        if self.cudagraph_batch_sizes else 0,
+                        dropped_oversized)
+                capturable_records = [
+                    rec for rec in sizes_with_hits
+                    if rec['batch_size'] in capturable_sizes
+                ]
+                # Primary key: hit_count (descending)
+                # Secondary key: capture_priority (descending)
+                ranked_records = sorted(
+                    capturable_records,
+                    key=lambda x: (x['hit_count'], x['capture_priority']),
+                    reverse=True)
+                if self.enable_adaptive_cudagraph and top_k_override is None:
+                    warmup_threshold = int(
+                        os.environ.get(
+                            "VLLM_CUDA_GRAPH_PRECAPTURE_MIN_HITS", "10"))
+                    selected_records = [
+                        record for record in ranked_records
+                        if record['hit_count'] > warmup_threshold
+                    ]
+                    selection_policy = (
+                        f"offline-hit-threshold>{warmup_threshold}")
+                else:
+                    selected_records = ranked_records[:top_k]
+                    selection_policy = f"top-k={top_k}"
+                extracted_sizes = [
+                    record['batch_size'] for record in selected_records
+                ]
+                if self.enable_adaptive_cudagraph:
+                    # Tiny decode batches dominate low-RPS tails but can be
+                    # underrepresented in a burst-derived Top-K. Capturing
+                    # these inexpensive shapes up front avoids a visible
+                    # runtime warmup/capture transition for common traffic.
+                    mandatory_text = os.environ.get(
+                        "VLLM_ADAPTIVE_CUDAGRAPH_MANDATORY_SHAPES", "1,2")
+                    mandatory_sizes = {
+                        int(value.strip())
+                        for value in mandatory_text.split(',') if value.strip()
+                    }
+                    mandatory_sizes.intersection_update(capturable_sizes)
+                    extracted_sizes.extend(mandatory_sizes)
+                    extracted_sizes = list(set(extracted_sizes))
+                extracted_sizes.sort()
+
+                if extracted_sizes:
+                    self.cuda_graph_captured = extracted_sizes
+                    logger.info(
+                        "Selected %d CUDA graph shapes from CSV using %s "
+                        "(ranked by hit_count then capture_priority): %s",
+                        len(self.cuda_graph_captured), selection_policy,
+                        self.cuda_graph_captured)
+                else:
+                    raise ValueError("CSV file is empty or missing valid data.")
+            except Exception as e:
+                logger.error("Failed to load custom CUDA graph shapes from %s: %s. Falling back to default sizes.",
+                             csv_path, str(e))
+                self.cuda_graph_captured = self.cudagraph_batch_sizes
+        else:
+            logger.warning(
+                "Hotspot CSV not found in %s. Falling back to default sizes.",
+                hotspot_csv_paths)
+            self.cuda_graph_captured = getattr(self, "cudagraph_batch_sizes",[1, 2, 4, 8, 16, 24, 32, 48, 64])
+
+        # self.cuda_graph_captured = [1, 2, 4, 8, 16, 24, 32, 48, 64] # 默认启动构建的CUDA图
+        # self.cuda_graph_captured = self.cudagraph_batch_sizes
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
-        with graph_capture(device=self.device):
+        with self.manager.fast_capture_scope(), graph_capture(device=self.device):
             full_cg = self.full_cuda_graph
             # Only rank 0 should print progress bar during capture
-            compilation_cases = reversed(self.cudagraph_batch_sizes)
+            compilation_cases = reversed(self.cuda_graph_captured)
             if is_global_first_rank():
                 compilation_cases = tqdm(list(compilation_cases),
                                          desc="Capturing CUDA graph shapes")
+            capturable_sizes = set(self.cudagraph_batch_sizes)
             for num_tokens in compilation_cases:
+                # Defensive guard (mirrors DynamicGraphManager._is_capturable_shape):
+                # never attempt to capture a shape outside the registered
+                # cudagraph sizes (e.g. > max_capture_size). Such a shape is not
+                # replayable and would crash/waste the capture.
+                if num_tokens not in capturable_sizes:
+                    logger.warning(
+                        "Skip pre-capture for shape %s because it is not in "
+                        "cudagraph_capture_sizes.", num_tokens)
+                    continue
                 # We skip EPLB here since we don't want to record dummy metrics
                 for _ in range(
                         self.compilation_config.cudagraph_num_of_warmups):
@@ -2325,6 +3004,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # This usually takes 5~20 seconds.
         logger.info("Graph capturing finished in %.0f secs, took %.2f GiB",
                     elapsed_time, cuda_graph_size / (1 << 30))
+        if self.enable_adaptive_cudagraph:
+            self.graphMatcher.update_captured_sizes(
+                self.cuda_graph_captured)
+            self.adaptive_cudagraph_controller.register_ready_shapes(
+                self.cuda_graph_captured, phase="decode")
 
     def initialize_attn_backend(self, kv_cache_config: KVCacheConfig) -> None:
         """

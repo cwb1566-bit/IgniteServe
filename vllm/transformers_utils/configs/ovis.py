@@ -73,9 +73,11 @@ IMAGE_TOKEN = "<image>"
 IMAGE_ATOM_ID = -300
 IMAGE_INDICATOR_IDS = [-301, -302, -303, -304, -305]
 
-AutoConfig.register("aimv2", AIMv2Config)
-
-
+# 改,源码：AutoConfig.register("aimv2", AIMv2Config)
+try:
+    AutoConfig.register("aimv2", AIMv2Config)
+except ValueError:
+    pass  # 如果已注册则忽略
 # ----------------------------------------------------------------------
 #                     Visual Tokenizer Configuration
 # ----------------------------------------------------------------------

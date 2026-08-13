@@ -19,6 +19,7 @@ from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
+from vllm.operator_pipeline_trace import operator_pipeline_range
 from vllm.platforms import _Backend, current_platform
 from vllm.utils import direct_register_custom_op
 from vllm.v1.attention.backends.utils import validate_kv_sharing_target
@@ -409,8 +410,9 @@ def unified_attention(
         attn_metadata = attn_metadata[layer_name]
     self = forward_context.no_compile_layers[layer_name]
     kv_cache = self.kv_cache[forward_context.virtual_engine]
-    output = self.impl.forward(self, query, key, value, kv_cache,
-                               attn_metadata)
+    with operator_pipeline_range(f"attention.{layer_name}"):
+        output = self.impl.forward(self, query, key, value, kv_cache,
+                                   attn_metadata)
 
     maybe_save_kv_layer_to_connector(layer_name, kv_cache)
     return output
@@ -449,14 +451,15 @@ def unified_attention_with_output(
         attn_metadata = attn_metadata[layer_name]
     self = forward_context.no_compile_layers[layer_name]
     kv_cache = self.kv_cache[forward_context.virtual_engine]
-    self.impl.forward(self,
-                      query,
-                      key,
-                      value,
-                      kv_cache,
-                      attn_metadata,
-                      output=output,
-                      output_scale=output_scale)
+    with operator_pipeline_range(f"attention.{layer_name}"):
+        self.impl.forward(self,
+                          query,
+                          key,
+                          value,
+                          kv_cache,
+                          attn_metadata,
+                          output=output,
+                          output_scale=output_scale)
 
     maybe_save_kv_layer_to_connector(layer_name, kv_cache)
 
