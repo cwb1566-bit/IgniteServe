@@ -2,7 +2,7 @@
 
 IgniteServe is a research inference framework for reducing large-language-model cold-start latency while preserving steady-state serving performance.
 
-It is developed by the **Cloud-Native Large Model Systems Group (CGCL), Huazhong University of Science and Technology**. This repository is a private research codebase derived from [vLLM](https://github.com/vllm-project/vllm) 0.9.2.
+It is developed by the **CGCL, Huazhong University of Science and Technology**. This repository is a private research codebase derived from [vLLM](https://github.com/vllm-project/vllm) 0.9.2.
 
 ## What IgniteServe Adds
 
