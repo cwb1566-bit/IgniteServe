@@ -74,9 +74,7 @@ class EngineCore:
         deferred_supported = bool(
             getattr(executor_class, "supports_deferred_startup",
                     lambda: False)())
-        if (requested_dag_mode == "execute"
-                and vllm_config.parallel_config.world_size == 1
-                and deferred_supported):
+        if requested_dag_mode == "execute" and deferred_supported:
             self._initialize_with_full_startup_dag(
                 vllm_config, executor_class, log_stats,
                 executor_fail_callback)
@@ -1024,6 +1022,12 @@ class EngineCore:
         HotspotAnalyzer.check_and_export(True)
         self.structured_output_manager.clear_backend()
         if self.model_executor:
+            try:
+                self.model_executor.collective_rpc(
+                    "export_cudagraph_hotspot_profile")
+            except Exception:
+                logger.exception(
+                    "Failed to export distributed CUDA graph hotspots")
             if self._adaptive_cudagraph_enabled:
                 try:
                     self.model_executor.collective_rpc(
@@ -1366,7 +1370,7 @@ class EngineCoreProc(EngineCore):
                     # stream-capture window.
                     if not self.input_queue.empty():
                         continue
-                    if self.model_executor.capture_pending_cudagraphs() > 0:
+                    if self._capture_pending_cudagraphs_coordinated() > 0:
                         # Re-enter the grace period before capturing another
                         # graph, so a request can preempt the maintenance queue.
                         continue
@@ -1401,6 +1405,51 @@ class EngineCoreProc(EngineCore):
             self._maybe_capture_cudagraph_with_slo_slack()
 
         return model_executed
+
+    def _capture_pending_cudagraphs_coordinated(
+        self,
+        max_pieces_per_shape: Optional[int] = None,
+        deadline_ms: Optional[float] = None,
+        selected_shape: Optional[int] = None,
+    ) -> int:
+        """Capture only a shape that is pending on every distributed rank."""
+        world_size = self.vllm_config.parallel_config.world_size
+        if world_size == 1:
+            return self.model_executor.capture_pending_cudagraphs(
+                max_pieces_per_shape=max_pieces_per_shape,
+                deadline_ms=deadline_ms,
+                selected_shape=selected_shape,
+            )
+        if os.environ.get(
+                "VLLM_ENABLE_DISTRIBUTED_ADAPTIVE_CUDAGRAPH",
+                "").strip().lower() not in ("1", "true", "yes", "on"):
+            return 0
+
+        pending_by_rank = self.model_executor.collective_rpc(
+            "get_pending_cudagraph_shapes")
+        if len(pending_by_rank) != world_size or not pending_by_rank:
+            return 0
+        common = set(int(shape) for shape in pending_by_rank[0])
+        for pending in pending_by_rank[1:]:
+            common.intersection_update(int(shape) for shape in pending)
+        if selected_shape is not None:
+            candidate = int(selected_shape)
+            if candidate not in common:
+                return 0
+        else:
+            candidate = next(
+                (int(shape) for shape in pending_by_rank[0]
+                 if int(shape) in common), None)
+            if candidate is None:
+                return 0
+        logger.info(
+            "Distributed adaptive CUDA graph capture admitted: "
+            "shape=%d world_size=%d", candidate, world_size)
+        return self.model_executor.capture_pending_cudagraphs(
+            max_pieces_per_shape=max_pieces_per_shape,
+            deadline_ms=deadline_ms,
+            selected_shape=candidate,
+        )
 
     @staticmethod
     def _percentile(values: deque[float], quantile: float) -> float:
@@ -1469,7 +1518,11 @@ class EngineCoreProc(EngineCore):
         if not self._adaptive_cudagraph_slo_capture_enabled:
             return
         parallel_config = self.vllm_config.parallel_config
-        if (parallel_config.world_size != 1
+        distributed_capture_enabled = os.environ.get(
+            "VLLM_ENABLE_DISTRIBUTED_ADAPTIVE_CUDAGRAPH",
+            "").strip().lower() in ("1", "true", "yes", "on")
+        if ((parallel_config.world_size != 1
+             and not distributed_capture_enabled)
                 or parallel_config.data_parallel_size != 1
                 or self.batch_queue is not None):
             return
@@ -1561,8 +1614,15 @@ class EngineCoreProc(EngineCore):
             ),
         )
         plans = [plan for plan in capture_plans if plan is not None]
-        if not plans:
+        if not plans or len(plans) != parallel_config.world_size:
             return
+        plan_shapes = {int(plan["shape"]) for plan in plans}
+        if len(plan_shapes) != 1:
+            logger.warning(
+                "Skipping distributed CUDA graph capture because rank "
+                "plans disagree: shapes=%s", sorted(plan_shapes))
+            return
+        selected_shape = next(iter(plan_shapes))
         piece_budget = min(int(plan["piece_budget"]) for plan in plans)
         predicted_capture_ms = max(
             float(plan["predicted_ms"]) for plan in plans)
@@ -1578,9 +1638,10 @@ class EngineCoreProc(EngineCore):
             self._adaptive_cudagraph_model_steps)
         capture_started = time.perf_counter()
         try:
-            progressed = self.model_executor.capture_pending_cudagraphs(
+            progressed = self._capture_pending_cudagraphs_coordinated(
                 max_pieces_per_shape=piece_budget,
                 deadline_ms=slack_ms,
+                selected_shape=selected_shape,
             )
         except Exception:
             logger.exception(

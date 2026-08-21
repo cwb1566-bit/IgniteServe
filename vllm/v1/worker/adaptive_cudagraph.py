@@ -528,6 +528,7 @@ class AdaptiveCUDAGraphController:
         self,
         phase: str = "decode",
         limit: Optional[int] = None,
+        selected_shape: Optional[int] = None,
     ) -> list[int]:
         if not self.enabled:
             return []
@@ -537,6 +538,9 @@ class AdaptiveCUDAGraphController:
                 if record.phase == phase and record.state in (
                     GraphState.QUEUED, GraphState.PARTIAL)
             ]
+            if selected_shape is not None:
+                queued = [record for record in queued
+                          if record.shape == int(selected_shape)]
             queued.sort(key=lambda record: (record.hit_count, record.shape),
                         reverse=True)
             if self._planned_capture_shape is not None:
@@ -550,6 +554,20 @@ class AdaptiveCUDAGraphController:
             for record in selected:
                 record.state = GraphState.CAPTURING
             return [record.shape for record in selected]
+
+    def pending_shapes(self, phase: str = "decode") -> list[int]:
+        """Return queued shapes without mutating their capture state."""
+        if not self.enabled:
+            return []
+        with self._lock:
+            queued = [
+                record for record in self._records.values()
+                if record.phase == phase and record.state in (
+                    GraphState.QUEUED, GraphState.PARTIAL)
+            ]
+            queued.sort(key=lambda record: (record.hit_count, record.shape),
+                        reverse=True)
+            return [record.shape for record in queued]
 
     def plan_capture_maintenance(
         self,
@@ -681,6 +699,7 @@ class AdaptiveCUDAGraphController:
         runner: object,
         max_pieces_per_shape: Optional[int] = None,
         deadline_ms: Optional[float] = None,
+        selected_shape: Optional[int] = None,
     ) -> int:
         """Capture queued graphs, optionally in bounded piecewise chunks."""
         if not self.enabled:
@@ -691,7 +710,9 @@ class AdaptiveCUDAGraphController:
             # cannot use the piecewise compiler's incremental budget.
             return 0
         shapes = self.take_queued_shapes(
-            limit=self.max_captures_per_idle)
+            limit=(1 if selected_shape is not None else
+                   self.max_captures_per_idle),
+            selected_shape=selected_shape)
         if not shapes:
             return 0
 

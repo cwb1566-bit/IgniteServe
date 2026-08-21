@@ -70,6 +70,19 @@ def test_idle_capture_selection_is_bounded_and_frequency_ordered() -> None:
     assert controller.take_queued_shapes(limit=1) == [8]
 
 
+def test_distributed_selection_peeks_then_takes_one_common_shape() -> None:
+    controller = AdaptiveCUDAGraphController(enabled=True, min_hits=1)
+    for shape in (4, 8):
+        decision = controller.plan_runtime("decode", shape, shape, True, False)
+        assert decision.mark_runtime_warmup
+        controller.finish_runtime_warmup("decode", shape)
+
+    assert controller.pending_shapes() == [8, 4]
+    assert controller.pending_shapes() == [8, 4]
+    assert controller.take_queued_shapes(selected_shape=4) == [4]
+    assert controller.pending_shapes() == [8]
+
+
 def test_split_shadow_claims_each_shape_once() -> None:
     controller = AdaptiveCUDAGraphController(enabled=True, min_hits=1)
     assert controller.claim_split_shadow_shape("decode", 40)
@@ -83,5 +96,6 @@ if __name__ == "__main__":
     test_startup_graph_preserves_existing_replay()
     test_cost_policy_can_force_ready_graph_to_eager()
     test_idle_capture_selection_is_bounded_and_frequency_ordered()
+    test_distributed_selection_peeks_then_takes_one_common_shape()
     test_split_shadow_claims_each_shape_once()
     print("adaptive controller tests passed")

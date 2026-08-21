@@ -28,6 +28,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+from vllm.v1.worker.HotspotAnalyzer import HotspotAnalyzer
 from vllm.v1.worker import kv_profile_cache
 from vllm.v1.worker.startup_compile import (
     compile_only_forward, maybe_apply_offline_best_config, startup_compile_mode)
@@ -76,7 +77,8 @@ if TYPE_CHECKING:
 import time
 import concurrent.futures
 from vllm.distributed.parallel_state import (
-    get_pp_group, get_tp_group, graph_capture, is_global_first_rank,
+    get_pp_group, get_tp_group, get_world_group, graph_capture,
+    is_global_first_rank,
     prepare_communication_buffer_for_model)
 from vllm.utils import DeviceMemoryProfiler
 from torch import inference_mode, no_grad
@@ -576,19 +578,33 @@ class Worker(WorkerBase):
         self,
         max_pieces_per_shape: Optional[int] = None,
         deadline_ms: Optional[float] = None,
+        selected_shape: Optional[int] = None,
     ) -> int:
         if not self.model_runner.enable_adaptive_cudagraph:
             return 0
         controller = self.model_runner.adaptive_cudagraph_controller
-        captured = controller.capture_pending(
-            self.model_runner,
-            max_pieces_per_shape=max_pieces_per_shape,
-            deadline_ms=deadline_ms,
-        )
+        distributed = self.vllm_config.parallel_config.world_size > 1
+        if distributed:
+            torch.distributed.barrier(group=get_world_group().cpu_group)
+        try:
+            captured = controller.capture_pending(
+                self.model_runner,
+                max_pieces_per_shape=max_pieces_per_shape,
+                deadline_ms=deadline_ms,
+                selected_shape=selected_shape,
+            )
+        finally:
+            if distributed:
+                torch.distributed.barrier(group=get_world_group().cpu_group)
         controller.flush_gpu_samples()
         if captured == 0:
             controller.export_telemetry()
         return captured
+
+    def get_pending_cudagraph_shapes(self) -> list[int]:
+        if not self.model_runner.enable_adaptive_cudagraph:
+            return []
+        return self.model_runner.adaptive_cudagraph_controller.pending_shapes()
 
     def plan_pending_cudagraph_capture(
         self,
@@ -616,6 +632,11 @@ class Worker(WorkerBase):
         controller = self.model_runner.adaptive_cudagraph_controller
         controller.flush_gpu_samples()
         controller.export_telemetry()
+
+    def export_cudagraph_hotspot_profile(self) -> None:
+        """Persist one logical workload profile from distributed rank zero."""
+        if self.rank == 0:
+            HotspotAnalyzer.check_and_export(True)
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_runner.add_lora(lora_request)
