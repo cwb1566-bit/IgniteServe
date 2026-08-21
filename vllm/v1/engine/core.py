@@ -202,32 +202,42 @@ class EngineCore:
         if startup_dag_mode == "shadow":
             self._write_startup_dag_shadow_plan()
 
-        timer.start("Init Model")
-        self.model_executor.init_model()
-        timer.end("Init Model")
-
-        stop_async_weight_prewarm_from_env("EngineCore.load_weights")
+        native_distributed_baseline = (
+            self.vllm_config.parallel_config.world_size > 1
+            and os.environ.get(
+                "VLLM_DISTRIBUTED_NATIVE_BASELINE", "").strip().lower()
+            in {"1", "true", "yes", "on"})
         self._weight_loading_error = None
-        # timer.start("Loading Weights")
-        # self.model_executor.load_weights()
-        # timer.end("Loading Weights")
+        if native_distributed_baseline:
+            # Multiproc workers have already followed the upstream lifecycle:
+            # init_device() + load_model(). The first profile run below is the
+            # compilation trigger, matching unmodified vLLM V1 startup.
+            logger.info(
+                "Using strict native distributed startup baseline; skipping "
+                "the split init/load/compile-only stages.")
+        else:
+            timer.start("Init Model")
+            self.model_executor.init_model()
+            timer.end("Init Model")
 
-        def _load_weights_target():
-            try:
-                self.model_executor.load_weights()
-            except BaseException as exc:
-                self._weight_loading_error = exc
-                raise
-        self._weight_loading_thread = threading.Thread(
-            target=_load_weights_target,
-            daemon=True,
-            name="WeightLoadingThread"
-        )
-        self._weight_loading_thread.start()
+            stop_async_weight_prewarm_from_env("EngineCore.load_weights")
 
-        timer.start("Model Compilation")
-        self.model_executor.run_to_trigger_compile()
-        timer.end("Model Compilation")
+            def _load_weights_target():
+                try:
+                    self.model_executor.load_weights()
+                except BaseException as exc:
+                    self._weight_loading_error = exc
+                    raise
+            self._weight_loading_thread = threading.Thread(
+                target=_load_weights_target,
+                daemon=True,
+                name="WeightLoadingThread"
+            )
+            self._weight_loading_thread.start()
+
+            timer.start("Model Compilation")
+            self.model_executor.run_to_trigger_compile()
+            timer.end("Model Compilation")
 
         timer.start("KV Cache Init")
         available_gpu_memory = self.model_executor.determine_available_memory()
