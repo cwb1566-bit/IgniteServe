@@ -45,6 +45,7 @@ from vllm.utils import (STR_DUAL_CHUNK_FLASH_ATTN_VAL, FlexibleArgumentParser,
                         GiB_bytes, get_ip, is_in_ray_actor)
 
 from vllm.v1.engine.weight_pagecache import (
+    ensure_async_weight_prewarm,
     start_async_weight_prewarm,
     stop_async_weight_prewarm,
 )
@@ -474,6 +475,14 @@ class EngineArgs:
         ParallelConfig.enable_multimodal_encoder_data_parallel
 
     def __post_init__(self):
+        # This is the earliest common point for direct LLM, API server, and
+        # on-demand engine construction. Start weight IO before plugin/model
+        # configuration work so the frontend portion of the startup DAG can
+        # overlap it with create_model_config and EngineCore bootstrap.
+        prewarm_proc = ensure_async_weight_prewarm(self.model)
+        if prewarm_proc is not None:
+            setattr(self, "_weight_prewarm_proc", prewarm_proc)
+
         # support `EngineArgs(compilation_config={...})`
         # without having to manually construct a
         # CompilationConfig object

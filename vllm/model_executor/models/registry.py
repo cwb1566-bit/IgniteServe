@@ -307,14 +307,13 @@ class _ModelInfo:
 def _model_info_cache_key(module_name: str, class_name: str) -> Optional[str]:
     """Build a disk-cache key for a lazily-registered model's ``_ModelInfo``.
 
-    Returns ``None`` (i.e. caching disabled) unless startup optimizations are
-    enabled. The key is invalidated by vLLM version changes and by edits to the
-    model's source file (mtime + size), so a stale cache is never used.
+    Returns ``None`` when the independently controllable model-info cache is
+    disabled. The key is invalidated by vLLM version changes and by edits to
+    the model's source file (mtime + size), so a stale cache is never used.
     """
     try:
-        from vllm.compilation.startup_resources import (
-            startup_optimizations_enabled)
-        if not startup_optimizations_enabled():
+        from vllm.compilation.startup_resources import enabled_by_master
+        if not enabled_by_master("VLLM_ENABLE_MODEL_INFO_CACHE"):
             return None
     except Exception:
         return None
@@ -427,7 +426,8 @@ class _LazyRegisteredModel(_BaseRegisteredModel):
     def inspect_model_cls(self) -> _ModelInfo:
         # Fast path: reuse a previously-computed result from disk to avoid
         # spawning a fresh Python subprocess (which re-imports vllm + torch)
-        # on every cold start. Only active when startup optimizations are on.
+        # on every cold start. It can be enabled as a standalone DAG resource
+        # or inherited from the startup-optimization master switch.
         cached = _load_cached_model_info(self.module_name, self.class_name)
         if cached is not None:
             return cached
