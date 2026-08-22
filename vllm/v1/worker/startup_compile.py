@@ -234,6 +234,9 @@ def compile_only_forward(model_runner: Any, *, autotune: bool = False,
     }
 
     def _autotune(self_ca, args, kwargs, stream) -> None:
+        from vllm.compilation.weight_compile_overlap import (
+            wait_for_weights_ready)
+        wait_for_weights_ready()
         st = time.perf_counter()
         self_ca.autotune_to_one_config(*args, **kwargs)
         if stream is not None:

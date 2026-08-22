@@ -59,12 +59,20 @@ def _start_full_fx_compile_worker_prewarm(vllm_config: VllmConfig) -> None:
         import_names)
 
     try:
+        from vllm.compilation.compiler_interface import (
+            start_inductor_factor_prewarm)
         from torch._inductor.compile_fx_full_subproc import FullFxCompilePool
 
+        prewarm_identity = os.environ.get(
+                "VLLM_ENABLE_ASYNC_COMPILER_HASH_PREWARM",
+                "").strip().lower() in {"1", "true", "yes", "on"}
+        if prewarm_identity:
+            start_inductor_factor_prewarm()
         FullFxCompilePool.prewarm_workers()
         logger.info(
-            "Started Full-FX compiler worker import/CUDA prewarm during "
-            "GPU worker initialization.")
+            "Started %sFull-FX worker prewarm during GPU worker "
+            "initialization.",
+            "compiler-identity and " if prewarm_identity else "")
     except Exception as exc:
         logger.warning("Failed to start Full-FX compiler worker prewarm: %s",
                        exc)
@@ -272,6 +280,65 @@ class Worker(WorkerBase):
 
     def load_weights(self) -> None:
         self.model_runner.load_weights()
+
+    def load_weights_and_trigger_compile(self) -> None:
+        """Overlap finalized-weight loading with value-independent compile-only.
+
+        Model construction has already allocated every parameter with its final
+        shape and dtype. S4 compile-only reads that structure but suppresses
+        kernel launches, while the loader only copies values into the existing
+        parameter storage. Keeping both tasks inside one worker RPC avoids
+        interleaving two collective RPC streams.
+        """
+        started = time.perf_counter()
+        mode = startup_compile_mode()
+        safe_modes = {
+            "s0", "stage_separated", "stage_separated_baseline",
+            "precompile", "precompile_skip_profile", "s4",
+            "a100_optimized", "offline_best_config",
+            "offline_best_config_skip_profile",
+        }
+        if mode not in safe_modes:
+            logger.warning(
+                "Weight/compile overlap is unsafe for compile mode %s; "
+                "using the sequential path.", mode)
+            self.load_weights()
+            self.run_to_trigger_compile()
+            return
+
+        def on_worker_device(fn):
+            torch.cuda.set_device(self.device)
+            with torch.inference_mode():
+                return fn()
+
+        from vllm.compilation import weight_compile_overlap
+
+        weight_compile_overlap.begin()
+
+        def load_and_signal():
+            try:
+                result = on_worker_device(self.load_weights)
+                sync_started = time.perf_counter()
+                torch.cuda.synchronize(self.device)
+                logger.info("Weight/compile overlap finalized CUDA copies in "
+                            "%.3f seconds", time.perf_counter() - sync_started)
+                return result
+            finally:
+                weight_compile_overlap.mark_weights_ready()
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=2,
+                    thread_name_prefix="vllm-weight-compile") as pool:
+                load_future = pool.submit(load_and_signal)
+                compile_future = pool.submit(on_worker_device,
+                                             self.run_to_trigger_compile)
+                load_future.result()
+                compile_future.result()
+        finally:
+            weight_compile_overlap.end()
+        logger.info("Weight/compile overlap finished in %.3f seconds",
+                    time.perf_counter() - started)
 
     def get_startup_state_snapshot(self) -> dict[str, object]:
         """Return exact worker-local facts used to build the startup DAG."""

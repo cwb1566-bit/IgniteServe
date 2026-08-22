@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
 import copy
+import functools
 import hashlib
 import os
 import threading
@@ -21,6 +22,8 @@ from vllm.utils import is_torch_equal_or_newer
 from .inductor_pass import pass_context
 from vllm.logger import init_logger
 logger = init_logger(__name__)
+
+
 class CompilerInterface:
     """
     The interface for a compiler that can be used by vLLM.
@@ -148,7 +151,11 @@ class AlwaysHitShapeEnv:
         return ""
 
 
-def get_inductor_factors() -> list[Any]:
+_inductor_factor_prewarm_thread: Optional[threading.Thread] = None
+
+
+@functools.lru_cache(maxsize=1)
+def _get_inductor_factors_cached() -> list[Any]:
     factors: list[Any] = []
     # summarize system state
     from torch._inductor.codecache import CacheBase
@@ -160,6 +167,28 @@ def get_inductor_factors() -> list[Any]:
     torch_factors = torch_key()
     factors.append(torch_factors)
     return factors
+
+
+def get_inductor_factors() -> list[Any]:
+    thread = _inductor_factor_prewarm_thread
+    if thread is not None and thread is not threading.current_thread():
+        thread.join()
+    return _get_inductor_factors_cached()
+
+
+def start_inductor_factor_prewarm() -> None:
+    """Compute the compiler identity while model weights are loading."""
+    global _inductor_factor_prewarm_thread
+    thread = _inductor_factor_prewarm_thread
+    if thread is not None:
+        return
+    thread = threading.Thread(
+        target=get_inductor_factors,
+        name="inductor-factor-prewarm",
+        daemon=True,
+    )
+    _inductor_factor_prewarm_thread = thread
+    thread.start()
 
 
 class InductorStandaloneAdaptor(CompilerInterface):

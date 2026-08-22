@@ -613,11 +613,16 @@ def build_logical_startup_dag(state: StartupState) -> StartupDAG:
     add("transformed_code_lookup", {"model_structure"},
         "compilation_manager", {"cpu": 1},
         state.transformed_code_store_present is True)
-    add("dynamo_trace", {"model_structure", "transformed_code_lookup"},
+    # The transformed-code resource avoids depyf decompilation and artifact
+    # regeneration; it does not persist Dynamo's guarded frame cache.
+    add("dynamo_trace", {"model_structure"},
+        "compilation_manager", {"cpu": 1}, True)
+    add("transformed_code_decompile",
+        {"dynamo_trace", "transformed_code_lookup"},
         "compilation_manager", {"cpu": 1},
         state.transformed_code_store_present is not True,
-        "transformed-code-hit")
-    add("graph_split", {"dynamo_trace", "transformed_code_lookup"},
+        "transformed-code-artifact-hit")
+    add("graph_split", {"dynamo_trace"},
         "compilation_manager", {"cpu": 1})
     add("dataflow_metadata_restore", {"graph_split"},
         "compilation_manager", {"cpu": 1},

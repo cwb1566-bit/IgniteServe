@@ -7,6 +7,7 @@ import copy
 import dataclasses
 import functools
 import json
+import os
 import sys
 import threading
 import warnings
@@ -1337,11 +1338,19 @@ class EngineArgs:
         #############################################################
         # Unsupported Feature Flags on V1.
 
-        if self.load_format == LoadFormat.SHARDED_STATE.value:
+        enable_v1_sharded_state = os.environ.get(
+            "VLLM_ENABLE_V1_SHARDED_STATE", "").strip().lower() in {
+                "1", "true", "yes", "on"
+            }
+        if (self.load_format == LoadFormat.SHARDED_STATE.value
+                and not enable_v1_sharded_state):
             _raise_or_fallback(
                 feature_name=f"--load_format {self.load_format}",
                 recommend_to_remove=False)
             return False
+        if (self.load_format == LoadFormat.SHARDED_STATE.value
+                and enable_v1_sharded_state):
+            logger.info("Using experimental V1 topology-sharded state loader.")
 
         if (self.logits_processor_pattern
                 != EngineArgs.logits_processor_pattern):

@@ -520,6 +520,10 @@ class EngineCore:
         history.update(bootstrap_state, bootstrap_results)
 
         state = context.require("startup_state")
+        overlap_weight_compile = os.environ.get(
+            "VLLM_ENABLE_WEIGHT_COMPILE_OVERLAP", "").strip().lower() in {
+                "1", "true", "yes", "on"
+            }
 
         def init_model(_):
             self.model_executor.init_model()
@@ -528,7 +532,14 @@ class EngineCore:
             stop_async_weight_prewarm_from_env("EngineCore.load_weights")
 
         def load_weights(_):
-            self.model_executor.load_weights()
+            if overlap_weight_compile:
+                self.model_executor.load_weights_and_trigger_compile()
+            else:
+                self.model_executor.load_weights()
+
+        def compile_model(_):
+            if not overlap_weight_compile:
+                self.model_executor.run_to_trigger_compile()
 
         def kv_profile(ctx):
             return ctx.put(
@@ -575,10 +586,10 @@ class EngineCore:
         runtime_actions = {
             "init_model": timed("Init Model", init_model),
             "stop_weight_prewarm": stop_weight_prewarm,
-            "load_weights": timed("Loading Weights", load_weights),
-            "compile_model": timed(
-                "Model Compilation",
-                lambda _: self.model_executor.run_to_trigger_compile()),
+            "load_weights": timed(
+                "Weight-Compile Overlap" if overlap_weight_compile else
+                "Loading Weights", load_weights),
+            "compile_model": timed("Model Compilation", compile_model),
             "kv_profile": timed("KV Profile", kv_profile),
             "kv_cache_allocate": timed("KV Cache Allocation",
                                          kv_cache_allocate),
@@ -719,6 +730,10 @@ class EngineCore:
         )
 
         state = self._collect_startup_state()
+        overlap_weight_compile = os.environ.get(
+            "VLLM_ENABLE_WEIGHT_COMPILE_OVERLAP", "").strip().lower() in {
+                "1", "true", "yes", "on"
+            }
         history_path, plan_path = self._startup_orchestration_paths()
         history = StartupCostHistory(history_path)
 
@@ -738,10 +753,14 @@ class EngineCore:
             stop_async_weight_prewarm_from_env("EngineCore.load_weights")
 
         def load_weights(_):
-            self.model_executor.load_weights()
+            if overlap_weight_compile:
+                self.model_executor.load_weights_and_trigger_compile()
+            else:
+                self.model_executor.load_weights()
 
         def compile_model(_):
-            self.model_executor.run_to_trigger_compile()
+            if not overlap_weight_compile:
+                self.model_executor.run_to_trigger_compile()
 
         def kv_profile(context):
             return context.put(
@@ -799,7 +818,9 @@ class EngineCore:
         actions = {
             "init_model": timed("Init Model", init_model),
             "stop_weight_prewarm": stop_weight_prewarm,
-            "load_weights": timed("Loading Weights", load_weights),
+            "load_weights": timed(
+                "Weight-Compile Overlap" if overlap_weight_compile else
+                "Loading Weights", load_weights),
             "compile_model": timed("Model Compilation", compile_model),
             "kv_profile": timed("KV Profile", kv_profile),
             "kv_cache_allocate": timed("KV Cache Allocation",

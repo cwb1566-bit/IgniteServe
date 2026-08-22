@@ -32,6 +32,27 @@ class ShardedStateLoader(BaseModelLoader):
 
     DEFAULT_PATTERN = "model-rank-{rank}-part-{part}.safetensors"
 
+    @staticmethod
+    def _format_pattern(pattern: str, part: object) -> str:
+        """Format a shard name with TP, PP, and global rank coordinates.
+
+        ``rank`` remains an alias for ``tp_rank`` so existing checkpoints
+        continue to load. Topology-aware checkpoints can use ``global_rank``
+        to prevent PP stages from overwriting one another.
+        """
+        from vllm.distributed import (get_pp_group,
+                                      get_tensor_model_parallel_rank)
+
+        tp_rank = get_tensor_model_parallel_rank()
+        pp_rank = get_pp_group().rank_in_group
+        global_rank = (torch.distributed.get_rank()
+                       if torch.distributed.is_initialized() else 0)
+        return pattern.format(rank=tp_rank,
+                              tp_rank=tp_rank,
+                              pp_rank=pp_rank,
+                              global_rank=global_rank,
+                              part=part)
+
     def __init__(self,
                  load_config: LoadConfig,
                  runai_model_streamer: bool = False):
@@ -101,22 +122,17 @@ class ShardedStateLoader(BaseModelLoader):
 
     def load_weights(self, model: nn.Module,
                      model_config: ModelConfig) -> None:
-        from vllm.distributed import get_tensor_model_parallel_rank
-
         model_weights = model_config.model
         if hasattr(model_config, "model_weights"):
             model_weights = model_config.model_weights
         local_model_path = model_weights
 
-        rank = get_tensor_model_parallel_rank()
-        pattern = os.path.join(
-            local_model_path,
-            self.pattern.format(rank=rank, part="*"),
-        )
+        shard_pattern = self._format_pattern(self.pattern, part="*")
+        pattern = os.path.join(local_model_path, shard_pattern)
 
         filepaths = []
         if is_s3(local_model_path):
-            file_pattern = f"*{self.pattern.format(rank=rank, part=' * ')}"
+            file_pattern = f"*{shard_pattern}"
             filepaths = s3_glob(path=local_model_path,
                                 allow_pattern=[file_pattern])
         else:
@@ -171,11 +187,8 @@ class ShardedStateLoader(BaseModelLoader):
     ) -> None:
         from safetensors.torch import save_file
 
-        from vllm.distributed import get_tensor_model_parallel_rank
-
         if pattern is None:
             pattern = ShardedStateLoader.DEFAULT_PATTERN
-        rank = get_tensor_model_parallel_rank()
         part_idx = 0
         total_size = 0
         state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
@@ -183,7 +196,8 @@ class ShardedStateLoader(BaseModelLoader):
         for key, tensor in state_dict.items():
             param_size = tensor.nelement() * tensor.element_size()
             if max_size is not None and total_size + param_size > max_size:
-                filename = pattern.format(rank=rank, part=part_idx)
+                filename = ShardedStateLoader._format_pattern(
+                    pattern, part=part_idx)
                 save_file(
                     state_dict_part,
                     os.path.join(path, filename),
@@ -194,7 +208,8 @@ class ShardedStateLoader(BaseModelLoader):
             state_dict_part[key] = tensor
             total_size += param_size
         if len(state_dict_part) > 0:
-            filename = pattern.format(rank=rank, part=part_idx)
+            filename = ShardedStateLoader._format_pattern(
+                pattern, part=part_idx)
             save_file(
                 state_dict_part,
                 os.path.join(path, filename),
