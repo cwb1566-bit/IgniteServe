@@ -1697,7 +1697,7 @@ class ParallelCompileManager:
         prewarm_wait_started = time.perf_counter()
         prewarm_results = [
             future.result()
-            for future in FullFxCompilePool.prewarm_workers()
+            for future in FullFxCompilePool.all_prewarm_futures()
         ]
         logger.info(
             'Parallel compile timing worker_prewarm wait_s=%.6f results=%s',

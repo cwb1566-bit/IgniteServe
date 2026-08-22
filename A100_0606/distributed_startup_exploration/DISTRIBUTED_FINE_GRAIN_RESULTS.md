@@ -80,14 +80,41 @@ The individual stages become slower under contention, but the end-to-end
 critical path is shorter. PP=2 cold compilation benefits least because weight
 I/O delays completion of the asynchronous Full-FX worker import/CUDA prewarm.
 
+### 5. Two-phase Full-FX worker prewarm
+
+The remaining Full-FX bootstrap was split into two dependency-aware tasks.
+Compiler/framework imports are submitted immediately after the rank worker is
+constructed, before CUDA and NCCL initialization. After the rank selects its
+device, CUDA context prewarm is queued on the same compiler subprocesses.
+Materialization waits for both sets of futures before submitting compile jobs.
+
+- Switch: `VLLM_ENABLE_TWO_PHASE_FULL_FX_PREWARM=1`
+- PyTorch API: `FullFxCompilePool.prewarm_cuda_workers(device_index)` and
+  `FullFxCompilePool.all_prewarm_futures()`.
+- Default behavior is unchanged when the switch is absent.
+
+Three-run medians for cold model pages and cold compile caches:
+
+| Topology | Path | Full-FX wait | Weight/compile overlap | Total Init |
+|---|---|---:|---:|---:|
+| PP=2 | previous ordering | 4.3164 s | 15.1618 s | 19.2213 s |
+| PP=2 | CUDA-before-NCCL only | 4.0890 s | 14.9654 s | 18.6712 s |
+| PP=2 | two-phase prewarm | 3.4408 s | 13.9334 s | 17.7271 s |
+| TP=2 | previous ordering | 0.2057 s | 16.8944 s | 20.7231 s |
+| TP=2 | two-phase prewarm | 0.0000 s | 16.5020 s | 20.6014 s |
+
+The two-phase path reduces PP=2 `Total Init` by 1.4942 s (7.77%) and
+TP=2 by 0.1217 s (0.59%). PP benefits more because compiler bootstrap remains
+on its cold critical path; TP already overlaps almost all of that work.
+
 ## Cumulative Result Relative to the Previous D3 Path
 
 | Topology | State | D3 Total Init | Current Total Init | Reduction |
 |---|---|---:|---:|---:|
-| TP=2 | cold model / cold compile | 33.5839 s | 20.9458 s | 37.6% |
+| TP=2 | cold model / cold compile | 33.5839 s | 20.6014 s | 38.7% |
 | TP=2 | cold model / warm compile | 28.0953 s | 14.7602 s | 47.5% |
 | TP=2 | warm model / warm compile | 24.8311 s | 14.8314 s | 40.3% |
-| PP=2 | cold model / cold compile | 29.4559 s | 18.6869 s | 36.6% |
+| PP=2 | cold model / cold compile | 29.4559 s | 17.7271 s | 39.8% |
 | PP=2 | cold model / warm compile | 22.8439 s | 10.6788 s | 53.2% |
 | PP=2 | warm model / warm compile | 21.1953 s | 8.8662 s | 58.2% |
 
@@ -104,22 +131,71 @@ I/O delays completion of the asynchronous Full-FX worker import/CUDA prewarm.
 - Transformed-code artifacts do not skip Dynamo tracing. They avoid expensive
   depyf decompilation/artifact regeneration; the startup DAG description was
   corrected accordingly.
+- Naive regional compilation of each `LlamaDecoderLayer` is not safe or
+  beneficial. A 32-layer synthetic PyTorch probe needed only two backend calls,
+  but the real vLLM model recompiles layers because every attention module has
+  a static `Attention.layer_name` used to select its KV cache and metadata.
+  Sharing one `VllmBackend` violates its one-graph contract; independent
+  backends either collide in graph-index metadata or compile every layer.
+  Namespaced trials spent 14-19 s lowering each region and did not complete a
+  correct startup. All regional source changes were removed.
+
+## Remaining-Space Experiments
+
+### Regional decoder compilation
+
+Warm-cache Dynamo tracing remains approximately 7.3 s on TP=2 and 3.5 s per
+PP=2 stage, and scales almost linearly with the number of decoder layers seen by
+that rank. A correct regional design must split a decoder layer into:
+
+1. an attention pre-region with explicitly lifted weights;
+2. a layer-specific opaque attention call carrying a stable layer handle; and
+3. a shared attention post/MLP region with explicitly lifted weights.
+
+The cache/guard signature must include placeholder schemas, tensor metadata,
+constants, and the layer-handle binding. Merely wrapping the existing layer in
+`Module.compile()` cannot remove the static attention identity guard.
+
+### Service-owned Full-FX compiler daemon
+
+A live-pool probe measured the first two-worker pool prewarm at 9.294932 s,
+including spawn/bootstrap; the child import/CUDA tasks themselves took about
+3.51 s. A second `prewarm_workers()` call in the same parent took 9 microseconds,
+demonstrating that the runtime is fully reusable. The two resident helper
+processes consumed 418 MiB each (836 MiB for one two-worker pool).
+
+The current pool is process-local: every rank worker owns its pipes and destroys
+them at engine shutdown. Cross-engine reuse therefore requires a service-owned
+daemon with a Unix-socket/RPC protocol for serialized FX payloads, per-request
+compiler/cache environments, device identity, concurrent futures, and artifact
+responses. Keeping the current parent-local object alive cannot transfer it to
+a new EngineCore.
+
+### Persistent distributed worker shell
+
+Current bootstrap medians are about 1.75 s for TP=2 and 1.69 s for PP=2.
+An experimental same-executor replay measured PP=2 initial bootstrap at
+1.8326 s and idempotent shell reentry at 0.000651 s. Thus the low-level CUDA,
+NCCL, worker, and RPC state is reusable and has roughly 1.7-1.8 s of headroom.
+
+This is not equivalent to `sleep(level=2)`, which retains the ModelRunner and
+compiled runtime. A correct cross-model shell must keep the worker processes,
+CUDA contexts, compatible NCCL groups, and compiler daemon while explicitly
+releasing/rebinding model, KV-cache, CUDA-graph, scheduler, allocator-tag,
+`static_forward_context`, and piecewise-backend state. It also needs a
+service-owned EngineCore broker because the current `EngineCore.shutdown()`
+terminates the workers and a new EngineCore cannot adopt the old message queues.
+The reentry instrumentation was removed after measurement; no incomplete shell
+handoff code remains in the runtime.
 
 ## Remaining Opportunities
 
-1. Persist or preload the Full-FX worker runtime across engine instances. Its
-   imports and CUDA initialization take about 4 s per worker and account for
-   the remaining PP cold overlap loss. This requires a service-owned compiler
-   daemon or transferable IPC protocol; the current pool is parent-process
-   local.
-2. Regional compilation of repeated decoder layers. Warm-cache Dynamo tracing
-   remains about 7.3 s on TP=2 and 3.5 s on each PP=2 stage. This requires a
-   guarded regional-frame design that preserves vLLM attention graph breaks and
-   parameter binding; filesystem caches cannot eliminate it.
-3. Persistent distributed worker shells. Reusing CUDA contexts, NCCL
-   communicators, P2P probes, and compiler daemons across model swaps could
-   remove roughly 2 s of bootstrap, but changes the multi-model service
-   lifecycle and isolation boundary.
+1. Implement the service-owned Full-FX daemon protocol. The reuse benefit is
+   validated, while the remaining work is ownership, IPC, and isolation.
+2. Implement attention-aware regional frames rather than per-layer wrappers.
+   This is the only path that can remove the remaining linear Dynamo trace.
+3. Move EngineCore ownership into a persistent service broker and add an
+   explicit model-state reset/rebind protocol for compatible TP/PP shells.
 4. Stage-specific CUDA graph policies have limited remaining startup headroom:
    adaptive pre-capture is already about 0.6-0.9 s for three shapes. Every TP
    rank and PP stage still needs its local graph; graphs cannot be copied across
@@ -135,6 +211,16 @@ I/O delays completion of the asynchronous Full-FX worker import/CUDA prewarm.
   - `A100_0606/distributed_startup_finegrain_weight_compile_overlap_pp2/`
 - PP materialization-gate rejection:
   - `A100_0606/distributed_startup_finegrain_weight_compile_gate_pp2_cold/`
+- Two-phase Full-FX formal results:
+  - `A100_0606/distributed_startup_two_phase_fullfx_pp2_formal/`
+  - `A100_0606/distributed_startup_two_phase_fullfx_tp2_formal/`
+- Regional compilation failure probes:
+  - `A100_0606/distributed_startup_regional_tp2_smoke_v2/`
+  - `A100_0606/distributed_startup_regional_tp2_smoke_v4/`
+  - `A100_0606/distributed_startup_regional_tp2_smoke_v5/`
+- Persistent runtime probes:
+  - `A100_0606/distributed_startup_exploration/fullfx_pool_reuse_probe.py`
+  - `A100_0606/distributed_startup_exploration/persistent_shell_reentry_pp2.log`
 - Generated topology checkpoints:
   - `/data/wenbiao/igniteserve_probe/llama8b_tp2/`
   - `/data/wenbiao/igniteserve_probe/llama8b_pp2/`

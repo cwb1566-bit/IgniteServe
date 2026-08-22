@@ -523,15 +523,25 @@ def build_bootstrap_startup_dag(
     add("worker_construct", {"worker_prepare"}, {"cpu": 1}, "worker")
     add("static_resource_probe", {"worker_construct"}, {"disk_io": 1},
         "startup_manager")
-    add("cuda_device", {"worker_construct"},
+    two_phase_compile_prewarm = os.environ.get(
+        "VLLM_ENABLE_TWO_PHASE_FULL_FX_PREWARM", "0") == "1"
+    if two_phase_compile_prewarm:
+        compile_prewarm_dependencies = {"worker_construct"}
+        cuda_dependencies = {"compile_worker_prewarm"}
+        distributed_dependencies = {"cuda_device"}
+    else:
+        compile_prewarm_dependencies = {"distributed_environment"}
+        cuda_dependencies = {"worker_construct"}
+        distributed_dependencies = {"cuda_device"}
+    add("cuda_device", cuda_dependencies,
         {"worker_rpc": 1, "gpu_runtime": 1}, "worker", "worker-0")
-    add("distributed_environment", {"cuda_device"},
-        {"worker_rpc": 1, "gpu_runtime": 1}, "worker", "worker-0")
-    # Launch the FX helper before GPUModelRunner construction. The helper then
-    # warms asynchronously while the runner allocates its persistent buffers.
-    add("compile_worker_prewarm", {"distributed_environment"},
+    add("compile_worker_prewarm", compile_prewarm_dependencies,
         {"worker_rpc": 1, "compiler_cpu": 1}, "compilation", "worker-0")
-    add("model_runner", {"compile_worker_prewarm"},
+    add("distributed_environment", distributed_dependencies,
+        {"worker_rpc": 1, "gpu_runtime": 1}, "worker", "worker-0")
+    # The helper warms asynchronously while distributed setup and the runner
+    # allocate their persistent state.
+    add("model_runner", {"compile_worker_prewarm", "distributed_environment"},
         {"worker_rpc": 1, "gpu_memory": 1}, "model", "worker-0")
     add("usage_reporting", {"model_runner"}, {"worker_rpc": 1}, "runtime",
         "worker-0")

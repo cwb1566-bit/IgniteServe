@@ -48,7 +48,12 @@ def _start_full_fx_compile_worker_prewarm(vllm_config: VllmConfig) -> None:
     os.environ.setdefault("TORCHINDUCTOR_FULL_FX_COMPILE_WORKERS",
                           str(max_workers))
     os.environ.setdefault("TORCHINDUCTOR_FX_COMPILE_INNER_THREADS", "1")
-    os.environ.setdefault("TORCHINDUCTOR_FX_COMPILE_PREWARM_CUDA", "1")
+    two_phase = os.environ.get(
+        "VLLM_ENABLE_TWO_PHASE_FULL_FX_PREWARM", "0") == "1"
+    if two_phase:
+        os.environ["TORCHINDUCTOR_FX_COMPILE_PREWARM_CUDA"] = "0"
+    else:
+        os.environ.setdefault("TORCHINDUCTOR_FX_COMPILE_PREWARM_CUDA", "1")
     worker_imports = os.environ.get(
         "TORCHINDUCTOR_FX_COMPILE_WORKER_IMPORTS", "")
     import_names = [name for name in worker_imports.split(",") if name]
@@ -76,6 +81,20 @@ def _start_full_fx_compile_worker_prewarm(vllm_config: VllmConfig) -> None:
     except Exception as exc:
         logger.warning("Failed to start Full-FX compiler worker prewarm: %s",
                        exc)
+
+
+def _start_full_fx_compile_worker_cuda_prewarm(device_index: int) -> None:
+    if os.environ.get(
+            "VLLM_ENABLE_TWO_PHASE_FULL_FX_PREWARM", "0") != "1":
+        return
+    try:
+        from torch._inductor.compile_fx_full_subproc import FullFxCompilePool
+
+        FullFxCompilePool.prewarm_cuda_workers(device_index)
+        logger.info("Queued second-stage Full-FX CUDA prewarm on device %s.",
+                    device_index)
+    except Exception as exc:
+        logger.warning("Failed to queue Full-FX CUDA prewarm: %s", exc)
 
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
@@ -224,6 +243,7 @@ class Worker(WorkerBase):
             raise RuntimeError(
                 f"Not support device type: {self.device_config.device}")
         self._startup_cuda_device_ready = True
+        _start_full_fx_compile_worker_cuda_prewarm(self.local_rank)
 
     def initialize_distributed_environment(self) -> None:
         """Create distributed/model-parallel state after CUDA selection."""
@@ -240,8 +260,13 @@ class Worker(WorkerBase):
         """Start the reusable FX compilation worker outside model loading."""
         if getattr(self, "_startup_compile_prewarm_ready", False):
             return
-        self.initialize_distributed_environment()
+        two_phase = os.environ.get(
+            "VLLM_ENABLE_TWO_PHASE_FULL_FX_PREWARM", "0") == "1"
+        if not two_phase:
+            self.initialize_distributed_environment()
         _start_full_fx_compile_worker_prewarm(self.vllm_config)
+        if two_phase and getattr(self, "_startup_cuda_device_ready", False):
+            _start_full_fx_compile_worker_cuda_prewarm(self.local_rank)
         self._startup_compile_prewarm_ready = True
 
     def initialize_model_runner(self) -> None:
