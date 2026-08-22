@@ -92,6 +92,7 @@ class AsyncLLM(EngineClient):
 
         self.model_config = vllm_config.model_config
         self.vllm_config = vllm_config
+        self.mm_registry = mm_registry
         self.log_requests = log_requests
         self.log_stats = log_stats
 
@@ -569,6 +570,30 @@ class AsyncLLM(EngineClient):
 
     async def get_vllm_config(self) -> VllmConfig:
         return self.vllm_config
+
+    async def rebind_model(self, vllm_config: VllmConfig) -> dict[str, Any]:
+        """Switch models while retaining the EngineCore executor shell."""
+        if self.errored:
+            raise EngineDeadError()
+        if self.output_processor.has_unfinished_requests():
+            raise RuntimeError("Cannot rebind while requests are unfinished")
+        tokenizer = await asyncio.to_thread(
+            init_tokenizer_from_configs,
+            model_config=vllm_config.model_config,
+            scheduler_config=vllm_config.scheduler_config,
+            lora_config=vllm_config.lora_config,
+        )
+        result = await self.engine_core.rebind_model_async(vllm_config)
+        self.vllm_config = vllm_config
+        self.model_config = vllm_config.model_config
+        self.tokenizer = tokenizer
+        self.processor = Processor(vllm_config=vllm_config,
+                                   tokenizer=tokenizer,
+                                   mm_registry=self.mm_registry)
+        self.output_processor = OutputProcessor(tokenizer,
+                                                log_stats=self.log_stats)
+        await self.reset_mm_cache()
+        return result
 
     async def get_model_config(self) -> ModelConfig:
         return self.model_config

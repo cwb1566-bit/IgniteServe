@@ -1806,7 +1806,13 @@ class ParallelCompileManager:
         # assembly can safely overlap with process teardown.
         results_ready_at = time.perf_counter()
         shutdown_started = time.perf_counter()
-        shutdown_started_async = FullFxCompilePool.begin_shutdown_pool()
+        keep_compile_pool = os.environ.get(
+            "VLLM_ENABLE_PERSISTENT_ENGINE_SHELL", "0").lower() in {
+                "1", "true", "yes", "on"
+            }
+        shutdown_started_async = (
+            False if keep_compile_pool
+            else FullFxCompilePool.begin_shutdown_pool())
         shutdown_dispatch_s = time.perf_counter() - shutdown_started
         logger.info(
             'Parallel compile timing batch_summary submit_phase_wall_s=%.6f '
@@ -2033,8 +2039,12 @@ class ParallelCompileManager:
                 compiled_by_index[index] = compiled_graph
                 action_counts[action] += 1
         finally:
-            if os.environ.get("VLLM_ENABLE_SUBPROCESS_COMPILE", "").lower() in {
-                    "1", "true", "yes", "on"}:
+            if (os.environ.get(
+                    "VLLM_ENABLE_SUBPROCESS_COMPILE", "").lower() in {
+                        "1", "true", "yes", "on"
+                    } and os.environ.get(
+                        "VLLM_ENABLE_PERSISTENT_ENGINE_SHELL", "0").lower()
+                    not in {"1", "true", "yes", "on"}):
                 from torch._inductor.compile_fx_full_subproc import (
                     FullFxCompilePool,
                 )
@@ -2086,8 +2096,12 @@ class ParallelCompileManager:
                                     reuse_index_map, runtime_shape)
 
     def shutdown(self):
-        if os.environ.get("VLLM_ENABLE_SUBPROCESS_COMPILE", "").lower() in {
-                "1", "true", "yes", "on"}:
+        if (os.environ.get(
+                "VLLM_ENABLE_SUBPROCESS_COMPILE", "").lower() in {
+                    "1", "true", "yes", "on"
+                } and os.environ.get(
+                    "VLLM_ENABLE_PERSISTENT_ENGINE_SHELL", "0").lower()
+                not in {"1", "true", "yes", "on"}):
             from torch._inductor.compile_fx_full_subproc import FullFxCompilePool
             FullFxCompilePool.shutdown_pool()
         self.thread_executor.shutdown(wait=True)

@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A GPU worker class."""
 import gc
+import hashlib
+import json
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
@@ -27,6 +29,7 @@ from vllm.utils import GiB_bytes, MemorySnapshot, memory_profiling
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.utils import report_usage_stats
+from vllm.v1.worker.CudaGraphManager import DynamicGraphManager
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.HotspotAnalyzer import HotspotAnalyzer
 from vllm.v1.worker import kv_profile_cache
@@ -285,6 +288,188 @@ class Worker(WorkerBase):
             report_usage_stats(self.vllm_config)
         self._startup_usage_reporting_ready = True
 
+    @staticmethod
+    def _shell_topology_signature(vllm_config: VllmConfig) -> tuple:
+        parallel = vllm_config.parallel_config
+        return (
+            parallel.world_size,
+            parallel.tensor_parallel_size,
+            parallel.pipeline_parallel_size,
+            parallel.data_parallel_size,
+            str(parallel.distributed_executor_backend),
+            str(parallel.worker_cls),
+        )
+
+    @staticmethod
+    def _inplace_model_signature(vllm_config: VllmConfig) -> str:
+        """Hash shape- and runtime-defining configuration, excluding paths."""
+        model = vllm_config.model_config
+        hf_config = model.hf_config.to_dict()
+        for key in ("_name_or_path", "name_or_path", "transformers_version"):
+            hf_config.pop(key, None)
+        payload = {
+            "hf_config": hf_config,
+            "dtype": str(model.dtype),
+            "quantization": model.quantization,
+            "task": str(model.task),
+            "max_model_len": model.max_model_len,
+            "is_multimodal": model.is_multimodal_model,
+            "pooler_config": str(model.pooler_config),
+            "topology": Worker._shell_topology_signature(vllm_config),
+            "cache_dtype": str(vllm_config.cache_config.cache_dtype),
+            "block_size": vllm_config.cache_config.block_size,
+            "max_num_batched_tokens": (
+                vllm_config.scheduler_config.max_num_batched_tokens),
+            "max_num_seqs": vllm_config.scheduler_config.max_num_seqs,
+            "compilation_level": str(vllm_config.compilation_config.level),
+            "cudagraph_sizes": list(
+                vllm_config.compilation_config.cudagraph_capture_sizes),
+            "full_cuda_graph": (
+                vllm_config.compilation_config.full_cuda_graph),
+            "speculative": str(vllm_config.speculative_config),
+            "lora": str(vllm_config.lora_config),
+        }
+        encoded = json.dumps(payload, sort_keys=True, default=str).encode()
+        return hashlib.sha256(encoded).hexdigest()
+
+    def can_rebind_weights_in_place(
+            self, vllm_config: VllmConfig) -> dict[str, object]:
+        old_digest = self._inplace_model_signature(self.vllm_config)
+        new_digest = self._inplace_model_signature(vllm_config)
+        reasons = []
+        if old_digest != new_digest:
+            reasons.append("structure_or_runtime_signature_mismatch")
+        if self.model_config.quantization is not None:
+            reasons.append("quantized_weight_postprocessing_is_not_stable")
+        if self.lora_config is not None or vllm_config.lora_config is not None:
+            reasons.append("lora_state_is_not_supported")
+        if self.speculative_config is not None:
+            reasons.append("speculative_model_state_is_not_supported")
+        runner = getattr(self, "model_runner", None)
+        if runner is None or runner.model is None:
+            reasons.append("model_is_not_initialized")
+        return {
+            "rank": self.rank,
+            "eligible": not reasons,
+            "reasons": reasons,
+            "stale_worker_requests": (
+                len(runner.requests) if runner is not None else 0),
+            "stale_input_batch_requests": (
+                len(runner.input_batch.req_ids) if runner is not None else 0),
+            "old_signature": old_digest,
+            "new_signature": new_digest,
+        }
+
+    def rebind_weights_in_place(
+            self, vllm_config: VllmConfig) -> dict[str, object]:
+        """Overwrite a compatible model while retaining KV/graph storage."""
+        eligibility = self.can_rebind_weights_in_place(vllm_config)
+        if not eligibility["eligible"]:
+            raise ValueError(
+                "Unsafe in-place model rebind: "
+                f"rank={self.rank} reasons={eligibility['reasons']}")
+
+        started = time.perf_counter()
+        torch.cuda.set_device(self.device)
+        torch.cuda.synchronize(self.device)
+        runner = self.model_runner
+        for req_id in list(runner.input_batch.req_ids):
+            if req_id is not None:
+                runner.input_batch.remove_request(req_id)
+        runner.input_batch.condense()
+        if runner.input_batch.req_ids:
+            raise RuntimeError("Failed to clear worker input batch for rebind")
+        runner.encoder_cache.clear()
+        runner.requests.clear()
+        load_result = runner.rebind_weights_in_place(vllm_config)
+        vllm_config.parallel_config.rank = self.rank
+        self.bind_vllm_config(vllm_config)
+        DynamicGraphManager.runner = runner
+        result = {
+            **eligibility,
+            **load_result,
+            "elapsed_s": time.perf_counter() - started,
+            "kv_cache_tensors_retained": len(runner.kv_caches),
+            "cuda_graph_shapes_retained": len(
+                getattr(runner, "cuda_graph_captured", ())),
+        }
+        logger.info("In-place weight rebind finished: %s", result)
+        return result
+
+    def rebind_model(self, vllm_config: VllmConfig) -> dict[str, object]:
+        """Drop model-owned state while preserving CUDA/distributed runtime."""
+        if os.environ.get(
+                "VLLM_ENABLE_PERSISTENT_ENGINE_SHELL", "0").lower() not in {
+                    "1", "true", "yes", "on"
+                }:
+            raise RuntimeError(
+                "Persistent engine shell rebind is disabled. Set "
+                "VLLM_ENABLE_PERSISTENT_ENGINE_SHELL=1 to enable it.")
+        old_signature = self._shell_topology_signature(self.vllm_config)
+        new_signature = self._shell_topology_signature(vllm_config)
+        if old_signature != new_signature:
+            raise ValueError(
+                "Persistent shell topology mismatch: "
+                f"old={old_signature!r} new={new_signature!r}")
+
+        started = time.perf_counter()
+        torch.cuda.set_device(self.device)
+        torch.cuda.synchronize(self.device)
+        free_before, total_memory = torch.cuda.mem_get_info(self.device)
+
+        runner = getattr(self, "model_runner", None)
+        if runner is not None:
+            try:
+                HotspotAnalyzer.check_and_export(True)
+            except Exception:
+                logger.exception("Failed to export hotspot data before rebind")
+            DynamicGraphManager.runner = None
+            DynamicGraphManager.capture_queue.clear()
+            getattr(runner, "kv_caches", []).clear()
+            getattr(runner, "encoder_cache", {}).clear()
+            getattr(runner, "requests", {}).clear()
+            old_compilation_config = getattr(runner, "compilation_config", None)
+            if old_compilation_config is not None:
+                old_compilation_config.static_forward_context.clear()
+            runner.model = None
+            self.model_runner = None
+            del runner
+
+        self._sleep_saved_buffers = {}
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        torch.cuda.synchronize(self.device)
+        free_after_release, _ = torch.cuda.mem_get_info(self.device)
+
+        vllm_config.parallel_config.rank = self.rank
+        self.bind_vllm_config(vllm_config)
+        self.init_snapshot = MemorySnapshot()
+        self.requested_memory = (
+            self.init_snapshot.total_memory
+            * self.cache_config.gpu_memory_utilization)
+        if self.init_snapshot.free_memory < self.requested_memory:
+            raise ValueError(
+                "Insufficient free GPU memory after persistent-shell reset: "
+                f"free={self.init_snapshot.free_memory} "
+                f"requested={self.requested_memory}")
+
+        self.model_runner = GPUModelRunner(vllm_config, self.device)
+        DynamicGraphManager.runner = self.model_runner
+        elapsed = time.perf_counter() - started
+        released = max(0, free_after_release - free_before)
+        logger.info(
+            "Persistent engine shell rebound rank=%d in %.6f s; "
+            "released=%.2f GiB retained_runtime=%.2f GiB",
+            self.rank, elapsed, released / GiB_bytes,
+            (total_memory - free_after_release) / GiB_bytes)
+        return {
+            "rank": self.rank,
+            "elapsed_s": elapsed,
+            "released_bytes": released,
+            "retained_runtime_bytes": total_memory - free_after_release,
+        }
+
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
     def load_model(self) -> None:
@@ -471,8 +656,12 @@ class Worker(WorkerBase):
             You may limit the usage of GPU memory
             by adjusting the `gpu_memory_utilization` parameter.
         """
-        if os.environ.get("VLLM_ENABLE_SUBPROCESS_COMPILE", "").lower() in {
-                "1", "true", "yes", "on"}:
+        if (os.environ.get(
+                "VLLM_ENABLE_SUBPROCESS_COMPILE", "").lower() in {
+                    "1", "true", "yes", "on"
+                } and os.environ.get(
+                    "VLLM_ENABLE_PERSISTENT_ENGINE_SHELL", "0").lower()
+                not in {"1", "true", "yes", "on"}):
             from torch._inductor.compile_fx_full_subproc import FullFxCompilePool
             shutdown_wait_started = time.perf_counter()
             shutdown_elapsed_s = FullFxCompilePool.wait_for_shutdown_pool()

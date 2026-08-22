@@ -67,6 +67,7 @@ class LLMEngine:
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
+        self.mm_registry = mm_registry
 
         self.log_stats = log_stats
         self.stat_logger: Optional[StatLoggerBase] = None
@@ -169,6 +170,29 @@ class LLMEngine:
         if not has_unfinished and aggregated_has_unfinished:
             self.should_execute_dummy_batch = True
         return aggregated_has_unfinished
+
+    def rebind_model(self, vllm_config: VllmConfig) -> dict[str, Any]:
+        """Switch models while retaining the EngineCore executor shell."""
+        if self.has_unfinished_requests():
+            raise RuntimeError("Cannot rebind while requests are unfinished")
+        tokenizer = init_tokenizer_from_configs(
+            model_config=vllm_config.model_config,
+            scheduler_config=vllm_config.scheduler_config,
+            lora_config=vllm_config.lora_config)
+        result = self.engine_core.rebind_model(vllm_config)
+        self.vllm_config = vllm_config
+        self.model_config = vllm_config.model_config
+        self.cache_config = vllm_config.cache_config
+        self.tokenizer = tokenizer
+        self.processor = Processor(vllm_config=vllm_config,
+                                   tokenizer=tokenizer,
+                                   mm_registry=self.mm_registry)
+        self.output_processor = OutputProcessor(tokenizer,
+                                                log_stats=self.log_stats)
+        if self.log_stats:
+            self.stat_logger = PrometheusStatLogger(vllm_config)
+        self.reset_mm_cache()
+        return result
 
     @classmethod
     def validate_outputs(cls, outputs, output_type):

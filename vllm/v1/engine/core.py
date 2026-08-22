@@ -1091,6 +1091,235 @@ class EngineCore:
     def wake_up(self, tags: Optional[list[str]] = None):
         self.model_executor.wake_up(tags)
 
+    @staticmethod
+    def _persistent_shell_topology_signature(
+            vllm_config: VllmConfig) -> tuple:
+        parallel = vllm_config.parallel_config
+        return (
+            parallel.world_size,
+            parallel.tensor_parallel_size,
+            parallel.pipeline_parallel_size,
+            parallel.data_parallel_size,
+            str(parallel.distributed_executor_backend),
+            str(parallel.worker_cls),
+        )
+
+    def _rebind_weights_in_place(
+            self, vllm_config: VllmConfig,
+            eligibility: list[dict[str, Any]]) -> dict[str, Any]:
+        """Replace compatible weights while retaining KV and CUDA graphs."""
+        started = time.perf_counter()
+        old_model = str(self.vllm_config.model_config.model)
+        new_model = str(vllm_config.model_config.model)
+        kv_cache_config = self.scheduler.kv_cache_config
+        vllm_config.cache_config.num_gpu_blocks = (
+            self.vllm_config.cache_config.num_gpu_blocks)
+        vllm_config.cache_config.num_cpu_blocks = (
+            self.vllm_config.cache_config.num_cpu_blocks)
+
+        self.structured_output_manager.clear_backend()
+        self.scheduler.shutdown()
+        self.batch_queue = None
+        self.mm_input_cache_server.reset()
+        try:
+            HotspotAnalyzer.check_and_export(True)
+            HotspotAnalyzer.stats.clear()
+            HotspotAnalyzer.recent_sizes.clear()
+            HotspotAnalyzer.total_requests = 0
+            HotspotAnalyzer.triggered_thresholds.clear()
+            HotspotAnalyzer.pending_captures.clear()
+            HotspotAnalyzer.has_exported_final = False
+        except Exception:
+            logger.exception("Failed to reset EngineCore hotspot state")
+
+        load_started = time.perf_counter()
+        worker_results = self.model_executor.rebind_weights_in_place(
+            vllm_config)
+        load_weights_s = time.perf_counter() - load_started
+        self.vllm_config = vllm_config
+
+        runtime_started = time.perf_counter()
+        self.structured_output_manager = StructuredOutputManager(vllm_config)
+        self.mm_input_cache_server = MirroredProcessingCache(
+            vllm_config.model_config)
+        scheduler_cls = vllm_config.scheduler_config.scheduler_cls
+        Scheduler = (resolve_obj_by_qualname(scheduler_cls)
+                     if isinstance(scheduler_cls, str) else scheduler_cls)
+        self.scheduler = Scheduler(
+            vllm_config=vllm_config,
+            kv_cache_config=kv_cache_config,
+            structured_output_manager=self.structured_output_manager,
+            include_finished_set=(
+                vllm_config.parallel_config.data_parallel_size > 1),
+            log_stats=self.log_stats,
+        )
+        self.batch_queue_size = self.model_executor.max_concurrent_batches
+        self.batch_queue = None
+        if self.batch_queue_size > 1:
+            self.batch_queue = queue.Queue(self.batch_queue_size)
+        if hasattr(self, "step_fn"):
+            self.step_fn = (self.step if self.batch_queue is None else
+                            self.step_with_batch_queue)
+        runtime_s = time.perf_counter() - runtime_started
+
+        result = {
+            "mode": "inplace_weights",
+            "old_model": old_model,
+            "new_model": new_model,
+            "elapsed_s": time.perf_counter() - started,
+            "shell_reset_s": 0.0,
+            "init_model_s": 0.0,
+            "load_weights_s": load_weights_s,
+            "compile_s": 0.0,
+            "kv_s": 0.0,
+            "cuda_graph_s": 0.0,
+            "runtime_s": runtime_s,
+            "eligibility": eligibility,
+            "worker_results": worker_results,
+        }
+        logger.info("In-place EngineCore rebind finished: %s", result)
+        return result
+
+    def rebind_model(self, vllm_config: VllmConfig) -> dict[str, Any]:
+        """Rebuild model-owned runtime while retaining the executor shell."""
+        if os.environ.get(
+                "VLLM_ENABLE_PERSISTENT_ENGINE_SHELL", "0").lower() not in {
+                    "1", "true", "yes", "on"
+                }:
+            raise RuntimeError(
+                "Persistent engine shell rebind is disabled. Set "
+                "VLLM_ENABLE_PERSISTENT_ENGINE_SHELL=1 to enable it.")
+        if self.scheduler.has_unfinished_requests():
+            raise RuntimeError("Cannot rebind while requests are unfinished")
+        if self.batch_queue is not None and not self.batch_queue.empty():
+            raise RuntimeError("Cannot rebind with pipeline batches in flight")
+        old_signature = self._persistent_shell_topology_signature(
+            self.vllm_config)
+        new_signature = self._persistent_shell_topology_signature(vllm_config)
+        if old_signature != new_signature:
+            raise ValueError(
+                "Persistent shell topology mismatch: "
+                f"old={old_signature!r} new={new_signature!r}")
+
+        started = time.perf_counter()
+        old_model = str(self.vllm_config.model_config.model)
+        new_model = str(vllm_config.model_config.model)
+        logger.info("Persistent engine shell rebind started: %s -> %s",
+                    old_model, new_model)
+
+        inplace_requested = os.environ.get(
+            "VLLM_PERSISTENT_SHELL_INPLACE_WEIGHTS", "0").lower() in {
+                "1", "true", "yes", "on"
+            }
+        if inplace_requested:
+            eligibility = self.model_executor.can_rebind_weights_in_place(
+                vllm_config)
+            if eligibility and all(
+                    item.get("eligible", False) for item in eligibility):
+                return self._rebind_weights_in_place(
+                    vllm_config, eligibility)
+            logger.warning(
+                "In-place weight rebind was requested but is not safe; "
+                "falling back to general shell rebind: %s", eligibility)
+
+        self.structured_output_manager.clear_backend()
+        self.scheduler.shutdown()
+        self.batch_queue = None
+        self.mm_input_cache_server.reset()
+        try:
+            HotspotAnalyzer.check_and_export(True)
+            HotspotAnalyzer.stats.clear()
+            HotspotAnalyzer.recent_sizes.clear()
+            HotspotAnalyzer.total_requests = 0
+            HotspotAnalyzer.triggered_thresholds.clear()
+            HotspotAnalyzer.pending_captures.clear()
+            HotspotAnalyzer.has_exported_final = False
+        except Exception:
+            logger.exception("Failed to reset EngineCore hotspot state")
+
+        reset_started = time.perf_counter()
+        worker_results = self.model_executor.rebind_model(vllm_config)
+        reset_s = time.perf_counter() - reset_started
+        self.vllm_config = vllm_config
+
+        init_started = time.perf_counter()
+        self.model_executor.init_model()
+        init_model_s = time.perf_counter() - init_started
+
+        load_started = time.perf_counter()
+        self.model_executor.load_weights()
+        load_weights_s = time.perf_counter() - load_started
+
+        compile_started = time.perf_counter()
+        self.model_executor.run_to_trigger_compile()
+        compile_s = time.perf_counter() - compile_started
+
+        kv_started = time.perf_counter()
+        available_gpu_memory = self.model_executor.determine_available_memory()
+        num_gpu_blocks, num_cpu_blocks, kv_cache_config = (
+            self._initialize_kv_caches(vllm_config, available_gpu_memory))
+        vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks
+        vllm_config.cache_config.num_cpu_blocks = num_cpu_blocks
+        self.collective_rpc("initialize_cache",
+                            args=(num_gpu_blocks, num_cpu_blocks))
+        kv_s = time.perf_counter() - kv_started
+
+        graph_started = time.perf_counter()
+        self.model_executor.compile_or_warm_up_model()
+        cuda_graph_s = time.perf_counter() - graph_started
+
+        runtime_started = time.perf_counter()
+        self.structured_output_manager = StructuredOutputManager(vllm_config)
+        self.mm_input_cache_server = MirroredProcessingCache(
+            vllm_config.model_config)
+        scheduler_cls = vllm_config.scheduler_config.scheduler_cls
+        Scheduler = (resolve_obj_by_qualname(scheduler_cls)
+                     if isinstance(scheduler_cls, str) else scheduler_cls)
+        self.scheduler = Scheduler(
+            vllm_config=vllm_config,
+            kv_cache_config=kv_cache_config,
+            structured_output_manager=self.structured_output_manager,
+            include_finished_set=(
+                vllm_config.parallel_config.data_parallel_size > 1),
+            log_stats=self.log_stats,
+        )
+        self.batch_queue_size = self.model_executor.max_concurrent_batches
+        self.batch_queue = None
+        if self.batch_queue_size > 1:
+            self.batch_queue = queue.Queue(self.batch_queue_size)
+        if hasattr(self, "step_fn"):
+            self.step_fn = (self.step if self.batch_queue is None else
+                            self.step_with_batch_queue)
+        runtime_s = time.perf_counter() - runtime_started
+
+        elapsed = time.perf_counter() - started
+        result = {
+            "mode": "general_shell",
+            "old_model": old_model,
+            "new_model": new_model,
+            "elapsed_s": elapsed,
+            "shell_reset_s": reset_s,
+            "init_model_s": init_model_s,
+            "load_weights_s": load_weights_s,
+            "compile_s": compile_s,
+            "kv_s": kv_s,
+            "cuda_graph_s": cuda_graph_s,
+            "runtime_s": runtime_s,
+            "worker_results": worker_results,
+        }
+        logger.info("Persistent engine shell rebind finished: %s", result)
+        return result
+
+    def rebind_model_serialized(self, payload: bytes) -> dict[str, Any]:
+        """Decode the explicitly serialized local shell-control message."""
+        import cloudpickle
+
+        vllm_config = cloudpickle.loads(payload)
+        if not isinstance(vllm_config, VllmConfig):
+            raise TypeError(
+                "Persistent shell payload did not contain a VllmConfig")
+        return self.rebind_model(vllm_config)
+
     def is_sleeping(self) -> bool:
         return self.model_executor.is_sleeping
 

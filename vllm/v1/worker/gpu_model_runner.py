@@ -2235,6 +2235,75 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         finally:
             timer.end("load_weights")
 
+    def rebind_weights_in_place(self, vllm_config: VllmConfig) -> dict:
+        """Load a compatible checkpoint without changing tensor addresses.
+
+        CUDA graphs capture parameter and persistent-buffer addresses.  This
+        path therefore loads into the existing module and rejects any loader
+        post-processing that replaces parameter or buffer storage.
+        """
+        timer.start("rebind_weights_in_place")
+        started = time.perf_counter()
+        tensors_before = {
+            name: (tensor.data_ptr(), tuple(tensor.shape), tensor.dtype)
+            for name, tensor in self.model.state_dict().items()
+        }
+        old_vllm_config = self.vllm_config
+        old_compilation_config = self.compilation_config
+        old_cache_config = self.cache_config
+        try:
+            # Keep the populated compilation object and allocated-cache
+            # geometry. The incoming configuration has equivalent semantics
+            # but does not own the compiled wrappers or graph state.
+            vllm_config.compilation_config = old_compilation_config
+            vllm_config.cache_config.num_gpu_blocks = (
+                old_cache_config.num_gpu_blocks)
+            vllm_config.cache_config.num_cpu_blocks = (
+                old_cache_config.num_cpu_blocks)
+            self.vllm_config = vllm_config
+            self.model_config = vllm_config.model_config
+            self.load_config = vllm_config.load_config
+            self.cache_config = vllm_config.cache_config
+
+            model_loader = get_model_loader(self.load_config)
+            model_loader.load_weights(self.model,
+                                      model_config=self.model_config)
+            target_device = torch.device(vllm_config.device_config.device)
+            process_weights_after_loading(
+                self.model, self.model_config, target_device)
+            self.model.eval()
+            torch.cuda.synchronize(self.device)
+
+            tensors_after = {
+                name: (tensor.data_ptr(), tuple(tensor.shape), tensor.dtype)
+                for name, tensor in self.model.state_dict().items()
+            }
+            if tensors_before != tensors_after:
+                changed = sorted(
+                    set(tensors_before) ^ set(tensors_after)
+                    | {
+                        name for name in tensors_before.keys()
+                        & tensors_after.keys()
+                        if tensors_before[name] != tensors_after[name]
+                    })
+                raise RuntimeError(
+                    "In-place weight rebind changed captured tensor storage: "
+                    f"{changed[:8]}")
+        except Exception:
+            self.vllm_config = old_vllm_config
+            self.model_config = old_vllm_config.model_config
+            self.load_config = old_vllm_config.load_config
+            self.cache_config = old_cache_config
+            raise
+        finally:
+            timer.end("rebind_weights_in_place")
+
+        return {
+            "elapsed_s": time.perf_counter() - started,
+            "tensor_count": len(tensors_before),
+            "storage_preserved": True,
+        }
+
     def save_tensorized_model(
         self,
         tensorizer_config: "TensorizerConfig",

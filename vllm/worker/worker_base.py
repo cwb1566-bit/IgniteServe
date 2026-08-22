@@ -40,6 +40,12 @@ class WorkerBase:
         self,
         vllm_config: VllmConfig,
     ) -> None:
+        self.bind_vllm_config(vllm_config)
+        from vllm.platforms import current_platform
+        self.current_platform = current_platform
+
+    def bind_vllm_config(self, vllm_config: VllmConfig) -> None:
+        """Update model-owned configuration while retaining worker resources."""
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
@@ -53,8 +59,6 @@ class WorkerBase:
         self.observability_config = vllm_config.observability_config
         self.kv_transfer_config = vllm_config.kv_transfer_config
         self.compilation_config = vllm_config.compilation_config
-        from vllm.platforms import current_platform
-        self.current_platform = current_platform
 
     def init_device(self) -> None:
         """Initialize device state, such as loading the model or other on-device
@@ -645,6 +649,13 @@ class WorkerWrapperBase:
 
     def initialize_usage_reporting(self) -> Any:
         return self._run_worker_startup_stage("initialize_usage_reporting")
+
+    def rebind_model(self, vllm_config: VllmConfig) -> Any:
+        if self.worker is None:
+            raise RuntimeError("Worker must be initialized before rebind_model")
+        self.vllm_config = vllm_config
+        with set_current_vllm_config(vllm_config):
+            return self.worker.rebind_model(vllm_config)
 
     def execute_method(self, method: Union[str, bytes], *args, **kwargs):
         try:
