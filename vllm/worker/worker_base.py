@@ -650,12 +650,16 @@ class WorkerWrapperBase:
     def initialize_usage_reporting(self) -> Any:
         return self._run_worker_startup_stage("initialize_usage_reporting")
 
-    def rebind_model(self, vllm_config: VllmConfig) -> Any:
+    def rebind_model(
+        self,
+        vllm_config: VllmConfig,
+        runtime_env: Optional[dict[str, str]] = None,
+    ) -> Any:
         if self.worker is None:
             raise RuntimeError("Worker must be initialized before rebind_model")
         self.vllm_config = vllm_config
         with set_current_vllm_config(vllm_config):
-            return self.worker.rebind_model(vllm_config)
+            return self.worker.rebind_model(vllm_config, runtime_env)
 
     def execute_method(self, method: Union[str, bytes], *args, **kwargs):
         try:

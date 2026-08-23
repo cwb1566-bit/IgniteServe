@@ -32,6 +32,32 @@ PREWARM_ENV_KEYS = (
     PREWARM_MODEL_ENV,
     PREWARM_STARTED_AT_ENV,
 )
+REBIND_RUNTIME_ENV_KEYS = (
+    *PREWARM_ENV_KEYS,
+    "VLLM_CUDA_GRAPH_HOTSPOT_DIR",
+)
+
+
+def export_rebind_runtime_env() -> dict[str, str]:
+    """Export the small runtime-env handoff accepted by EngineCore rebind."""
+    return {
+        key: os.environ[key]
+        for key in REBIND_RUNTIME_ENV_KEYS
+        if key in os.environ
+    }
+
+
+def apply_rebind_runtime_env(values: dict[str, str]) -> None:
+    """Apply a validated frontend-to-EngineCore rebind environment handoff."""
+    unknown = set(values).difference(REBIND_RUNTIME_ENV_KEYS)
+    if unknown:
+        raise ValueError(f"Unsupported rebind runtime env keys: {unknown}")
+    for key in REBIND_RUNTIME_ENV_KEYS:
+        value = values.get(key)
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = str(value)
 
 
 def weight_prewarm_enabled() -> bool:

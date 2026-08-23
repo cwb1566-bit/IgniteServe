@@ -25,6 +25,14 @@ class LazyFreezeManager:
             self._is_globally_frozen = True
             print("Model state globally frozen for fast CUDA graph capture.")
 
+    def release_for_model_rebind(self) -> bool:
+        """Return frozen objects to normal GC before dropping a model."""
+        if not self._is_globally_frozen:
+            return False
+        gc.unfreeze()
+        self._is_globally_frozen = False
+        return True
+
     @contextmanager
     def fast_capture_scope(self):
         """

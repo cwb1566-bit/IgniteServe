@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import threading
+import time
 from collections.abc import AsyncGenerator, Mapping
 from copy import copy
 from typing import Any, Optional, Union
@@ -577,13 +578,40 @@ class AsyncLLM(EngineClient):
             raise EngineDeadError()
         if self.output_processor.has_unfinished_requests():
             raise RuntimeError("Cannot rebind while requests are unfinished")
-        tokenizer = await asyncio.to_thread(
-            init_tokenizer_from_configs,
-            model_config=vllm_config.model_config,
-            scheduler_config=vllm_config.scheduler_config,
-            lora_config=vllm_config.lora_config,
-        )
-        result = await self.engine_core.rebind_model_async(vllm_config)
+
+        def load_tokenizer():
+            started = time.perf_counter()
+            tokenizer = init_tokenizer_from_configs(
+                model_config=vllm_config.model_config,
+                scheduler_config=vllm_config.scheduler_config,
+                lora_config=vllm_config.lora_config)
+            return tokenizer, time.perf_counter() - started
+
+        started = time.perf_counter()
+        old_vllm_config = self.vllm_config
+        core_switched = False
+        tokenizer_task = asyncio.create_task(asyncio.to_thread(
+            load_tokenizer))
+        core_started = time.perf_counter()
+        try:
+            result = await self.engine_core.rebind_model_async(vllm_config)
+            core_wall_s = time.perf_counter() - core_started
+            core_switched = True
+            tokenizer, tokenizer_s = await tokenizer_task
+        except BaseException:
+            tokenizer_task.cancel()
+            if core_switched:
+                logger.exception(
+                    "Tokenizer preparation failed after EngineCore rebind; "
+                    "rolling the shell back to the old model")
+                await self.engine_core.rebind_model_async(old_vllm_config)
+            raise
+        result["frontend_rebind"] = {
+            "elapsed_s": time.perf_counter() - started,
+            "engine_core_s": core_wall_s,
+            "tokenizer_s": tokenizer_s,
+            "overlapped": True,
+        }
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.tokenizer = tokenizer

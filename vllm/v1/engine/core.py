@@ -57,7 +57,12 @@ import threading
 from vllm.v1.phase_profiler import timer
 from vllm.v1.metrics_recorder import recorder
 from vllm.v1.worker.HotspotAnalyzer import HotspotAnalyzer
-from vllm.v1.engine.weight_pagecache import stop_async_weight_prewarm_from_env
+from vllm.v1.engine.weight_pagecache import (
+    apply_rebind_runtime_env,
+    ensure_async_weight_prewarm,
+    export_rebind_runtime_env,
+    stop_async_weight_prewarm_from_env,
+)
 
 class EngineCore:
     """Inner loop of vLLM's Engine."""
@@ -720,7 +725,9 @@ class EngineCore:
             logger.exception("Startup DAG shadow planning failed; continuing "
                              "with the legacy startup path")
 
-    def _initialize_with_startup_dag(self) -> None:
+    def _initialize_with_startup_dag(
+            self, *, allow_weight_compile_overlap: bool = True
+    ) -> dict[str, Any]:
         from vllm.v1.engine.startup_orchestrator import (
             ResourceAwareDAGExecutor,
             StartupContext,
@@ -730,7 +737,7 @@ class EngineCore:
         )
 
         state = self._collect_startup_state()
-        overlap_weight_compile = os.environ.get(
+        overlap_weight_compile = allow_weight_compile_overlap and os.environ.get(
             "VLLM_ENABLE_WEIGHT_COMPILE_OVERLAP", "").strip().lower() in {
                 "1", "true", "yes", "on"
             }
@@ -752,9 +759,12 @@ class EngineCore:
         def stop_weight_prewarm(_):
             stop_async_weight_prewarm_from_env("EngineCore.load_weights")
 
-        def load_weights(_):
+        def load_weights(context):
             if overlap_weight_compile:
-                self.model_executor.load_weights_and_trigger_compile()
+                worker_results = (
+                    self.model_executor.load_weights_and_trigger_compile())
+                context.put("weight_compile_worker_results", worker_results)
+                return worker_results
             else:
                 self.model_executor.load_weights()
 
@@ -879,6 +889,16 @@ class EngineCore:
                 f"{result.name}:{result.elapsed_s:.6f}s"
                 for result in actual_path),
         )
+        stage_seconds = {
+            name: result.elapsed_s for name, result in results.items()
+        }
+        worker_overlap = context.get("weight_compile_worker_results", [])
+        return {
+            "stage_seconds": stage_seconds,
+            "weight_compile_worker_results": worker_overlap,
+            "weight_compile_overlap": overlap_weight_compile,
+            "plan_path": str(plan_path),
+        }
         # timer.save(
         #     filepath=f"./analysis_results/IgniteServe_tests/cold_with_caches/total_init_{model_name}_IgniteServe_with_caches.json",
         #     csv_filepath=f"./analysis_results/IgniteServe_tests/cold_with_caches/timing_summary_{model_name}_IgniteServe_with_caches.csv"
@@ -1202,25 +1222,47 @@ class EngineCore:
                 f"old={old_signature!r} new={new_signature!r}")
 
         started = time.perf_counter()
+        self._persistent_shell_rebind_epoch = getattr(
+            self, "_persistent_shell_rebind_epoch", 0) + 1
+        rebind_epoch = self._persistent_shell_rebind_epoch
         old_model = str(self.vllm_config.model_config.model)
         new_model = str(vllm_config.model_config.model)
         logger.info("Persistent engine shell rebind started: %s -> %s",
                     old_model, new_model)
 
-        inplace_requested = os.environ.get(
-            "VLLM_PERSISTENT_SHELL_INPLACE_WEIGHTS", "0").lower() in {
-                "1", "true", "yes", "on"
-            }
-        if inplace_requested:
+        rebind_mode = os.environ.get(
+            "VLLM_PERSISTENT_SHELL_REBIND_MODE", "general").strip().lower()
+        if rebind_mode not in {"general", "auto", "inplace"}:
+            raise ValueError(
+                "VLLM_PERSISTENT_SHELL_REBIND_MODE must be one of "
+                "general, auto, or inplace")
+        if ("VLLM_PERSISTENT_SHELL_REBIND_MODE" not in os.environ
+                and os.environ.get(
+                    "VLLM_PERSISTENT_SHELL_INPLACE_WEIGHTS",
+                    "0").lower() in {"1", "true", "yes", "on"}):
+            logger.warning(
+                "VLLM_PERSISTENT_SHELL_INPLACE_WEIGHTS is deprecated and "
+                "does not override the safe default general rebind. Set "
+                "VLLM_PERSISTENT_SHELL_REBIND_MODE=inplace explicitly to "
+                "retain model-owned state.")
+        if rebind_mode in {"auto", "inplace"}:
             eligibility = self.model_executor.can_rebind_weights_in_place(
                 vllm_config)
             if eligibility and all(
                     item.get("eligible", False) for item in eligibility):
                 return self._rebind_weights_in_place(
                     vllm_config, eligibility)
+            if rebind_mode == "inplace":
+                raise ValueError(
+                    "Explicit in-place rebind is not safe for this model: "
+                    f"{eligibility}")
             logger.warning(
-                "In-place weight rebind was requested but is not safe; "
+                "Automatic in-place weight rebind is not safe; "
                 "falling back to general shell rebind: %s", eligibility)
+
+        prewarm_started = time.perf_counter()
+        ensure_async_weight_prewarm(new_model)
+        prewarm_launch_s = time.perf_counter() - prewarm_started
 
         self.structured_output_manager.clear_backend()
         self.scheduler.shutdown()
@@ -1237,75 +1279,77 @@ class EngineCore:
         except Exception:
             logger.exception("Failed to reset EngineCore hotspot state")
 
-        reset_started = time.perf_counter()
-        worker_results = self.model_executor.rebind_model(vllm_config)
-        reset_s = time.perf_counter() - reset_started
-        self.vllm_config = vllm_config
+        try:
+            reset_started = time.perf_counter()
+            worker_results = self.model_executor.rebind_model(
+                vllm_config, export_rebind_runtime_env())
+            reset_s = time.perf_counter() - reset_started
+            self.vllm_config = vllm_config
 
-        init_started = time.perf_counter()
-        self.model_executor.init_model()
-        init_model_s = time.perf_counter() - init_started
-
-        load_started = time.perf_counter()
-        self.model_executor.load_weights()
-        load_weights_s = time.perf_counter() - load_started
-
-        compile_started = time.perf_counter()
-        self.model_executor.run_to_trigger_compile()
-        compile_s = time.perf_counter() - compile_started
-
-        kv_started = time.perf_counter()
-        available_gpu_memory = self.model_executor.determine_available_memory()
-        num_gpu_blocks, num_cpu_blocks, kv_cache_config = (
-            self._initialize_kv_caches(vllm_config, available_gpu_memory))
-        vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks
-        vllm_config.cache_config.num_cpu_blocks = num_cpu_blocks
-        self.collective_rpc("initialize_cache",
-                            args=(num_gpu_blocks, num_cpu_blocks))
-        kv_s = time.perf_counter() - kv_started
-
-        graph_started = time.perf_counter()
-        self.model_executor.compile_or_warm_up_model()
-        cuda_graph_s = time.perf_counter() - graph_started
-
-        runtime_started = time.perf_counter()
-        self.structured_output_manager = StructuredOutputManager(vllm_config)
-        self.mm_input_cache_server = MirroredProcessingCache(
-            vllm_config.model_config)
-        scheduler_cls = vllm_config.scheduler_config.scheduler_cls
-        Scheduler = (resolve_obj_by_qualname(scheduler_cls)
-                     if isinstance(scheduler_cls, str) else scheduler_cls)
-        self.scheduler = Scheduler(
-            vllm_config=vllm_config,
-            kv_cache_config=kv_cache_config,
-            structured_output_manager=self.structured_output_manager,
-            include_finished_set=(
-                vllm_config.parallel_config.data_parallel_size > 1),
-            log_stats=self.log_stats,
-        )
-        self.batch_queue_size = self.model_executor.max_concurrent_batches
-        self.batch_queue = None
-        if self.batch_queue_size > 1:
-            self.batch_queue = queue.Queue(self.batch_queue_size)
-        if hasattr(self, "step_fn"):
-            self.step_fn = (self.step if self.batch_queue is None else
-                            self.step_with_batch_queue)
-        runtime_s = time.perf_counter() - runtime_started
+            # A general rebind creates fresh, unloaded parameter storage. The
+            # compile-only dummy forward reads those parameters, so its hard
+            # dependency on finalized weight loading must be preserved. Model
+            # file prewarm and per-shard read-ahead still overlap the safe CPU
+            # and host-to-device parts of initialization.
+            dag_result = self._initialize_with_startup_dag(
+                allow_weight_compile_overlap=False)
+            stages = dag_result["stage_seconds"]
+            worker_overlap = dag_result["weight_compile_worker_results"]
+            if worker_overlap:
+                load_weights_s = max(
+                    float(item.get("load_weights_s", 0.0))
+                    for item in worker_overlap)
+                compile_s = max(
+                    float(item.get("compile_s", 0.0))
+                    for item in worker_overlap)
+            else:
+                load_weights_s = float(stages.get("load_weights", 0.0))
+                compile_s = float(stages.get("compile_model", 0.0))
+            init_model_s = float(stages.get("init_model", 0.0))
+            weight_compile_overlap_s = (
+                float(stages.get("load_weights", 0.0))
+                if dag_result["weight_compile_overlap"] else 0.0)
+            weight_compile_critical_s = (
+                weight_compile_overlap_s
+                if dag_result["weight_compile_overlap"] else
+                load_weights_s + compile_s)
+            kv_s = (float(stages.get("kv_profile", 0.0))
+                    + float(stages.get("kv_cache_allocate", 0.0)))
+            cuda_graph_s = float(
+                stages.get("cuda_graph_precapture", 0.0))
+            runtime_s = sum(float(stages.get(name, 0.0)) for name in (
+                "structured_output", "mm_input_cache", "scheduler",
+                "batch_queue"))
+            runtime_validation = self.model_executor.collective_rpc(
+                "get_general_rebind_runtime_state")
+            if hasattr(self, "step_fn"):
+                self.step_fn = (self.step if self.batch_queue is None else
+                                self.step_with_batch_queue)
+        except BaseException:
+            stop_async_weight_prewarm_from_env(
+                "persistent general rebind failure")
+            raise
 
         elapsed = time.perf_counter() - started
         result = {
-            "mode": "general_shell",
+            "mode": "general_shell_rebind",
+            "rebind_epoch": rebind_epoch,
             "old_model": old_model,
             "new_model": new_model,
             "elapsed_s": elapsed,
             "shell_reset_s": reset_s,
+            "weight_prewarm_launch_s": prewarm_launch_s,
             "init_model_s": init_model_s,
             "load_weights_s": load_weights_s,
             "compile_s": compile_s,
+            "weight_compile_overlap_s": weight_compile_overlap_s,
+            "weight_compile_critical_s": weight_compile_critical_s,
             "kv_s": kv_s,
             "cuda_graph_s": cuda_graph_s,
             "runtime_s": runtime_s,
             "worker_results": worker_results,
+            "runtime_validation": runtime_validation,
+            "startup_dag": dag_result,
         }
         logger.info("Persistent engine shell rebind finished: %s", result)
         return result
@@ -1314,7 +1358,17 @@ class EngineCore:
         """Decode the explicitly serialized local shell-control message."""
         import cloudpickle
 
-        vllm_config = cloudpickle.loads(payload)
+        decoded = cloudpickle.loads(payload)
+        if isinstance(decoded, dict) and decoded.get(
+                "schema") == "vllm-persistent-shell-rebind-v1":
+            vllm_config = decoded.get("vllm_config")
+            runtime_env = decoded.get("runtime_env", {})
+            if not isinstance(runtime_env, dict):
+                raise TypeError("Persistent shell runtime_env must be a dict")
+            apply_rebind_runtime_env(runtime_env)
+        else:
+            # Backward compatibility for local tools using the old payload.
+            vllm_config = decoded
         if not isinstance(vllm_config, VllmConfig):
             raise TypeError(
                 "Persistent shell payload did not contain a VllmConfig")

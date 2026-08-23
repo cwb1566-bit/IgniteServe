@@ -6,6 +6,7 @@ import glob
 import hashlib
 import json
 import os
+import re
 import tempfile
 import threading
 import time
@@ -520,20 +521,34 @@ class _WeightShardPrefetcher:
         self.target = None
 
 
-def _weight_shard_pipeline_enabled() -> bool:
+def _weight_shard_pipeline_scope(hf_weights_files: list[str]) -> Optional[str]:
     enabled = os.environ.get(
         "VLLM_ENABLE_WEIGHT_SHARD_PIPELINE", "0").strip().lower() in {
             "1", "true", "yes", "on"
         }
     if not enabled:
-        return False
+        return None
     leader_only = os.environ.get(
         "VLLM_WEIGHT_SHARD_PREFETCH_LEADER_ONLY", "1").strip().lower() in {
             "1", "true", "yes", "on"
         }
     if leader_only and torch.distributed.is_initialized():
-        return torch.distributed.get_rank() == 0
-    return True
+        rank = torch.distributed.get_rank()
+        file_ranks = {
+            int(match.group(1))
+            for path in hf_weights_files
+            for match in [re.search(r"global-rank-(\d+)",
+                                    os.path.basename(path))]
+            if match is not None
+        }
+        # Topology-sharded checkpoints have disjoint files per rank. Let each
+        # rank prefetch its own next file; leader-only is useful only when all
+        # ranks consume the same checkpoint files through the shared page
+        # cache.
+        if file_ranks == {rank}:
+            return "rank_local"
+        return "shared_leader" if rank == 0 else None
+    return "all_ranks"
 
 
 def safetensors_weights_iterator(
@@ -541,8 +556,9 @@ def safetensors_weights_iterator(
     use_tqdm_on_load: bool,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
+    pipeline_scope = _weight_shard_pipeline_scope(hf_weights_files)
     prefetcher = (_WeightShardPrefetcher()
-                  if _weight_shard_pipeline_enabled() else None)
+                  if pipeline_scope is not None else None)
     pipeline_started = time.perf_counter()
     try:
         iterator = tqdm(
@@ -569,10 +585,10 @@ def safetensors_weights_iterator(
             prefetcher.finish(cancel_if_running=True)
             logger.info(
                 "Weight shard pipeline finished in %.3f s: "
-                "shards=%d prefetched_bytes=%d completed=%d cancelled=%d "
+                "scope=%s shards=%d prefetched_bytes=%d completed=%d cancelled=%d "
                 "errors=%d chunk_mb=%d",
                 time.perf_counter() - pipeline_started,
-                len(hf_weights_files), prefetcher.bytes_read,
+                pipeline_scope, len(hf_weights_files), prefetcher.bytes_read,
                 prefetcher.completed, prefetcher.cancelled,
                 prefetcher.errors, prefetcher.chunk_bytes // (1024 * 1024))
 

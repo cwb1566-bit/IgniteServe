@@ -83,9 +83,14 @@ class ExecutorBase(ABC):
         self.prompt_adapter_config = vllm_config.prompt_adapter_config
         self.observability_config = vllm_config.observability_config
 
-    def rebind_model(self, vllm_config: VllmConfig) -> list[Any]:
+    def rebind_model(
+        self,
+        vllm_config: VllmConfig,
+        runtime_env: Optional[dict[str, str]] = None,
+    ) -> list[Any]:
         """Replace model-owned state without destroying the executor shell."""
-        results = self.collective_rpc("rebind_model", args=(vllm_config, ))
+        results = self.collective_rpc(
+            "rebind_model", args=(vllm_config, runtime_env))
         self.bind_vllm_config(vllm_config)
         return results
 
