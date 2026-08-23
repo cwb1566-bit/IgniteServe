@@ -38,16 +38,22 @@ but changing TP/PP size requires a new shell.
    - initialize model;
    - stop external prewarm immediately before the real loader;
    - load weights with next-shard read-ahead;
-   - trace/compile after finalized weights;
+   - overlap value-independent structural compile with verified in-place
+     dense loaders, then join before autotune or real execution;
    - profile or restore KV capacity, allocate a new KV cache;
    - capture target CUDA graphs;
    - recreate scheduler and batch-queue state.
 6. Load the target tokenizer concurrently with EngineCore rebind, then publish
    the switched engine.
 
-The compile-only dummy forward reads model parameters. It is therefore not
-allowed to race with weight loading during a general rebind. File prewarm and
-next-shard I/O still overlap safe CPU/configuration and H2D work.
+For unquantized Llama/Qwen safetensors loaders, model construction fixes the
+parameter shape, dtype, device and object identity before loading. The loader
+copies values into that storage, while S4 compile-only suppresses normal kernel
+launches. Tracing, lowering and artifact materialization can therefore overlap
+weight I/O. Online autotune waits at the `weights_ready` boundary, and KV
+profiling, CUDA graph capture and inference remain strictly after it. Loaders
+that quantize, repack, replace parameters, use LoRA/speculative state, or have
+an unsupported architecture fall back to the sequential dependency.
 
 ## 3. Main implementation files
 
@@ -126,6 +132,24 @@ The first switch in these fresh cache roots was not a fully seeded warm-cache
 measurement; the table is a correctness and lifecycle result, not a formal
 TP/PP performance comparison.
 
+### Weight-load/structural-compile dependency validation
+
+The former unconditional `load_weights -> compile` edge was too conservative.
+With a verified dense in-place loader, the edge now joins only before autotune
+or real execution:
+
+| Switch | Weight load | Structural compile | Overlapped wall | Result |
+|---|---:|---:|---:|---|
+| Llama3-8B -> Llama3-8B variant | 8.851 s | 9.922 s | 10.258 s | pass |
+| Llama3-8B -> Qwen2.5-14B | 16.601 s | 15.960 s | 16.602 s | pass |
+
+The first row saves 8.515 s versus the sum of the two measured tasks. A forced
+Qwen best-config miss reached online autotune before cold weight loading had
+finished; the first tuner waited 7.648 s at `weights_ready`, then six tuners
+benchmarked and generation succeeded. This confirms that tracing/lowering and
+materialization are weight-value independent for these loaders, while autotune
+and every later real-execution phase retain the finalized-weight dependency.
+
 ## 6. Tests and logs
 
 Validation entrypoints:
@@ -142,6 +166,10 @@ Key result directories:
 - `general_shell_rebind/cross_arch_v18/`: Llama3-8B/Qwen2.5-14B.
 - `general_shell_rebind/tp2_v19/`: TP=2.
 - `general_shell_rebind/pp2_v20/`: PP=2.
+- `weight_compile_overlap_probe_v21/`: same-architecture overlap validation.
+- `weight_compile_overlap_crossarch_v22/`: cross-architecture overlap.
+- `weight_compile_wait_probe_v24/`: forced autotune wait-boundary validation.
+- `weight_compile_overlap_capability_v25/`: capability-gated regression.
 
 Enable the service path with:
 
@@ -151,6 +179,8 @@ export VLLM_PERSISTENT_SHELL_REBIND_MODE=general
 export VLLM_ENABLE_WEIGHT_PAGECACHE_PREWARM=1
 export VLLM_ENABLE_WEIGHT_SHARD_PIPELINE=1
 export VLLM_PERSISTENT_SHELL_CLEAR_INMEM_COMPILE=1
+export VLLM_ENABLE_WEIGHT_COMPILE_OVERLAP=1
+export VLLM_PERSISTENT_SHELL_ALLOW_WEIGHT_COMPILE_OVERLAP=1
 ```
 
 The existing S4/startup-DAG/parallel-compile variables remain applicable.

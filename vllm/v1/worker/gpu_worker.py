@@ -917,6 +917,30 @@ class Worker(WorkerBase):
     def load_weights(self) -> None:
         self.model_runner.load_weights()
 
+    def _weight_compile_overlap_eligibility(self) -> tuple[bool, list[str]]:
+        """Check whether compile-only may observe an in-place weight load."""
+        reasons: list[str] = []
+        model_config = self.vllm_config.model_config
+        architectures = set(
+            getattr(model_config.hf_config, "architectures", None) or ())
+        supported_architectures = {
+            "LlamaForCausalLM",
+            "Qwen2ForCausalLM",
+        }
+        if not architectures or not architectures.issubset(
+                supported_architectures):
+            reasons.append(f"unsupported_architectures={sorted(architectures)}")
+        if model_config.quantization is not None:
+            reasons.append(f"quantization={model_config.quantization}")
+        if self.vllm_config.speculative_config is not None:
+            reasons.append("speculative_config")
+        if self.vllm_config.lora_config is not None:
+            reasons.append("lora_config")
+        load_format = str(self.vllm_config.load_config.load_format).lower()
+        if load_format.rsplit(".", 1)[-1] not in {"auto", "safetensors"}:
+            reasons.append(f"load_format={load_format}")
+        return not reasons, reasons
+
     def load_weights_and_trigger_compile(self) -> dict[str, object]:
         """Overlap finalized-weight loading with value-independent compile-only.
 
@@ -934,10 +958,13 @@ class Worker(WorkerBase):
             "a100_optimized", "offline_best_config",
             "offline_best_config_skip_profile",
         }
-        if mode not in safe_modes:
+        overlap_eligible, eligibility_reasons = (
+            self._weight_compile_overlap_eligibility())
+        if mode not in safe_modes or not overlap_eligible:
             logger.warning(
-                "Weight/compile overlap is unsafe for compile mode %s; "
-                "using the sequential path.", mode)
+                "Weight/compile overlap is not eligible for compile mode %s "
+                "(%s); using the sequential path.", mode,
+                ", ".join(eligibility_reasons) or "unsupported mode")
             load_started = time.perf_counter()
             self.load_weights()
             load_s = time.perf_counter() - load_started
@@ -949,6 +976,7 @@ class Worker(WorkerBase):
                 "load_weights_s": load_s,
                 "compile_s": time.perf_counter() - compile_started,
                 "overlapped": False,
+                "eligibility_reasons": eligibility_reasons,
             }
 
         def on_worker_device(fn):
@@ -995,6 +1023,7 @@ class Worker(WorkerBase):
             "load_weights_s": load_s,
             "compile_s": compile_s,
             "overlapped": True,
+            "eligibility_reasons": [],
         }
 
     def get_startup_state_snapshot(self) -> dict[str, object]:
@@ -1018,6 +1047,8 @@ class Worker(WorkerBase):
             "device": str(self.device),
             "kv_profile_hit": kv_value is not None and kv_value > 0,
             "kv_profile_key": kv_key,
+            "weight_compile_overlap_safe": (
+                self._weight_compile_overlap_eligibility()[0]),
         }
 
     def get_static_startup_resource_snapshot(self) -> dict[str, object]:

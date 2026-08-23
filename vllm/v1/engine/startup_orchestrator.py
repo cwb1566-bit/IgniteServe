@@ -435,7 +435,11 @@ def build_engine_startup_dag(
             "includes_post_load": bool(state.attributes.get(
                 "compile_requires_finalized_weights", False)),
         })
-    compile_dependencies = {"init_model", "load_weights"}
+    requires_finalized_weights = bool(state.attributes.get(
+        "compile_requires_finalized_weights", True))
+    compile_dependencies = {"init_model"}
+    if requires_finalized_weights:
+        compile_dependencies.add("load_weights")
     add("compile_model", compile_dependencies,
         {"worker_rpc": 1, "compiler_cpu": 1}, "compilation", {
             "sub_dag": [
@@ -445,11 +449,9 @@ def build_engine_startup_dag(
                 "compile_finalize",
             ],
             "state_dependent": True,
-            "requires_finalized_weights": True,
+            "requires_finalized_weights": requires_finalized_weights,
         })
-    # The KV phase always observes finalized model weights. Compilation also
-    # waits for this boundary in the current implementation because its dummy
-    # forward reads module parameters.
+    # KV profiling and all real execution always observe finalized weights.
     kv_dependencies = {"compile_model", "load_weights"}
     kv_resources = ({"worker_rpc": 1} if state.kv_profile_hit else
                     {"worker_rpc": 1, "gpu_compute": 1})

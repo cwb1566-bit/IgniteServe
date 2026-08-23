@@ -671,12 +671,12 @@ class EngineCore:
             hotspot_profile_present=all_workers("hotspot_profile_present"),
             attributes={
                 "worker_states": worker_states,
-                # The compile-only dummy forward and GraphPickler read module
-                # parameters. Concurrent in-place loading is a data race even
-                # for dense FP16 models, so compilation requires the complete
-                # loader/post-load boundary for every configuration.
+                # The final dependency is selected when the executable DAG is
+                # built. Only verified in-place dense loaders may overlap the
+                # value-independent structural compile portion.
                 "compile_requires_finalized_weights": True,
-                "overlap_safe_weight_loading": False,
+                "overlap_safe_weight_loading": all_workers(
+                    "weight_compile_overlap_safe"),
                 "max_model_len": model_config.max_model_len,
                 "max_num_batched_tokens":
                     scheduler_config.max_num_batched_tokens,
@@ -737,10 +737,18 @@ class EngineCore:
         )
 
         state = self._collect_startup_state()
-        overlap_weight_compile = allow_weight_compile_overlap and os.environ.get(
-            "VLLM_ENABLE_WEIGHT_COMPILE_OVERLAP", "").strip().lower() in {
-                "1", "true", "yes", "on"
-            }
+        overlap_requested = (
+            allow_weight_compile_overlap and os.environ.get(
+                "VLLM_ENABLE_WEIGHT_COMPILE_OVERLAP", "").strip().lower()
+            in {"1", "true", "yes", "on"})
+        overlap_weight_compile = overlap_requested and bool(
+            state.attributes.get("overlap_safe_weight_loading", False))
+        state.attributes["compile_requires_finalized_weights"] = (
+            not overlap_weight_compile)
+        if overlap_requested and not overlap_weight_compile:
+            logger.warning("Weight/compile overlap was requested but the "
+                           "current model loader is not eligible; using the "
+                           "sequential startup dependency.")
         history_path, plan_path = self._startup_orchestration_paths()
         history = StartupCostHistory(history_path)
 
@@ -1286,13 +1294,16 @@ class EngineCore:
             reset_s = time.perf_counter() - reset_started
             self.vllm_config = vllm_config
 
-            # A general rebind creates fresh, unloaded parameter storage. The
-            # compile-only dummy forward reads those parameters, so its hard
-            # dependency on finalized weight loading must be preserved. Model
-            # file prewarm and per-shard read-ahead still overlap the safe CPU
-            # and host-to-device parts of initialization.
+            # Structural compile-only can overlap an in-place dense-weight
+            # loader because model construction has already fixed parameter
+            # metadata and real launches/autotune wait for finalized weights.
+            # Keep this opt-in until loaders that replace/repack parameters
+            # have an explicit capability check.
+            allow_rebind_compile_overlap = os.environ.get(
+                "VLLM_PERSISTENT_SHELL_ALLOW_WEIGHT_COMPILE_OVERLAP",
+                "0").strip().lower() in {"1", "true", "yes", "on"}
             dag_result = self._initialize_with_startup_dag(
-                allow_weight_compile_overlap=False)
+                allow_weight_compile_overlap=allow_rebind_compile_overlap)
             stages = dag_result["stage_seconds"]
             worker_overlap = dag_result["weight_compile_worker_results"]
             if worker_overlap:

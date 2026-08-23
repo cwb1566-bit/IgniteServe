@@ -81,8 +81,8 @@ class Executor(ExecutorBase):
     def load_weights(self) -> None:
         self.collective_rpc("load_weights")
 
-    def load_weights_and_trigger_compile(self) -> None:
-        self.collective_rpc("load_weights_and_trigger_compile")
+    def load_weights_and_trigger_compile(self) -> list[dict[str, object]]:
+        return self.collective_rpc("load_weights_and_trigger_compile")
 
     def run_to_trigger_compile(self) -> None:
         self.collective_rpc("run_to_trigger_compile")
