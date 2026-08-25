@@ -91,6 +91,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 ## Documentation
 
+- [Chinese branch, deployment, and experiment guide](BRANCHES_AND_EXPERIMENTS_CN.md)
 - [Architecture](docs/architecture.md)
 - [Deployment guide](docs/deployment.md)
 - [Configuration reference](docs/configuration.md)
