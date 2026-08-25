@@ -11,9 +11,9 @@
 
 ## 1. 先看结论
 
-- 单卡三项基础优化使用 `codex/private-release`。
-- TP=2 / PP=2 分布式启动实验使用 `codex/distributed-startup-optimizations`。
-- 需要分布式优化、通用 Engine Shell 复用、权重 I/O 流水和权重/编译重叠时，使用最新的 `codex/persistent-engine-shell`。它继承前两个分支，而不是独立于它们。
+- 单卡三项基础优化使用 `igniteServe/single-gpu-startup-optimizations`。
+- TP=2 / PP=2 分布式启动实验使用 `igniteServe/distributed-startup-optimizations`。
+- 需要分布式优化、通用 Engine Shell 复用、权重 I/O 流水和权重/编译重叠时，使用最新的 `igniteServe/persistent-engine-shell`。它继承前两个分支，而不是独立于它们。
 - 真正的多进程完整 FX 图并行编译需要配套的 `IgniteServe-Pytorch`。只使用官方 PyTorch 2.7 时，S4、DAG、元数据复用和自适应 CUDA Graph 仍可工作，但必须关闭 `VLLM_ENABLE_SUBPROCESS_COMPILE`。
 - `main` 是上游 vLLM 参考分支，不包含 IgniteServe 冷启动优化，不应用作优化实验分支。
 
@@ -22,9 +22,9 @@
 ```text
 main (上游 vLLM 参考)
 
-codex/private-release
-  └─ codex/distributed-startup-optimizations
-       └─ codex/persistent-engine-shell
+igniteServe/single-gpu-startup-optimizations
+  └─ igniteServe/distributed-startup-optimizations
+       └─ igniteServe/persistent-engine-shell
 ```
 
 当前服务器上的精确提交如下：
@@ -32,32 +32,28 @@ codex/private-release
 | 分支 | 提交 | 定位 |
 |---|---|---|
 | `main` | `ca5fb4bbd` | 上游 vLLM 参考，不含 IgniteServe 优化 |
-| `codex/private-release` | `a984d55b6` | 单卡三项基础优化与 S4 资源复用 |
-| `codex/distributed-startup-optimizations` | `af678326b` | 在基础分支上扩展 TP/PP 启动优化 |
-| `codex/persistent-engine-shell` | `a6301b0da` | 最新超集：分布式优化 + 通用引擎复用 + I/O/编译重叠 |
+| `igniteServe/single-gpu-startup-optimizations` | `a984d55b6` | 单卡三项基础优化与 S4 资源复用 |
+| `igniteServe/distributed-startup-optimizations` | `af678326b` | 在基础分支上扩展 TP/PP 启动优化 |
+| `igniteServe/persistent-engine-shell` | 见远程最新提交 | 最新超集：分布式优化 + 通用引擎复用 + I/O/编译重叠 |
 
 配套 IgniteServe-Pytorch 分支：
 
 | IgniteServe 分支 | IgniteServe-Pytorch 分支 | 提交 |
 |---|---|---|
-| `codex/private-release` | `origin/main` 或 `codex/release-upload` | `4dd0808` |
-| `codex/distributed-startup-optimizations` | `codex/distributed-startup-optimizations` | `c9e68dc` |
-| `codex/persistent-engine-shell` | `codex/persistent-engine-shell` | `6e905ed` |
+| `igniteServe/single-gpu-startup-optimizations` | `main` | `4dd0808` |
+| `igniteServe/distributed-startup-optimizations` | `igniteServe/distributed-startup-optimizations` | `c9e68dc` |
+| `igniteServe/persistent-engine-shell` | `igniteServe/persistent-engine-shell` | `6e905ed` |
 
-当前服务器能看到所有上述本地分支，但 2026-08-25 实测 GitHub SSH 返回 `Permission denied (publickey)`，因此无法在线确认两个最新实验分支是否已经推送。`codex/private-release` 有本地的 `igniteserve/main` 跟踪记录；在新机器部署其余分支前，应先在有 GitHub 权限的机器执行：
+2026-08-25 已通过仓库专用 SSH deploy key 将两个实验分支推送到相应的私有 GitHub 仓库。新机器配置读取权限后可直接获取：
 
 ```bash
-git push igniteserve codex/distributed-startup-optimizations
-git push igniteserve codex/persistent-engine-shell
-
-cd /path/to/IgniteServe-Pytorch
-git push origin codex/distributed-startup-optimizations
-git push origin codex/persistent-engine-shell
+git fetch --all --prune
+git switch igniteServe/persistent-engine-shell
 ```
 
 ## 3. 各分支实现内容与收益
 
-### 3.1 `codex/private-release`：单卡三项基础优化
+### 3.1 `igniteServe/single-gpu-startup-optimizations`：单卡三项基础优化
 
 该分支包含论文主体的三项冷启动技术。
 
@@ -103,7 +99,7 @@ Llama3-8B、ShareGPT、A100 的代表数据：
 | Burst P99 TTFT | 17.7651 s | 15.1256 s | -14.86% |
 | Steady P99 TPOT | 20.804 ms | 20.902 ms | +0.47% |
 
-### 3.2 `codex/distributed-startup-optimizations`：TP/PP 扩展
+### 3.2 `igniteServe/distributed-startup-optimizations`：TP/PP 扩展
 
 该分支继承单卡三项优化，并增加：
 
@@ -125,7 +121,7 @@ Llama3-8B、FP16、两张 A100 PCIe 40 GB、`max_model_len=2048` 的最佳累计
 
 上述最佳值包含 topology-sharded checkpoint、权重/编译重叠和两阶段 Full-FX 预热。若使用普通 Hugging Face checkpoint，权重加载收益会低于表中结果。
 
-### 3.3 `codex/persistent-engine-shell`：最新超集
+### 3.3 `igniteServe/persistent-engine-shell`：最新超集
 
 该分支继承分布式分支，并新增两种必须严格区分的引擎复用语义。
 
@@ -181,11 +177,11 @@ git clone git@github.com:cwb1566-bit/IgniteServe-Pytorch.git
 ```bash
 cd IgniteServe
 git fetch --all --prune
-git switch codex/persistent-engine-shell
+git switch igniteServe/persistent-engine-shell
 
 cd ../IgniteServe-Pytorch
 git fetch --all --prune
-git switch codex/persistent-engine-shell
+git switch igniteServe/persistent-engine-shell
 ```
 
 在当前服务器已有 checkout 时直接：
@@ -193,9 +189,9 @@ git switch codex/persistent-engine-shell
 ```bash
 cd /home/wenbiao/vllm_my_A100
 git status --short
-git switch codex/private-release
-# 或：git switch codex/distributed-startup-optimizations
-# 或：git switch codex/persistent-engine-shell
+git switch igniteServe/single-gpu-startup-optimizations
+# 或：git switch igniteServe/distributed-startup-optimizations
+# 或：git switch igniteServe/persistent-engine-shell
 ```
 
 切换前先处理自己的未提交修改。不要用 `git reset --hard` 清理实验文件。
@@ -216,7 +212,7 @@ pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 \
 
 ```bash
 cd /path/to/IgniteServe-Pytorch
-git switch codex/persistent-engine-shell
+git switch igniteServe/persistent-engine-shell
 python tools/install_igniteserve_overlay.py --python "$CONDA_PREFIX/bin/python"
 
 python - <<'PY'
@@ -425,7 +421,7 @@ python A100_0606/distributed_startup_exploration/run_distributed_startup_ablatio
 ### 8.1 直接 A -> B -> A 正确性/计时
 
 ```bash
-git switch codex/persistent-engine-shell
+git switch igniteServe/persistent-engine-shell
 
 export VLLM_ENABLE_PERSISTENT_ENGINE_SHELL=1
 export VLLM_PERSISTENT_SHELL_REBIND_MODE=general
