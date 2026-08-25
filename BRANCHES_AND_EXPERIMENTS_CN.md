@@ -15,26 +15,28 @@
 - TP=2 / PP=2 分布式启动实验使用 `igniteServe/distributed-startup-optimizations`。
 - 需要分布式优化、通用 Engine Shell 复用、权重 I/O 流水和权重/编译重叠时，使用最新的 `igniteServe/persistent-engine-shell`。它继承前两个分支，而不是独立于它们。
 - 真正的多进程完整 FX 图并行编译需要配套的修改版 `IgniteServe-Pytorch`。单卡分支对应 `IgniteServe-Pytorch@4dd0808`；只使用未经修改的官方 PyTorch 2.7 时，S4、DAG、元数据复用和自适应 CUDA Graph 仍可工作，但必须关闭 `VLLM_ENABLE_SUBPROCESS_COMPILE`。
-- `main` 是上游 vLLM 参考分支，不包含 IgniteServe 冷启动优化，不应用作优化实验分支。
+- 私有 GitHub 仓库的默认 `main` 当前与 `igniteServe/single-gpu-startup-optimizations` 指向同一提交，是稳定的单卡优化版，不是原生 vLLM。服务器本地另有一个跟踪上游 `origin/main` 的 `main`，两者不能混淆；实验命令应始终显式写出 `igniteServe/...` 分支名。
 
 ## 2. 分支继承关系
 
 ```text
-main (上游 vLLM 参考)
-
-igniteServe/single-gpu-startup-optimizations
+private GitHub main (单卡稳定版别名)
+  = igniteServe/single-gpu-startup-optimizations
   └─ igniteServe/distributed-startup-optimizations
        └─ igniteServe/persistent-engine-shell
+
+server origin/main (上游 vLLM 参考，独立历史)
 ```
 
 当前服务器上的精确提交如下：
 
 | 分支 | 提交 | 定位 |
 |---|---|---|
-| `main` | `ca5fb4bbd` | 上游 vLLM 参考，不含 IgniteServe 优化 |
+| 私有 GitHub `main` | `a984d55b6` | 默认分支；与单卡优化分支内容相同 |
 | `igniteServe/single-gpu-startup-optimizations` | `a984d55b6` | 单卡三项基础优化、S4 资源复用与 canonical FX 多进程并行编译 |
 | `igniteServe/distributed-startup-optimizations` | `af678326b` | 在基础分支上扩展 TP/PP 启动优化 |
 | `igniteServe/persistent-engine-shell` | 见远程最新提交 | 最新超集：分布式优化 + 通用引擎复用 + I/O/编译重叠 |
+| 服务器上游参考 `origin/main` | `ca5fb4bbd` | 原生上游 vLLM 历史，不属于私有 GitHub 默认 `main` |
 
 配套 IgniteServe-Pytorch 分支：
 
@@ -43,6 +45,8 @@ igniteServe/single-gpu-startup-optimizations
 | `igniteServe/single-gpu-startup-optimizations` | `igniteServe/single-gpu-startup-optimizations` | `4dd0808` |
 | `igniteServe/distributed-startup-optimizations` | `igniteServe/distributed-startup-optimizations` | `c9e68dc` |
 | `igniteServe/persistent-engine-shell` | `igniteServe/persistent-engine-shell` | `6e905ed` |
+
+`IgniteServe-Pytorch` 私有 GitHub 的默认 `main` 当前指向 `4dd0808`，同样是单卡配套修改版的别名，而不是未经修改的官方 PyTorch 2.7 源码。
 
 2026-08-25 已通过仓库专用 SSH deploy key 将实验分支推送到相应的私有 GitHub 仓库。新机器配置读取权限后可直接获取：
 
