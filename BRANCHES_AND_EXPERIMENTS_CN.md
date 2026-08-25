@@ -11,10 +11,10 @@
 
 ## 1. 先看结论
 
-- 单卡三项基础优化使用 `igniteServe/single-gpu-startup-optimizations`。
+- 单卡三项基础优化使用 `igniteServe/single-gpu-startup-optimizations`。该分支已经实现元数据感知的 canonical FX 多进程并行编译；它不是到 distributed 分支才新增的功能。
 - TP=2 / PP=2 分布式启动实验使用 `igniteServe/distributed-startup-optimizations`。
 - 需要分布式优化、通用 Engine Shell 复用、权重 I/O 流水和权重/编译重叠时，使用最新的 `igniteServe/persistent-engine-shell`。它继承前两个分支，而不是独立于它们。
-- 真正的多进程完整 FX 图并行编译需要配套的 `IgniteServe-Pytorch`。只使用官方 PyTorch 2.7 时，S4、DAG、元数据复用和自适应 CUDA Graph 仍可工作，但必须关闭 `VLLM_ENABLE_SUBPROCESS_COMPILE`。
+- 真正的多进程完整 FX 图并行编译需要配套的修改版 `IgniteServe-Pytorch`。单卡分支对应 `IgniteServe-Pytorch@4dd0808`；只使用未经修改的官方 PyTorch 2.7 时，S4、DAG、元数据复用和自适应 CUDA Graph 仍可工作，但必须关闭 `VLLM_ENABLE_SUBPROCESS_COMPILE`。
 - `main` 是上游 vLLM 参考分支，不包含 IgniteServe 冷启动优化，不应用作优化实验分支。
 
 ## 2. 分支继承关系
@@ -32,7 +32,7 @@ igniteServe/single-gpu-startup-optimizations
 | 分支 | 提交 | 定位 |
 |---|---|---|
 | `main` | `ca5fb4bbd` | 上游 vLLM 参考，不含 IgniteServe 优化 |
-| `igniteServe/single-gpu-startup-optimizations` | `a984d55b6` | 单卡三项基础优化与 S4 资源复用 |
+| `igniteServe/single-gpu-startup-optimizations` | `a984d55b6` | 单卡三项基础优化、S4 资源复用与 canonical FX 多进程并行编译 |
 | `igniteServe/distributed-startup-optimizations` | `af678326b` | 在基础分支上扩展 TP/PP 启动优化 |
 | `igniteServe/persistent-engine-shell` | 见远程最新提交 | 最新超集：分布式优化 + 通用引擎复用 + I/O/编译重叠 |
 
@@ -40,11 +40,11 @@ igniteServe/single-gpu-startup-optimizations
 
 | IgniteServe 分支 | IgniteServe-Pytorch 分支 | 提交 |
 |---|---|---|
-| `igniteServe/single-gpu-startup-optimizations` | `main` | `4dd0808` |
+| `igniteServe/single-gpu-startup-optimizations` | `igniteServe/single-gpu-startup-optimizations` | `4dd0808` |
 | `igniteServe/distributed-startup-optimizations` | `igniteServe/distributed-startup-optimizations` | `c9e68dc` |
 | `igniteServe/persistent-engine-shell` | `igniteServe/persistent-engine-shell` | `6e905ed` |
 
-2026-08-25 已通过仓库专用 SSH deploy key 将两个实验分支推送到相应的私有 GitHub 仓库。新机器配置读取权限后可直接获取：
+2026-08-25 已通过仓库专用 SSH deploy key 将实验分支推送到相应的私有 GitHub 仓库。新机器配置读取权限后可直接获取：
 
 ```bash
 git fetch --all --prune
@@ -64,10 +64,12 @@ git switch igniteServe/persistent-engine-shell
 - 支持权重 page-cache 异步预热，并在真实 `load_weights()` 前停止外部读取，减少 I/O 竞争。
 - DAG 的主要价值是依赖正确性和可调度框架；单独启用 DAG 的稳定加速有限，不能把后续编译或 CUDA Graph 收益算给 DAG。
 
-#### B. 元数据感知的编译优化与 S4
+#### B. 元数据感知的编译优化、S4 与并行编译
 
 - 将原生 `profile_run()` 的“编译 + 执行 + 峰值显存探测”拆成 compile-only 和 KV profile 两个可调度阶段。
 - canonical 子图复用：Qwen/Llama 的重复 decoder 子图只编译少量规范图，其余子图别名复用。
+- 单卡分支已经能够把 canonical GraphModule、FakeTensor/SymInt 输入和编译上下文提交给修改版 PyTorch 的 `FullFxCompilePool`，在隔离进程中并行执行完整 `compile_fx -> AOTAutograd -> Inductor` 路径，再由父进程加载产物并绑定 follower 子图。
+- 并行编译通过 `VLLM_ENABLE_SUBPROCESS_COMPILE=1` 独立开启；它主要用于 cold compile miss，warm compile cache 时应关闭以避免无任务进程池开销。
 - 持久化并恢复 piecewise 子图输入、fake-run 和数据流元数据。
 - 以语义键复用 Triton `.best_config`，跳过兼容配置的在线 autotune benchmark。
 - 复用 transformed TorchDynamo code artifact，减少反编译/产物生成开销。
@@ -105,7 +107,7 @@ Llama3-8B、ShareGPT、A100 的代表数据：
 
 - TP/PP 可执行启动 DAG 和 rank/stage 感知依赖。
 - 分布式自适应 CUDA Graph 预捕获；每个 rank/stage 仍捕获自己的本地图。
-- 进程隔离的完整 FX canonical 图并行编译。
+- 将单卡已有的进程隔离式完整 FX canonical 图并行编译适配到 TP/PP rank 与 pipeline stage。
 - Full-FX worker import 与 CUDA 预热前移、异步 compiler identity/hash 预热、快速进程组关闭。
 - topology-aware sharded checkpoint：TP rank 或 PP stage 只读取自己的权重分片。
 - rank 内权重加载与结构 tracing/compile-only 重叠；若 best-config miss，autotune 在 `weights_ready` 屏障等待最终权重。
@@ -210,9 +212,13 @@ pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 \
 
 推荐在专用 Conda 环境对官方 PyTorch 2.7 wheel 安装 guarded Python overlay，速度远快于完整重编 PyTorch：
 
+先切换到与 IgniteServe 相同名称的配套分支。单卡、distributed 和 persistent 三个版本分别对应同名分支；其中单卡分支固定在 `4dd0808`，已经包含真正的完整 FX 并行编译实现，并非未经修改的官方 PyTorch：
+
 ```bash
 cd /path/to/IgniteServe-Pytorch
-git switch igniteServe/persistent-engine-shell
+git switch igniteServe/single-gpu-startup-optimizations
+# 或：git switch igniteServe/distributed-startup-optimizations
+# 或：git switch igniteServe/persistent-engine-shell
 python tools/install_igniteserve_overlay.py --python "$CONDA_PREFIX/bin/python"
 
 python - <<'PY'
@@ -337,7 +343,7 @@ python -m vllm.entrypoints.openai.api_server \
 
 ### 6.4 真正的 canonical FX 并行编译
 
-只在 IgniteServe-Pytorch overlay 已验证、且预计是 cold compile miss 时启用：
+该能力已经在 `igniteServe/single-gpu-startup-optimizations` 中实现，并由后续两个分支继承。只在同名 IgniteServe-Pytorch overlay 已验证、且预计是 cold compile miss 时启用：
 
 ```bash
 export VLLM_ENABLE_SUBPROCESS_COMPILE=1
