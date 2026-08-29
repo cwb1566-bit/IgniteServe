@@ -69,6 +69,10 @@ def _release_model_compilation_state(compilation_config: object) -> dict[str,
             entry.runnable = None
             entry.output = None
             entry.input_addresses = None
+            entry.concurrent_capture_in_progress = False
+            entry.concurrent_capture_gate = None
+            entry.concurrent_capture_pool = None
+            entry.concurrent_capture_stream = None
         getattr(entries, "clear", lambda: None)()
         # Break cycles rooted in CompilationConfig. These objects own the
         # compiled closures whose cells capture model parameters and KV cache
@@ -598,6 +602,10 @@ class Worker(WorkerBase):
             "errors": [],
         }
         if runner is not None:
+            concurrent_capture_manager = getattr(
+                runner, "concurrent_piecewise_cudagraph_manager", None)
+            if concurrent_capture_manager is not None:
+                concurrent_capture_manager.shutdown()
             gc_was_unfrozen = (
                 LazyFreezeManager.get_instance().release_for_model_rebind())
             try:

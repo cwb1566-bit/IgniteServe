@@ -39,6 +39,13 @@ class ConcreteSizeEntry:
     # during capture, and check if they are the same during replay
     input_addresses: Optional[list[int]] = None
 
+    # Experimental formal-capture state. The whole shape is published only
+    # after every piece has been captured by the background worker.
+    concurrent_capture_in_progress: bool = False
+    concurrent_capture_gate: Optional[Any] = None
+    concurrent_capture_pool: Optional[Any] = None
+    concurrent_capture_stream: Optional[torch.cuda.Stream] = None
+
 
 class CUDAPiecewiseBackend:
 
@@ -99,6 +106,57 @@ class CUDAPiecewiseBackend:
                 need_to_compile=shape in self.compile_sizes,
                 use_cudagraph=shape in self.cudagraph_capture_sizes,
             )
+
+    def prepare_concurrent_capture(self, runtime_shape: int, graph_pool: Any,
+                                   capture_stream: torch.cuda.Stream,
+                                   capture_gate: Any) -> bool:
+        """Arm one warmed, uncaptured entry for background formal capture."""
+        entry = self.concrete_size_entries.get(runtime_shape)
+        if (entry is None or not entry.use_cudagraph
+                or entry.cudagraph is not None
+                or entry.concurrent_capture_in_progress
+                or entry.runnable is None
+                or (entry.need_to_compile and not entry.compiled)
+                or entry.num_finished_warmup <
+                self.compilation_config.cudagraph_num_of_warmups):
+            return False
+        entry.concurrent_capture_in_progress = True
+        entry.concurrent_capture_gate = capture_gate
+        entry.concurrent_capture_pool = graph_pool
+        entry.concurrent_capture_stream = capture_stream
+        return True
+
+    def finish_concurrent_capture(self, runtime_shape: int) -> bool:
+        """Publish an entry after the shape-wide capture pass succeeds."""
+        entry = self.concrete_size_entries.get(runtime_shape)
+        if entry is None or entry.cudagraph is None:
+            return False
+        entry.concurrent_capture_in_progress = False
+        entry.concurrent_capture_gate = None
+        entry.concurrent_capture_pool = None
+        entry.concurrent_capture_stream = None
+        return True
+
+    def abort_concurrent_capture(self, runtime_shape: int) -> None:
+        """Discard a partially captured entry and restore eager fallback."""
+        entry = self.concrete_size_entries.get(runtime_shape)
+        if entry is None:
+            return
+        if entry.concurrent_capture_in_progress and entry.cudagraph is not None:
+            try:
+                entry.cudagraph.reset()
+            except Exception:
+                logger.exception(
+                    "Failed to reset partial concurrent CUDA graph: "
+                    "piece=%d shape=%d", self.piecewise_compile_index,
+                    runtime_shape)
+            entry.cudagraph = None
+            entry.output = None
+            entry.input_addresses = None
+        entry.concurrent_capture_in_progress = False
+        entry.concurrent_capture_gate = None
+        entry.concurrent_capture_pool = None
+        entry.concurrent_capture_stream = None
 
     def _run(self, mode: str, runnable: Callable, args: tuple[Any, ...]) -> Any:
         label = f"piece.{self.piecewise_compile_index}.{mode}"
@@ -176,6 +234,18 @@ class CUDAPiecewiseBackend:
                 )
             return output
 
+        capture_not_published = (
+            entry.concurrent_capture_in_progress
+            and (entry.concurrent_capture_gate is None
+                 or not entry.concurrent_capture_gate.is_set()))
+        if (capture_not_published
+                and not forward_context.concurrent_cudagraph_capture):
+            # Do not expose a partially captured shape to foreground requests.
+            # The request continues eagerly while the background worker builds
+            # and instantiates all piece graphs.
+            return self._run("eager-during-concurrent-capture",
+                             entry.runnable, args)
+
         if entry.cudagraph is None:
             if entry.num_finished_warmup < self.compilation_config.cudagraph_num_of_warmups:  # noqa
                 capture_budget = forward_context.cudagraph_capture_budget
@@ -219,7 +289,8 @@ class CUDAPiecewiseBackend:
 
             with operator_pipeline_range(
                     f"piece.{self.piecewise_compile_index}.capture"), ExitStack() as stack:
-                if not self.is_first_graph:
+                if (not self.is_first_graph
+                        and not forward_context.concurrent_cudagraph_capture):
                     # during every model forward, we will capture
                     # many pieces of cudagraphs (roughly one per layer).
                     # running gc again and again across layers will
@@ -231,7 +302,22 @@ class CUDAPiecewiseBackend:
                         patch("torch.cuda.empty_cache", lambda: None))
 
                 # mind-exploding: carefully manage the reference and memory.
-                with torch.cuda.graph(cudagraph, pool=self.graph_pool):
+                graph_pool = (entry.concurrent_capture_pool
+                              if forward_context.concurrent_cudagraph_capture
+                              else self.graph_pool)
+                graph_kwargs = {}
+                if forward_context.concurrent_cudagraph_capture:
+                    graph_kwargs = {
+                        "stream": entry.concurrent_capture_stream,
+                        "capture_error_mode": "thread_local",
+                        "synchronize_before_capture": False,
+                        "collect_before_capture": False,
+                        "empty_cache_before_capture": False,
+                        "manage_default_generator": False,
+                    }
+                with torch.cuda.graph(cudagraph,
+                                      pool=graph_pool,
+                                      **graph_kwargs):
                     # `output` is managed by pytorch's cudagraph pool
                     output = entry.runnable(*args)
                     if self.is_last_graph:

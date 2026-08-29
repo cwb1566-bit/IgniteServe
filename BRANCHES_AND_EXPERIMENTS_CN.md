@@ -1,6 +1,6 @@
 # IgniteServe 分支、部署与实验使用说明
 
-> 快照日期：2026-08-25
+> 快照日期：2026-08-29
 >
 > vLLM 项目：`/home/wenbiao/vllm_my_A100`
 >
@@ -14,6 +14,7 @@
 - 单卡三项基础优化使用 `igniteServe/single-gpu-startup-optimizations`。该分支已经实现元数据感知的 canonical FX 多进程并行编译；它不是到 distributed 分支才新增的功能。
 - TP=2 / PP=2 分布式启动实验使用 `igniteServe/distributed-startup-optimizations`。
 - 需要分布式优化、通用 Engine Shell 复用、权重 I/O 流水和权重/编译重叠时，使用最新的 `igniteServe/persistent-engine-shell`。它继承前两个分支，而不是独立于它们。
+- 单卡 piecewise CUDA Graph 的并发正式捕获实验使用 `igniteServe/concurrent-piecewise-cudagraph-capture`。它从 persistent 基线分出，必须配套同名的修改版 PyTorch，当前不属于稳定主路径。
 - 真正的多进程完整 FX 图并行编译需要配套的修改版 `IgniteServe-Pytorch`。单卡分支对应 `IgniteServe-Pytorch@4dd0808`；只使用未经修改的官方 PyTorch 2.7 时，S4、DAG、元数据复用和自适应 CUDA Graph 仍可工作，但必须关闭 `VLLM_ENABLE_SUBPROCESS_COMPILE`。
 - 私有 GitHub 仓库的默认 `main` 当前与 `igniteServe/single-gpu-startup-optimizations` 指向同一提交，是稳定的单卡优化版，不是原生 vLLM。服务器本地另有一个跟踪上游 `origin/main` 的 `main`，两者不能混淆；实验命令应始终显式写出 `igniteServe/...` 分支名。
 
@@ -24,6 +25,7 @@ private GitHub main (单卡稳定版别名)
   = igniteServe/single-gpu-startup-optimizations
   └─ igniteServe/distributed-startup-optimizations
        └─ igniteServe/persistent-engine-shell
+            └─ igniteServe/concurrent-piecewise-cudagraph-capture (实验)
 
 server origin/main (上游 vLLM 参考，独立历史)
 ```
@@ -36,6 +38,7 @@ server origin/main (上游 vLLM 参考，独立历史)
 | `igniteServe/single-gpu-startup-optimizations` | `a984d55b6` | 单卡三项基础优化、S4 资源复用与 canonical FX 多进程并行编译 |
 | `igniteServe/distributed-startup-optimizations` | `af678326b` | 在基础分支上扩展 TP/PP 启动优化 |
 | `igniteServe/persistent-engine-shell` | 见远程最新提交 | 最新超集：分布式优化 + 通用引擎复用 + I/O/编译重叠 |
+| `igniteServe/concurrent-piecewise-cudagraph-capture` | 见远程最新提交 | 单卡 piecewise graph：真实请求 warmup 后，正式 capture 与前台推理并发 |
 | 服务器上游参考 `origin/main` | `ca5fb4bbd` | 原生上游 vLLM 历史，不属于私有 GitHub 默认 `main` |
 
 配套 IgniteServe-Pytorch 分支：
@@ -45,6 +48,7 @@ server origin/main (上游 vLLM 参考，独立历史)
 | `igniteServe/single-gpu-startup-optimizations` | `igniteServe/single-gpu-startup-optimizations` | `4dd0808` |
 | `igniteServe/distributed-startup-optimizations` | `igniteServe/distributed-startup-optimizations` | `c9e68dc` |
 | `igniteServe/persistent-engine-shell` | `igniteServe/persistent-engine-shell` | `6e905ed` |
+| `igniteServe/concurrent-piecewise-cudagraph-capture` | `igniteServe/concurrent-piecewise-cudagraph-capture` | 见远程最新提交 |
 
 `IgniteServe-Pytorch` 私有 GitHub 的默认 `main` 当前指向 `4dd0808`，同样是单卡配套修改版的别名，而不是未经修改的官方 PyTorch 2.7 源码。
 
@@ -166,6 +170,47 @@ Llama3-8B、FP16、两张 A100 PCIe 40 GB、`max_model_len=2048` 的最佳累计
 - dense in-place loader 下，权重读取与值无关的 tracing/lowering/materialization 并行。
 - best-config miss 时，只在真正需要运行 kernel 的 autotune 前等待权重；KV profile、CUDA Graph 和推理始终在权重完成后执行。
 - maxlen=512 的旧 I/O 消融中，权重加载下降约 20%～22%，完整切换下降约 7%。
+
+### 3.4 `igniteServe/concurrent-piecewise-cudagraph-capture`：并发正式捕获实验
+
+该分支从 `igniteServe/persistent-engine-shell@6bca62e361` 分出，不修改稳定基线。目标是在真实 decode 请求已经完成目标 shape 的 kernel/workspace warmup 后，让后台线程在私有 CUDA stream 和独立 graph pool 上执行正式 capture，同时前台继续 eager 推理；完整 piece 链捕获成功后再原子发布。
+
+配套 PyTorch 2.7 修改包括：
+
+- `torch.cuda.graph` 可选择跳过入口处的 device synchronize、Python GC 和 empty-cache；默认值全部保持原生语义。
+- capture 可使用显式 stream 和 `thread_local` error mode。
+- 无随机算子的模型 piece capture 可不接管进程默认 CUDA generator，使前台 sampling RNG 在后台 capture 期间继续工作；捕获体内若出现随机算子则 fail-closed。
+- 后台线程在正式 capture 前仅执行一次 `16x16 FP16 GEMM`，创建线程局部 cuBLAS handle；这不是第二次模型 warmup。
+
+vLLM 侧实现包括：
+
+- `ForwardContext` 改为 `ContextVar`，隔离前台推理线程与后台捕获线程。
+- 每个 shape 的所有 `CUDAPiecewiseBackend` 共享发布 gate；捕获期间前台保持 eager，所有 piece 完成后才整体切换到 replay。
+- piecewise attention 在正式捕获 forward 中保持 eager/no-op，不读取或修改在线 KV Cache。
+- 任一 piece、运行时初始化或图实例化失败时清理部分图并继续 eager。
+- 仅在显式设置 `VLLM_ENABLE_CONCURRENT_PIECEWISE_CUDAGRAPH_CAPTURE=1` 时开启。
+
+Qwen3-1.7B、FP16、单张 A100-SXM4-40GB、shape 64 启动预捕获、shape 1 在线触发、128+32 输出 token 的三轮交替 A/B：
+
+| 指标 | 原 SLO/机会捕获路径中位数 | 并发正式捕获中位数 | 变化 |
+|---|---:|---:|---:|
+| 第一条 128-token 请求总耗时 | 0.772416 s | 0.743396 s | -0.029020 s（-3.76%） |
+| 第二条 32-token 请求总耗时 | 0.175208 s | 0.173710 s | -0.001498 s（-0.86%） |
+| shape 1 正式捕获 | 约 22.9～23.2 ms，前台调度间隙内执行 | 29.9～32.9 ms，与前台执行重叠 | 执行语义不同，不直接比较 capture 时长 |
+| 首轮结束前 shape 1 replay 次数 | 151 | 155 | 更早发布 4 个 decode step |
+
+并发路径三轮均捕获 29 个 piece，状态最终为 `READY`，无失败；确定性输出 digest 每轮一致。底层测试同时确认：实验 capture 入口约 59 us，未等待已提交的前台长 kernel；捕获期间前台 RNG 和矩阵运算可执行；原生默认 capture 行为未改变。
+
+当前边界：仅支持 TP=PP=DP=1、text-only、piecewise graph；full graph、多模态、hybrid cache、LoRA 和 speculative decoding 会明确拒绝并回退原路径。当前数据证明单请求下的工程可行性与结果正确性，不等价于已经完成 ShareGPT 多并发的正式 TTFT/TPOT/SLO 评估。
+
+实验开关：
+
+```bash
+export VLLM_ENABLE_ADAPTIVE_CUDAGRAPH=1
+export VLLM_ENABLE_CONCURRENT_PIECEWISE_CUDAGRAPH_CAPTURE=1
+```
+
+必须使用同名 `IgniteServe-Pytorch` 分支构建的 wheel；官方 PyTorch 2.7 缺少所需 guarded capture API，vLLM 会检测后禁用实验路径。
 
 ## 4. 从零部署
 

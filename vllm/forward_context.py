@@ -4,6 +4,7 @@
 import time
 from collections import defaultdict
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional, Union
 
@@ -176,20 +177,25 @@ class ForwardContext:
     # A real request is intentionally executing the target shape eagerly so
     # its kernels and workspaces can serve as CUDA graph warmup.
     cudagraph_runtime_warmup: bool = False
+    # True only in the experimental background thread that performs formal
+    # piecewise CUDA graph capture after a real request has warmed the shape.
+    concurrent_cudagraph_capture: bool = False
     # Optional budget used only by adaptive background capture. Startup
     # capture leaves this unset and retains the original all-pieces behavior.
     cudagraph_capture_budget: Optional[CUDAGraphCaptureBudget] = None
 
 
-_forward_context: Optional[ForwardContext] = None
+_forward_context: ContextVar[Optional[ForwardContext]] = ContextVar(
+    "vllm_forward_context", default=None)
 
 
 def get_forward_context() -> ForwardContext:
     """Get the current forward context."""
-    assert _forward_context is not None, (
+    forward_context = _forward_context.get()
+    assert forward_context is not None, (
         "Forward context is not set. "
         "Please use `set_forward_context` to set the forward context.")
-    return _forward_context
+    return forward_context
 
 
 @contextmanager
@@ -202,6 +208,7 @@ def set_forward_context(
     skip_cuda_graphs: bool = False,
     cudagraph_runtime_warmup: bool = False,
     cudagraph_capture_budget: Optional[CUDAGraphCaptureBudget] = None,
+    concurrent_cudagraph_capture: bool = False,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -218,9 +225,7 @@ def set_forward_context(
                                       attn_metadata, num_tokens or 0,
                                       num_tokens_across_dp)
 
-    global _forward_context
-    prev_context = _forward_context
-    _forward_context = ForwardContext(
+    context_token = _forward_context.set(ForwardContext(
         no_compile_layers=vllm_config.compilation_config.
         static_forward_context,
         virtual_engine=virtual_engine,
@@ -229,7 +234,8 @@ def set_forward_context(
         skip_cuda_graphs=skip_cuda_graphs,
         cudagraph_runtime_warmup=cudagraph_runtime_warmup,
         cudagraph_capture_budget=cudagraph_capture_budget,
-    )
+        concurrent_cudagraph_capture=concurrent_cudagraph_capture,
+    ))
 
     try:
         yield
@@ -270,4 +276,4 @@ def set_forward_context(
                                  "(batchsize, count, median_time(ms)): %s"),
                                 forward_stats)
 
-        _forward_context = prev_context
+        _forward_context.reset(context_token)

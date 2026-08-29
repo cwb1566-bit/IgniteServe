@@ -662,6 +662,12 @@ class AdaptiveCUDAGraphController:
             record.remaining_pieces = 0
             record.failure = None
 
+    def mark_capture_started(self, phase: str, shape: int) -> None:
+        """Record capture start for both idle and concurrent workers."""
+        with self._lock:
+            record = self._records[(phase, shape)]
+            record.capture_started_at = time.time()
+
     def mark_capture_partial(
         self,
         phase: str,

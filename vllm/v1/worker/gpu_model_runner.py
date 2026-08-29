@@ -454,6 +454,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.enable_dynamic_cross_phase_replay:
                 logger.info(
                     "Piecewise dynamic CUDA graph cross-phase replay enabled.")
+        from vllm.v1.worker.concurrent_piecewise_cudagraph import (
+            ConcurrentPiecewiseCUDAGraphCaptureManager,
+        )
+        self.concurrent_piecewise_cudagraph_manager = (
+            ConcurrentPiecewiseCUDAGraphCaptureManager(self))
         self.enable_dynamic_cuda_graph_capture = (
             not self.enable_adaptive_cudagraph and os.environ.get(
                 "VLLM_DISABLE_DYNAMIC_CUDA_GRAPH_CAPTURE", "").lower() not in
@@ -1745,6 +1750,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     adaptive_decision.phase,
                     adaptive_decision.target_shape,
                 )
+                self.concurrent_piecewise_cudagraph_manager.enqueue_after_warmup(
+                    adaptive_decision.phase,
+                    adaptive_decision.target_shape,
+                )
 
             self.maybe_wait_for_kv_save()
             finished_sending, finished_recving = (
@@ -2531,6 +2540,41 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
                 inputs_embeds=inputs_embeds,
+            )
+
+    @torch.inference_mode()
+    def _concurrent_piecewise_capture_forward(
+            self, num_tokens: int) -> Any:
+        """Record a piecewise graph chain without a second warmup forward.
+
+        Piecewise attention remains eager and receives ``None`` metadata in
+        this formal-capture pass, so it neither reads nor mutates the live KV
+        cache. The persistent runner input buffers intentionally keep the same
+        addresses that normal replay will use. CUDA kernels are recorded on
+        the manager's private stream and execute once while CUDA records them.
+        Their outputs are discarded; foreground requests remain on eager until
+        the complete piece chain is atomically published.
+        """
+        if self.is_multimodal_model:
+            raise RuntimeError(
+                "concurrent piecewise capture supports text models only")
+        if num_tokens > self.scheduler_config.max_num_batched_tokens:
+            raise ValueError(
+                f"capture shape {num_tokens} exceeds max batched tokens")
+        model = self.model
+        input_ids = self.input_ids[:num_tokens]
+        positions = (self.mrope_positions[:, :num_tokens]
+                     if self.uses_mrope else self.positions[:num_tokens])
+        with set_forward_context(
+                None,
+                self.vllm_config,
+                num_tokens=num_tokens,
+                concurrent_cudagraph_capture=True):
+            return model(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=None,
+                inputs_embeds=None,
             )
 
     @torch.inference_mode()
