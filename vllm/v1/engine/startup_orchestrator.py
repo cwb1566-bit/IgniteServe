@@ -67,21 +67,37 @@ class StartupContext:
         self._lock = threading.Lock()
 
     def put(self, key: str, value: Any) -> Any:
+        from vllm.v1.engine.startup_analysis.recorder import get_startup_recorder
+        recorder = get_startup_recorder()
+        if recorder is not None:
+            recorder.state_access("put", key, value_type=type(value).__name__)
         with self._lock:
             self._values[key] = value
         return value
 
     def get(self, key: str, default: Any = None) -> Any:
+        from vllm.v1.engine.startup_analysis.recorder import get_startup_recorder
+        recorder = get_startup_recorder()
+        if recorder is not None:
+            recorder.state_access("get", key)
         with self._lock:
             return self._values.get(key, default)
 
     def require(self, key: str) -> Any:
+        from vllm.v1.engine.startup_analysis.recorder import get_startup_recorder
+        recorder = get_startup_recorder()
+        if recorder is not None:
+            recorder.state_access("require", key)
         with self._lock:
             if key not in self._values:
                 raise KeyError(f"Startup value is not ready: {key}")
             return self._values[key]
 
     def snapshot(self) -> dict[str, Any]:
+        from vllm.v1.engine.startup_analysis.recorder import get_startup_recorder
+        recorder = get_startup_recorder()
+        if recorder is not None:
+            recorder.record("state_snapshot")
         with self._lock:
             return dict(self._values)
 
@@ -224,6 +240,8 @@ class ResourceAwareDAGExecutor:
         self.capacities = dict(resource_capacities or {})
 
     def run(self, dag: StartupDAG, context: StartupContext) -> dict[str, StageResult]:
+        from vllm.v1.engine.startup_analysis.recorder import get_startup_recorder
+        recorder = get_startup_recorder()
         dag.topological_order()
         priority = dag.downstream_costs()
         pending = set(dag.nodes)
@@ -256,10 +274,13 @@ class ResourceAwareDAGExecutor:
             status = "completed"
             value: Any = None
             try:
-                if not node.enabled:
-                    status = "skipped"
-                elif node.action is not None:
-                    value = node.action(context)
+                stage_scope = (recorder.stage(node.name)
+                               if recorder is not None else ExitStack())
+                with stage_scope:
+                    if not node.enabled:
+                        status = "skipped"
+                    elif node.action is not None:
+                        value = node.action(context)
             except BaseException as exc:
                 finished = time.perf_counter()
                 return exc, StageResult(
@@ -468,6 +489,7 @@ def build_engine_startup_dag(
     add("batch_queue", {"scheduler"}, {"cpu": 1}, "runtime")
     add("ready", {"cuda_graph_precapture", "batch_queue", "mm_input_cache"},
         {}, "runtime")
+    _apply_configured_contract(dag)
     return dag
 
 
@@ -538,7 +560,16 @@ def build_bootstrap_startup_dag(
     add("state_probe", {"usage_reporting", "compile_worker_prewarm",
                         "static_resource_probe"},
         {"worker_rpc": 1, "cpu": 1}, "startup_manager", "worker-0")
+    _apply_configured_contract(dag)
     return dag
+
+
+def _apply_configured_contract(dag: StartupDAG) -> None:
+    contract = os.environ.get("VLLM_STARTUP_CONTRACT_PATH")
+    if not contract:
+        return
+    from vllm.v1.engine.startup_analysis.contract import apply_startup_contract
+    apply_startup_contract(dag, Path(contract), strict=False)
 
 
 def combine_startup_dags(bootstrap: StartupDAG,

@@ -619,6 +619,10 @@ class EngineCore:
             "Full startup DAG finished: plan=%s bootstrap_nodes=%d "
             "runtime_nodes=%d state=%s", plan_path, len(bootstrap.nodes),
             len(runtime.nodes), state.signature()[:16])
+        from vllm.v1.engine.startup_analysis.recorder import get_startup_recorder
+        startup_recorder = get_startup_recorder()
+        if startup_recorder is not None:
+            startup_recorder.flush()
 
     def _collect_startup_state(self):
         from vllm.v1.engine.startup_orchestrator import StartupState
@@ -850,6 +854,10 @@ class EngineCore:
                 f"{result.name}:{result.elapsed_s:.6f}s"
                 for result in actual_path),
         )
+        from vllm.v1.engine.startup_analysis.recorder import get_startup_recorder
+        startup_recorder = get_startup_recorder()
+        if startup_recorder is not None:
+            startup_recorder.flush()
         # timer.save(
         #     filepath=f"./analysis_results/IgniteServe_tests/cold_with_caches/total_init_{model_name}_IgniteServe_with_caches.json",
         #     csv_filepath=f"./analysis_results/IgniteServe_tests/cold_with_caches/timing_summary_{model_name}_IgniteServe_with_caches.csv"
