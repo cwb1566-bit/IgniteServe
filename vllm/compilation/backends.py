@@ -1012,10 +1012,35 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
             })
         if self.fake_run_map_filepath.exists():
             try:
-                return self._normalize_reuse_map(self._load_fake_run_metadata())
+                started = time.perf_counter()
+                reuse_map = self._normalize_reuse_map(
+                    self._load_fake_run_metadata())
+                logger.info(
+                    'Offline metadata timing reuse_map_load_s=%.6f '
+                    'graphs=%s canonical=%s path=%s',
+                    time.perf_counter() - started,
+                    len(reuse_map),
+                    len(set(reuse_map.values())),
+                    self.fake_run_map_filepath,
+                )
+                return reuse_map
             except Exception as exc:
                 logger.warning('Failed to load fake-run reuse metadata: %s', exc)
-        return self._normalize_reuse_map(self._build_structural_reuse_map())
+        started = time.perf_counter()
+        reuse_map = self._normalize_reuse_map(
+            self._build_structural_reuse_map())
+        self.fake_run_map_filepath.parent.mkdir(parents=True, exist_ok=True)
+        with self.fake_run_map_filepath.open('w', encoding='utf-8') as f:
+            json.dump(reuse_map, f, indent=2)
+        logger.info(
+            'Offline metadata timing reuse_map_build_s=%.6f graphs=%s '
+            'canonical=%s path=%s',
+            time.perf_counter() - started,
+            len(reuse_map),
+            len(set(reuse_map.values())),
+            self.fake_run_map_filepath,
+        )
+        return reuse_map
 
     def _try_load_cached_metadata(self) -> Optional[Dict[str, SubmoduleInputMetadata]]:
         started = time.perf_counter()
