@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import re
 import statistics
 import time
 from collections import defaultdict
@@ -250,6 +251,8 @@ class StartupContractGenerator:
         sampled_calls = parse_speedscope_profiles(self.call_profile_paths)
         if sampled_calls:
             calls = sampled_calls + calls
+        suggested_stage_nodes = self._suggest_stage_nodes(
+            calls, existing_names=all_stages)
 
         return {
             "schema": "igniteserve-startup-contract-v1",
@@ -264,6 +267,10 @@ class StartupContractGenerator:
                 ordering_candidates.values(),
                 key=lambda item: (item["target"], item["source"], item["state"])),
             "candidate_stage_boundaries": calls[:500],
+            # These are reviewable proposals, not executable nodes. Promoting a
+            # sampled call directly into the runtime contract would bypass the
+            # state/resource validation that makes the DAG safe.
+            "candidate_stage_nodes": suggested_stage_nodes,
             "summary": {
                 "trace_count": len(runs),
                 "node_count": len(contract_nodes),
@@ -274,6 +281,7 @@ class StartupContractGenerator:
                     1 for edge in edge_payload if edge["confidence"] < 0.9),
                 "ordering_candidate_count": len(ordering_candidates),
                 "call_boundary_candidate_count": len(calls),
+                "suggested_stage_node_count": len(suggested_stage_nodes),
             },
         }
 
@@ -299,3 +307,49 @@ class StartupContractGenerator:
         details["confidence"] = max(float(details["confidence"]), confidence)
         if evidence not in details["evidence"]:
             details["evidence"].append(evidence)
+
+    @staticmethod
+    def _suggest_stage_nodes(
+        calls: list[dict[str, Any]],
+        *,
+        existing_names: set[str],
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Turn expensive sampled calls into non-executable node proposals."""
+        suggestions = []
+        seen_actions = set()
+        for call in calls:
+            qualname = str(call.get("qualname", "")).strip()
+            filename = str(call.get("filename", "")).strip()
+            lineno = int(call.get("lineno", 0) or 0)
+            if not qualname or qualname in existing_names:
+                continue
+            inclusive_s = float(call.get(
+                "sampled_inclusive_s", call.get("total_s", 0.0)) or 0.0)
+            self_s = float(call.get(
+                "sampled_self_s", call.get("median_s", 0.0)) or 0.0)
+            if inclusive_s < 0.005 and self_s < 0.002:
+                continue
+            action_reference = f"{filename}:{lineno}:{qualname}"
+            if action_reference in seen_actions:
+                continue
+            seen_actions.add(action_reference)
+            stem = Path(filename).stem or "python"
+            raw_name = f"candidate.{stem}.{qualname}.{lineno}"
+            suggested_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw_name)
+            sample_count = int(call.get("sample_count", call.get("count", 0)))
+            suggestions.append({
+                "name": suggested_name,
+                "action_reference": action_reference,
+                "estimated_cost_s": max(inclusive_s, self_s),
+                "sampled_inclusive_s": inclusive_s,
+                "sampled_self_s": self_s,
+                "sample_count": sample_count,
+                "confidence": min(0.85, 0.45 + 0.05 * min(sample_count, 8)),
+                "evidence": "py-spy sampled startup call",
+                "requires_review": True,
+                "executable": False,
+            })
+            if len(suggestions) >= limit:
+                break
+        return suggestions

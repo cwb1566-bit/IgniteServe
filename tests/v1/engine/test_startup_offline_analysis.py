@@ -149,3 +149,18 @@ def test_pyspy_profile_proposes_boundaries(tmp_path: Path) -> None:
     assert candidates[0]["sampled_inclusive_s"] == 0.04
     load = next(item for item in candidates if item["qualname"] == "load")
     assert load["sampled_self_s"] == 0.02
+
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text(
+        json.dumps({"event": "stage_start", "name": "existing",
+                    "timestamp_ns": 1}) + "\n" +
+        json.dumps({"event": "stage_end", "name": "existing",
+                    "timestamp_ns": 2, "elapsed_ns": 1}) + "\n",
+        encoding="utf-8")
+    contract = StartupContractGenerator(
+        [trace], call_profile_paths=[path]).generate()
+    assert contract["summary"]["suggested_stage_node_count"] == 2
+    suggested = contract["candidate_stage_nodes"][0]
+    assert suggested["executable"] is False
+    assert suggested["requires_review"] is True
+    assert suggested["action_reference"].endswith(":10:startup")
