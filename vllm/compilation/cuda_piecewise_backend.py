@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import os
 import time
 from contextlib import ExitStack
 from typing import Any, Callable, Optional
@@ -160,8 +161,39 @@ class CUDAPiecewiseBackend:
 
     def _run(self, mode: str, runnable: Callable, args: tuple[Any, ...]) -> Any:
         label = f"piece.{self.piecewise_compile_index}.{mode}"
-        with operator_pipeline_range(label):
-            return runnable(*args)
+        if os.getenv("VLLM_PIECEWISE_INPUT_PROBE"):
+            arg_descriptions = []
+            for index, value in enumerate(args):
+                if isinstance(value, torch.Tensor):
+                    arg_descriptions.append({
+                        "index": index,
+                        "shape": tuple(value.shape),
+                        "stride": tuple(value.stride()),
+                        "dtype": str(value.dtype),
+                        "device": str(value.device),
+                    })
+                else:
+                    arg_descriptions.append({
+                        "index": index,
+                        "type": type(value).__name__,
+                        "repr": repr(value),
+                    })
+            placeholders = [
+                node.name for node in self.graph.graph.nodes
+                if node.op == "placeholder"
+            ]
+            logger.info("Piecewise input probe piece=%d mode=%s "
+                        "sym_shape_indices=%s placeholders=%s args=%s",
+                        self.piecewise_compile_index, mode,
+                        self.sym_shape_indices, placeholders,
+                        arg_descriptions)
+        try:
+            with operator_pipeline_range(label):
+                return runnable(*args)
+        except BaseException:
+            logger.exception("Piecewise execution failed: piece=%d mode=%s",
+                             self.piecewise_compile_index, mode)
+            raise
 
     def check_for_ending_compilation(self):
         if self.is_last_graph and not self.to_be_compiled_sizes:
@@ -180,6 +212,9 @@ class CUDAPiecewiseBackend:
         if not self.first_run_finished:
             self.first_run_finished = True
             if self.is_first_graph:
+                from vllm.compilation.weight_compile_overlap import (
+                    wait_for_weights_ready)
+                wait_for_weights_ready("First compiled execution")
                 if "after_backend_return_until_first_piecewise" in timer.start_times:
                     from vllm.compilation import gap_profiler
                     gap_profiler.stop()

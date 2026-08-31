@@ -48,6 +48,94 @@ from vllm.v1.phase_profiler import timer
 logger = init_logger(__name__)
 
 
+def _dump_dynamo_fx_artifact_probe(graph: fx.GraphModule,
+                                   example_inputs: list[Any],
+                                   traced_files: Sequence[str],
+                                   runtime_identity: dict[str, Any]) -> None:
+    """Persist the pre-backend FX graph with PyTorch's wire serializer."""
+    output_dir = (os.getenv("VLLM_DYNAMO_FRONTEND_CACHE_DIR")
+                  or os.getenv("VLLM_DYNAMO_ARTIFACT_PROBE_DIR"))
+    if not output_dir:
+        return
+
+    probe_dir = Path(output_dir)
+    probe_dir.mkdir(parents=True, exist_ok=True)
+    rank = os.getenv("RANK", os.getenv("LOCAL_RANK", "0"))
+    stem = f"dynamo_fx_rank_{rank}_{os.getpid()}"
+    started = time.perf_counter()
+    import hashlib
+    traced_file_sha256 = {}
+    for path in traced_files:
+        if path == "<string>" or not os.path.isfile(path):
+            continue
+        with open(path, "rb") as source_file:
+            traced_file_sha256[path] = hashlib.sha256(
+                source_file.read()).hexdigest()
+    metadata = {
+        "nodes": len(list(graph.graph.nodes)),
+        "placeholders": sum(node.op == "placeholder"
+                            for node in graph.graph.nodes),
+        "node_ops": {
+            op: sum(node.op == op for node in graph.graph.nodes)
+            for op in sorted({node.op for node in graph.graph.nodes})
+        },
+        "call_module_targets": sorted(
+            str(node.target) for node in graph.graph.nodes
+            if node.op == "call_module"),
+        "example_inputs": len(example_inputs),
+        "example_input_types": [
+            f"{type(value).__module__}.{type(value).__qualname__}"
+            for value in example_inputs
+        ],
+        "traced_files": sorted(traced_files),
+        "traced_file_sha256": traced_file_sha256,
+        "runtime_identity": runtime_identity,
+    }
+    structural_started = time.perf_counter()
+    try:
+        graph_payload = _serialize_graph_module_for_subprocess(graph)
+        graph_bytes = pickle.dumps(graph_payload, protocol=pickle.HIGHEST_PROTOCOL)
+        graph_path = probe_dir / f"{stem}.fxstruct.pkl"
+        graph_path.write_bytes(graph_bytes)
+
+        from torch.fx._graph_pickler import GraphPickler
+        from torch.fx.experimental.symbolic_shapes import free_symbols
+        direct_symbols = tuple(
+            (node.name, node.meta["example_value"])
+            for node in graph.graph.nodes
+            if isinstance(node.meta.get("example_value"),
+                          (torch.SymInt, torch.SymFloat)))
+        direct_symbol_bytes = GraphPickler.dumps(direct_symbols)
+        direct_symbol_path = (
+            probe_dir / f"{stem}.direct_symbols.graphpickle")
+        direct_symbol_path.write_bytes(direct_symbol_bytes)
+        symbol_dependencies = {}
+        for node in graph.graph.nodes:
+            value = node.meta.get("example_value")
+            if value is None:
+                continue
+            symbols = sorted(str(symbol) for symbol in free_symbols(value))
+            if symbols:
+                symbol_dependencies[node.name] = symbols
+
+        metadata.update({
+            "fxstruct_bytes": len(graph_bytes),
+            "fxstruct_path": str(graph_path),
+            "direct_symbols": len(direct_symbols),
+            "direct_symbol_graphpickle_bytes": len(direct_symbol_bytes),
+            "direct_symbol_graphpickle_path": str(direct_symbol_path),
+            "symbol_dependencies": symbol_dependencies,
+            "structural_seconds": time.perf_counter() - structural_started,
+        })
+    except Exception as exc:
+        metadata.update({
+            "structural_error": f"{type(exc).__name__}: {exc}",
+            "structural_seconds": time.perf_counter() - structural_started,
+        })
+    (probe_dir / f"{stem}.json").write_text(
+        json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
+
+
 def structural_reuse_enabled() -> bool:
     if env_flag("VLLM_DISABLE_STRUCTURAL_REUSE", False):
         return False
@@ -943,6 +1031,10 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
         super().__init__(module)
         from torch._guards import detect_fake_mode
         self.fake_mode = detect_fake_mode()
+        if self.fake_mode is None:
+            from torch._subclasses.fake_tensor import FakeTensorMode
+            from torch.fx.experimental.symbolic_shapes import ShapeEnv
+            self.fake_mode = FakeTensorMode(shape_env=ShapeEnv())
         self.compile_submod_names = compile_submod_names
         self.compilation_config = vllm_config.compilation_config
         self.graph_pool = graph_pool
@@ -1031,6 +1123,12 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
             int(index): int(mapped_index)
             for index, mapped_index in self.fake_run_map_list.items()
         }
+        if self.cached_metadata is not None and not args:
+            logger.info('Restoring submodule inputs from cache without '
+                        'replaying full-graph example inputs...')
+            self._restore_from_cache()
+            return None
+
         fake_args = [
             self.fake_mode.from_tensor(t) if isinstance(t, torch.Tensor) else t
             for t in args
@@ -2209,6 +2307,27 @@ class VllmBackend:
                 self.post_grad_pass_manager.add(inductor_config[PASS_KEY])
         inductor_config[PASS_KEY] = self.post_grad_pass_manager
 
+    def dynamo_frontend_runtime_identity(self) -> dict[str, Any]:
+        import platform
+
+        cached = getattr(self, "_dynamo_frontend_identity", None)
+        if cached is not None:
+            return cached
+        with normalized_model_paths(self.vllm_config) as hash_config:
+            config_hash = hash_config.compute_hash()
+            compiler_hash = self.compiler_manager.compute_hash(hash_config)
+        identity = {
+            "python": platform.python_version(),
+            "torch": torch.__version__,
+            "torch_cuda": torch.version.cuda,
+            "env_hash": envs.compute_hash(),
+            "config_hash": config_hash,
+            "compiler_hash": compiler_hash,
+            "prefix": self.prefix,
+        }
+        self._dynamo_frontend_identity = identity
+        return identity
+
     def visualize_graph(self, gm: fx.GraphModule, output_path):
         from torch.fx.passes.graph_drawer import FxGraphDrawer
 
@@ -2219,6 +2338,16 @@ class VllmBackend:
         logger.info(f"Graph visualization saved to {output_path}")
 
     def __call__(self, graph: fx.GraphModule, example_inputs) -> Callable:
+        backend_started = time.perf_counter()
+        if not getattr(self, "_dynamo_frontend_replaying", False):
+            _dump_dynamo_fx_artifact_probe(
+                graph, example_inputs, self.compilation_config.traced_files,
+                self.dynamo_frontend_runtime_identity())
+        from .monitor import torch_compile_start_time
+        dynamo_frontend_time = time.time() - torch_compile_start_time
+        logger.info("Dynamo frontend before backend entry: %.6f s",
+                    dynamo_frontend_time)
+        cache_analysis_started = time.perf_counter()
         timer.start("analyzing cache_dir and files")
         vllm_config = self.vllm_config
         if not self.compilation_config.cache_dir:
@@ -2330,13 +2459,15 @@ class VllmBackend:
             logger.info("Using cache directory: %s for vLLM's torch.compile", local_cache_dir)
         self.compiler_manager.initialize_cache(local_cache_dir, disable_cache, self.prefix)
         timer.end("analyzing cache_dir and files")
+        logger.info("Compilation cache analysis time: %.6f s",
+                    time.perf_counter() - cache_analysis_started)
 
         # when dynamo calls the backend, it means the bytecode
         # transform and analysis are done
         compilation_counter.num_graphs_seen += 1
-        from .monitor import torch_compile_start_time
         dynamo_time = time.time() - torch_compile_start_time
-        logger.info("Dynamo bytecode transform time: %.2f s", dynamo_time)
+        logger.info("Tracing operational time including cache analysis: %.6f s",
+                    dynamo_time)
         timer.end("Tracing")
         # self.compilation_config.compilation_time += dynamo_time
         # we control the compilation process, each instance can only be
@@ -2345,6 +2476,7 @@ class VllmBackend:
 
         timer.start("Compiling")
         timer.start("split graph")
+        split_started = time.perf_counter()
         self.graph = graph
         self.configure_post_pass()
         self.split_gm, self.piecewise_graphs = split_graph(graph, self.compilation_config.splitting_ops)
@@ -2365,6 +2497,8 @@ class VllmBackend:
             if not item.is_splitting_graph
         ]
         timer.end("split graph")
+        logger.info("FX graph split time: %.6f s",
+                    time.perf_counter() - split_started)
         # logger.info("split graph takes:%.3f", time.perf_counter() - start_time)
         # propagate the split graph to the piecewise backend, compile submodules with symbolic shapes
         logger.info("start compile submodules with symbolic shapes")
@@ -2379,11 +2513,15 @@ class VllmBackend:
                 f"submodule_inputs_metadata"
             )
         # get the metadata from fake_run or metadata_cache
+        metadata_started = time.perf_counter()
         timer.start("get meta_data")
         PiecewiseCompileInterpreter(self.split_gm, submod_names_to_compile,
                                     self.vllm_config, self.graph_pool,
                                     self, metadata_cache_dir=submodule_inputs_metadata_cache_dir).run(*example_inputs)
         timer.end("get meta_data")
+        logger.info("Piecewise metadata restore time: %.6f s",
+                    time.perf_counter() - metadata_started)
+        materialization_started = time.perf_counter()
         compiled_graphs = self.parallel_manager.materialize_all(
             self.meta_data,
             submod_names_to_compile,
@@ -2393,7 +2531,10 @@ class VllmBackend:
             reuse_index_map=self.reuse_index_map,
             runtime_shape=None,
         )
+        logger.info("Piecewise cache materialization time: %.6f s",
+                    time.perf_counter() - materialization_started)
 
+        assembly_started = time.perf_counter()
         piecewise_backend = resolve_obj_by_qualname(current_platform.get_piecewise_backend_cls())
         '''
         Original self.split_gm.__dict__.keys():dict_keys(['_modules', '_parameters', '_buffers', ...])
@@ -2422,6 +2563,8 @@ class VllmBackend:
             # 记录被编译的被识别并已处理的分段图数量
             compilation_counter.num_piecewise_capturable_graphs_seen += 1
 
+        logger.info("Piecewise backend assembly time: %.6f s",
+                    time.perf_counter() - assembly_started)
         '''
         PiecewiseCompileInterpreter(self.split_gm, submod_names_to_compile,
                                     self.vllm_config, self.graph_pool,
@@ -2442,6 +2585,8 @@ class VllmBackend:
 
         self._called = True
 
+        logger.info("VllmBackend total time: %.6f s",
+                    time.perf_counter() - backend_started)
         if not self.compilation_config.use_cudagraph or not self.compilation_config.cudagraph_copy_inputs:
             logger.debug("Not use cudagraph_copy_inputs...")
             timer.end("Compiling")

@@ -213,6 +213,7 @@ class EngineCore:
                 "VLLM_DISTRIBUTED_NATIVE_BASELINE", "").strip().lower()
             in {"1", "true", "yes", "on"})
         self._weight_loading_error = None
+        weight_compile_sync = None
         if native_distributed_baseline:
             # Multiproc workers have already followed the upstream lifecycle:
             # init_device() + load_model(). The first profile run below is the
@@ -227,12 +228,26 @@ class EngineCore:
 
             stop_async_weight_prewarm_from_env("EngineCore.load_weights")
 
+            # The single-rank path deliberately overlaps value-independent
+            # frontend/backend preparation with weight loading. Arm a
+            # rank-local barrier so the first compiled kernel cannot observe
+            # partially loaded parameter storage.
+            if self.vllm_config.parallel_config.world_size == 1:
+                from vllm.compilation import weight_compile_overlap
+                weight_compile_sync = weight_compile_overlap
+                weight_compile_sync.begin()
+
             def _load_weights_target():
                 try:
                     self.model_executor.load_weights()
                 except BaseException as exc:
                     self._weight_loading_error = exc
+                    if weight_compile_sync is not None:
+                        weight_compile_sync.mark_weights_failed(exc)
                     raise
+                else:
+                    if weight_compile_sync is not None:
+                        weight_compile_sync.mark_weights_ready()
             self._weight_loading_thread = threading.Thread(
                 target=_load_weights_target,
                 daemon=True,
@@ -262,6 +277,8 @@ class EngineCore:
             logger.info("Waiting for background weight loading before CUDA "
                         "graph pre-capture.")
             weight_loading_thread.join()
+        if not native_distributed_baseline and weight_compile_sync is not None:
+            weight_compile_sync.end()
         if self._weight_loading_error is not None:
             raise self._weight_loading_error
 
