@@ -21,12 +21,14 @@ class RequestResult:
     output_tokens: int = 0
     error: Optional[str] = None
     send_timestamp: float = 0.0  # 新增：记录请求发出的时间
+    attempts: int = 1
 
 
 class ShareGPTBenchmark:
     def __init__(self, base_url, model, dataset_path, num_prompts,
                  max_workers, output_csv, request_rate, hotspot_key=None,
-                 seed=0, max_tokens=256):
+                 seed=0, max_tokens=256, max_retries=0,
+                 request_timeout=600.0):
         self.base_url = base_url.rstrip('/')
         self.model = model
         self.dataset_path = dataset_path
@@ -37,6 +39,8 @@ class ShareGPTBenchmark:
         self.hotspot_key = hotspot_key
         self.rng = np.random.default_rng(seed)
         self.max_tokens = max_tokens
+        self.max_retries = max(0, max_retries)
+        self.request_timeout = request_timeout
         self.dataset = self._load_dataset()
 
     # def _load_dataset(self) -> List[str]:
@@ -143,7 +147,7 @@ class ShareGPTBenchmark:
                 return RequestResult(req_id, True, latency, ttft=ttft, tpot=tpot, input_tokens=len(prompt) // 3,
                                      output_tokens=out_tokens, send_timestamp=send_timestamp)
         except Exception as e:
-            return RequestResult(req_id, False, time.time() - send_timestamp, error=str(e),
+            return RequestResult(req_id, False, time.time() - send_timestamp, error=repr(e),
                                  send_timestamp=send_timestamp)
 
     async def run(self):
@@ -158,9 +162,25 @@ class ShareGPTBenchmark:
             """限制并发的请求包装器"""
             async with sem:
                 res = await self._send_request(session, prompt, req_id)
+                attempts = 1
+                retryable_errors = (
+                    "TimeoutError(", "ServerDisconnectedError(",
+                    "ClientOSError(", "ClientPayloadError(",
+                )
+                while (
+                    not res.success
+                    and attempts <= self.max_retries
+                    and (res.error or "").startswith(retryable_errors)
+                    and res.output_tokens == 0
+                ):
+                    attempts += 1
+                    await asyncio.sleep(0.1)
+                    res = await self._send_request(session, prompt, req_id)
+                res.attempts = attempts
                 results.append(res)
 
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=600)) as session:
+        timeout = aiohttp.ClientTimeout(total=self.request_timeout)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             tasks = []
             for i, prompt in enumerate(self.dataset):
                 # 【核心逻辑】：泊松到达的时间间隔模拟
@@ -186,6 +206,8 @@ class ShareGPTBenchmark:
 
         print("\n" + "=" * 50)
         print(f"总耗时: {total_time:.2f}s | 成功: {len(success)} | 失败: {len(failed)}")
+        retried = sum(r.attempts > 1 for r in results)
+        print(f"连接级重试请求数: {retried}")
 
         if failed:
             print("\n【失败原因归类】")
@@ -285,7 +307,8 @@ class ShareGPTBenchmark:
                 # 写入表头
                 writer.writerow([
                     "request_id", "send_timestamp", "success", "latency_s",
-                    "ttft_s", "tpot_s", "input_tokens", "output_tokens", "error_msg"
+                    "ttft_s", "tpot_s", "input_tokens", "output_tokens",
+                    "attempts", "error_msg"
                 ])
 
                 # 为了后续画图分析，按发送时间排序
@@ -303,6 +326,7 @@ class ShareGPTBenchmark:
                         f"{r.tpot:.4f}" if r.tpot is not None else "",
                         r.input_tokens,
                         r.output_tokens,
+                        r.attempts,
                         r.error if r.error else ""
                     ])
             print(f"\n[+] 详细请求数据已成功保存至: {self.output_csv}")
@@ -325,6 +349,10 @@ if __name__ == "__main__":
                         help="Random seed for reproducible Poisson arrivals")
     parser.add_argument('--max-tokens', type=int, default=256,
                         help="Maximum output tokens per request")
+    parser.add_argument('--max-retries', type=int, default=0,
+                        help="Retries for zero-token connection failures")
+    parser.add_argument('--request-timeout', type=float, default=600.0,
+                        help="Per-request timeout in seconds")
     args = parser.parse_args()
 
     benchmark = ShareGPTBenchmark(
@@ -338,5 +366,7 @@ if __name__ == "__main__":
         hotspot_key=args.hotspot_key,
         seed=args.seed,
         max_tokens=args.max_tokens,
+        max_retries=args.max_retries,
+        request_timeout=args.request_timeout,
     )
     asyncio.run(benchmark.run())

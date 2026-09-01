@@ -3,6 +3,7 @@ import os
 import time
 import csv
 import threading
+import uuid
 from pathlib import Path
 from collections import deque
 from typing import List, Dict, Optional
@@ -101,6 +102,7 @@ class HotspotAnalyzer:
             self.auto_plot = auto_plot
             self.output_dir = Path(output_dir)
             self.output_dir.mkdir(parents=True, exist_ok=True)
+            self.exporter_id = f"{os.getpid()}-{uuid.uuid4().hex}"
 
             self.has_exported_final = False  # 避免压测结束后重复疯狂落盘
 
@@ -190,69 +192,113 @@ class HotspotAnalyzer:
         )
 
     def export_to_csv(self, filename: str = "cuda_graph_hits.csv", top_percent: float = 0.99):
-        """将命中统计落盘为 CSV，同时额外导出一个占据前 N% 命中总数的优选批次集合"""
-        import os
-        import csv
-
+        """Export this engine generation and atomically merge all generations."""
         if not self.stats:
             return
 
-        # ==========================================
-        # 1. 导出全量 CSV 数据 (原始逻辑)
-        # ==========================================
-        filepath = self.output_dir / filename
-        with open(filepath, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow(['batch_size', 'hit_count', 'total_tokens', 'frequency', 'capture_priority'])
+        header = [
+            'batch_size', 'hit_count', 'total_tokens', 'frequency',
+            'capture_priority'
+        ]
+        base_name, ext = os.path.splitext(filename)
+        part_path = self.output_dir / (
+            f".{base_name}.part-{self.exporter_id}{ext}")
+        lock_path = self.output_dir / f".{base_name}.lock"
 
-            for size in sorted(self.stats.keys()):
+        # A process-local analyzer is cumulative. Replacing its own part makes
+        # repeated exports idempotent, while distinct engine generations retain
+        # separate parts that can be summed after unload/reload.
+        part_tmp = part_path.with_suffix(part_path.suffix + ".tmp")
+        with open(part_tmp, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(header)
+            for size in sorted(self.stats):
                 stat = self.stats[size]
-                freq = stat.hit_count / max(self.total_requests, 1)
-                writer.writerow([size, stat.hit_count, stat.total_tokens, freq, stat.capture_priority])
+                writer.writerow([
+                    size, stat.hit_count, stat.total_tokens,
+                    stat.hit_count / max(self.total_requests, 1),
+                    stat.capture_priority,
+                ])
+        os.replace(part_tmp, part_path)
+
+        # Multiple EngineCore generations may exit concurrently and target the
+        # same workload directory. Serialize aggregation across processes.
+        import fcntl
+        with open(lock_path, 'a+', encoding='utf-8') as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            aggregate: Dict[int, Dict[str, float]] = {}
+            for candidate in self.output_dir.glob(
+                    f".{base_name}.part-*{ext}"):
+                with open(candidate, newline='', encoding='utf-8') as f:
+                    for row in csv.DictReader(f):
+                        size = int(row['batch_size'])
+                        entry = aggregate.setdefault(size, {
+                            'hit_count': 0,
+                            'total_tokens': 0,
+                            'capture_priority': 0.0,
+                        })
+                        entry['hit_count'] += int(row['hit_count'])
+                        entry['total_tokens'] += int(row['total_tokens'])
+                        entry['capture_priority'] = max(
+                            entry['capture_priority'],
+                            float(row['capture_priority']),
+                        )
+
+            total_hits = sum(
+                int(entry['hit_count']) for entry in aggregate.values())
+            filepath = self.output_dir / filename
+            filepath_tmp = filepath.with_suffix(filepath.suffix + ".tmp")
+            with open(filepath_tmp, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(header)
+                for size in sorted(aggregate):
+                    entry = aggregate[size]
+                    writer.writerow([
+                        size, int(entry['hit_count']),
+                        int(entry['total_tokens']),
+                        entry['hit_count'] / max(total_hits, 1),
+                        entry['capture_priority'],
+                    ])
+            os.replace(filepath_tmp, filepath)
+
+            sorted_stats = sorted(
+                aggregate.items(),
+                key=lambda item: (
+                    item[1]['hit_count'], item[1]['capture_priority']),
+                reverse=True,
+            )
+
+            target_hits = total_hits * top_percent
+
+            top_stats = []
+            accumulated_hits = 0
+
+            for size, entry in sorted_stats:
+                top_stats.append((size, entry))
+                accumulated_hits += int(entry['hit_count'])
+                if accumulated_hits >= target_hits:
+                    break
+
+            top_filename = f"{base_name}_top{int(top_percent * 100)}{ext}"
+            top_filepath = self.output_dir / top_filename
+            top_tmp = top_filepath.with_suffix(top_filepath.suffix + ".tmp")
+
+            # Ascending shapes let capture code iterate in reverse and reuse
+            # the largest graph's memory pool.
+            with open(top_tmp, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(header)
+                for size, entry in sorted(top_stats):
+                    writer.writerow([
+                        size, int(entry['hit_count']),
+                        int(entry['total_tokens']),
+                        entry['hit_count'] / max(total_hits, 1),
+                        entry['capture_priority'],
+                    ])
+            os.replace(top_tmp, top_filepath)
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
         print(f"[+] CUDA 图全量命中统计已导出至: {filepath}")
-
-        # ==========================================
-        # 2. 核心逻辑：提取覆盖 Top N% 命中的最小批次集合
-        # ==========================================
-        # 最优优先级排序方案：
-        # 第一关键字：hit_count (命中次数降序)
-        # 第二关键字：capture_priority (综合了吞吐量贡献和时间最近性，用于同命中次数时的平局决胜)
-        sorted_stats = sorted(
-            self.stats.values(),
-            key=lambda s: (s.hit_count, s.capture_priority),
-            reverse=True
-        )
-
-        total_hits = sum(s.hit_count for s in sorted_stats)
-        target_hits = total_hits * top_percent
-
-        top_stats = []
-        accumulated_hits = 0
-
-        for stat in sorted_stats:
-            top_stats.append(stat)
-            accumulated_hits += stat.hit_count
-            # 当累加的命中次数达到目标覆盖率时，停止收集
-            if accumulated_hits >= target_hits:
-                break
-
-        # ==========================================
-        # 3. 将达到目标覆盖率的数据导出为新的 CSV
-        # ==========================================
-        base_name, ext = os.path.splitext(filename)
-        top_filename = f"{base_name}_top{int(top_percent * 100)}{ext}"
-        top_filepath = self.output_dir / top_filename
-
-        # 写入时，按 batch_size 从小到大升序排列，方便 vLLM 底层预捕获时 reversed 从大到小复用显存
-        with open(top_filepath, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow(['batch_size', 'hit_count', 'total_tokens', 'frequency', 'capture_priority'])
-
-            for stat in sorted(top_stats, key=lambda s: s.size):
-                freq = stat.hit_count / max(self.total_requests, 1)
-                writer.writerow([stat.size, stat.hit_count, stat.total_tokens, freq, stat.capture_priority])
-
         print(f"[+] CUDA 图 Top {int(top_percent * 100)}% 优选统计已导出至: {top_filepath}")
         print(f"    (有效剔除了长尾数据，共选中 {len(top_stats)} 个核心批次大小)")
 
