@@ -68,6 +68,97 @@ class EngineCore:
                  log_stats: bool,
                  executor_fail_callback: Optional[Callable] = None):
 
+        requested_mode = os.environ.get(
+            "VLLM_STARTUP_DAG_MODE", "off").strip().lower()
+        if requested_mode == "execute-generated":
+            contract = os.environ.get("VLLM_STARTUP_CONTRACT_PATH")
+            adapter = os.environ.get("VLLM_STARTUP_ADAPTER_PATH")
+            if contract:
+                from vllm.v1.engine.startup_analysis.generated import (
+                    GeneratedStartupRejected,
+                    prepare_generated_startup,
+                )
+                try:
+                    generated_plan = prepare_generated_startup(
+                        self,
+                        vllm_config,
+                        {
+                            "input.vllm_config": vllm_config,
+                            "input.executor_class": executor_class,
+                            "input.log_stats": log_stats,
+                            "input.executor_fail_callback":
+                                executor_fail_callback,
+                        },
+                        contract_path=Path(contract),
+                        adapter_path=Path(adapter) if adapter else None,
+                        source_path=Path(__file__),
+                    )
+                except GeneratedStartupRejected as exc:
+                    logger.warning(
+                        "Generated startup contract rejected before execution: "
+                        "%s; falling back to the sequential startup path.", exc)
+                else:
+                    logger.info(
+                        "Executing generated startup contract: contract=%s "
+                        "adapter=%s variant=%s", generated_plan.contract_path,
+                        generated_plan.adapter_path,
+                        generated_plan.variant["name"])
+                    generated_plan.execute()
+                    logger.info("Generated startup contract completed")
+                    return
+            else:
+                logger.warning(
+                    "VLLM_STARTUP_DAG_MODE=execute-generated requires "
+                    "VLLM_STARTUP_CONTRACT_PATH; falling back to the "
+                    "sequential startup path.")
+        if requested_mode != "discover":
+            self._initialize_engine_core(
+                vllm_config, executor_class, log_stats,
+                executor_fail_callback)
+            return
+
+        from vllm.v1.engine.startup_analysis.recorder import get_startup_recorder
+        startup_recorder = get_startup_recorder()
+        if startup_recorder is None:
+            logger.warning(
+                "VLLM_STARTUP_DAG_MODE=discover requires "
+                "VLLM_STARTUP_OFFLINE_ANALYSIS_DIR; using the legacy path "
+                "without trace collection.")
+            self._initialize_engine_core(
+                vllm_config, executor_class, log_stats,
+                executor_fail_callback)
+            return
+        try:
+            initializer = self._initialize_engine_core
+            stage_map = os.environ.get("VLLM_STARTUP_DISCOVERY_STAGE_MAP")
+            if stage_map:
+                from vllm.v1.engine.startup_analysis.source_instrumentation import (
+                    build_instrumented_bound_method,
+                )
+                initializer = build_instrumented_bound_method(
+                    initializer, Path(stage_map), startup_recorder)
+            with startup_recorder.stage("engine_startup.root"):
+                initializer(
+                    vllm_config, executor_class, log_stats,
+                    executor_fail_callback)
+            from vllm.v1.engine.startup_analysis.generated import (
+                runtime_compatibility_facts,
+            )
+            startup_recorder.record(
+                "startup_compatibility",
+                facts=runtime_compatibility_facts(
+                    vllm_config, source_path=Path(__file__)))
+        finally:
+            startup_recorder.flush()
+
+    def _initialize_engine_core(
+        self,
+        vllm_config: VllmConfig,
+        executor_class: type[Executor],
+        log_stats: bool,
+        executor_fail_callback: Optional[Callable] = None,
+    ) -> None:
+
         timer.start("Total Init")
         requested_dag_mode = os.environ.get(
             "VLLM_STARTUP_DAG_MODE", "off").strip().lower()
@@ -185,6 +276,8 @@ class EngineCore:
         startup_dag_mode = getattr(
             self, "_startup_dag_mode_override",
             os.environ.get("VLLM_STARTUP_DAG_MODE", "off")).strip().lower()
+        if startup_dag_mode in {"discover", "execute-generated"}:
+            startup_dag_mode = "off"
         if startup_dag_mode not in {"off", "shadow", "execute"}:
             logger.warning("Unknown VLLM_STARTUP_DAG_MODE=%s; using off",
                            startup_dag_mode)

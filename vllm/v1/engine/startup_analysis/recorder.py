@@ -6,6 +6,7 @@ from __future__ import annotations
 import atexit
 import contextlib
 import contextvars
+import itertools
 import json
 import os
 import sys
@@ -22,9 +23,14 @@ _RECORDER: Optional["StartupAnalysisRecorder"] = None
 _RECORDER_LOCK = threading.Lock()
 
 
-def _safe_value(value: Any, limit: int = 512) -> Any:
+def _safe_value(value: Any, limit: int = 512, depth: int = 0) -> Any:
     if value is None or isinstance(value, (bool, int, float, str)):
         text = value
+    elif depth < 3 and isinstance(value, (list, tuple)):
+        return [_safe_value(item, limit, depth + 1) for item in value]
+    elif depth < 3 and isinstance(value, dict):
+        return {str(key): _safe_value(item, limit, depth + 1)
+                for key, item in value.items()}
     else:
         try:
             text = repr(value)
@@ -77,8 +83,10 @@ class StartupAnalysisRecorder:
         self._module_prefixes = tuple(
             item.strip() for item in prefixes.split(",") if item.strip())
         self._previous_profile = None
-        self._call_starts: dict[tuple[int, int], tuple[int, Optional[str], str, str,
-                                                        str, int]] = {}
+        self._call_ids = itertools.count(1)
+        self._call_starts: dict[tuple[int, int], tuple[
+            int, int, Optional[int], Optional[str], str, str, str, int]] = {}
+        self._call_stacks: dict[int, list[int]] = {}
 
     @property
     def enabled(self) -> bool:
@@ -190,20 +198,36 @@ class StartupAnalysisRecorder:
         key = (threading.get_ident(), id(frame))
         if event == "call":
             code = frame.f_code
+            thread_id = threading.get_ident()
+            stack = self._call_stacks.setdefault(thread_id, [])
+            call_id = next(self._call_ids)
+            parent_call_id = stack[-1] if stack else None
+            stack.append(call_id)
+            started_ns = time.perf_counter_ns()
             self._call_starts[key] = (
-                time.perf_counter_ns(), _CURRENT_STAGE.get(), module,
-                getattr(code, "co_qualname", code.co_name), code.co_filename,
-                code.co_firstlineno)
+                started_ns, call_id, parent_call_id,
+                _CURRENT_STAGE.get(), module,
+                getattr(code, "co_qualname", code.co_name),
+                code.co_filename, code.co_firstlineno)
             return
         call = self._call_starts.pop(key, None)
         if call is None:
             return
-        started, stage, module, qualname, filename, lineno = call
+        (started, call_id, parent_call_id, stage, module, qualname, filename,
+         lineno) = call
+        stack = self._call_stacks.get(threading.get_ident(), [])
+        if stack and stack[-1] == call_id:
+            stack.pop()
+        elif call_id in stack:
+            stack.remove(call_id)
         elapsed = time.perf_counter_ns() - started
         if elapsed < self._call_min_ns:
             return
         self.record(
             "call_span",
+            call_id=call_id,
+            parent_call_id=parent_call_id,
+            started_ns=started,
             stage_at_call=stage,
             module=module,
             qualname=qualname,

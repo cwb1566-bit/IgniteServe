@@ -13,6 +13,11 @@ def parse_speedscope_profiles(
     paths: Iterable[Path],
     *,
     file_markers: tuple[str, ...] = ("/vllm/", "torch/_dynamo", "torch/_inductor"),
+    excluded_file_markers: tuple[str, ...] = (),
+    excluded_qualnames: tuple[str, ...] = (),
+    required_stack_qualnames: tuple[str, ...] = (),
+    profile_name_markers: tuple[str, ...] = (),
+    max_profile_s: float | None = None,
 ) -> list[dict[str, Any]]:
     stats: dict[tuple[str, str, int], dict[str, Any]] = {}
     for path in paths:
@@ -24,14 +29,34 @@ def parse_speedscope_profiles(
             samples = profile.get("samples", [])
             weights = profile.get("weights") or [1.0] * len(samples)
             profile_name = str(profile.get("name", ""))
+            if profile_name_markers and not any(
+                    marker in profile_name for marker in profile_name_markers):
+                continue
+            elapsed = 0.0
             for stack, weight_value in zip(samples, weights):
                 weight = float(weight_value)
+                if max_profile_s is not None and elapsed >= max_profile_s:
+                    break
+                elapsed += weight
+                stack_names = [str(frames[int(frame_index)].get("name", ""))
+                               for frame_index in stack]
+                if required_stack_qualnames and not any(
+                        marker in name for marker in required_stack_qualnames
+                        for name in stack_names):
+                    continue
                 valid_indices = []
                 for frame_index in stack:
                     frame = frames[int(frame_index)]
                     filename = str(frame.get("file", ""))
+                    qualname = str(frame.get("name", ""))
                     if file_markers and not any(
                             marker in filename for marker in file_markers):
+                        continue
+                    if excluded_file_markers and any(
+                            marker in filename for marker in excluded_file_markers):
+                        continue
+                    if excluded_qualnames and any(
+                            marker in qualname for marker in excluded_qualnames):
                         continue
                     valid_indices.append(int(frame_index))
                 for frame_index in set(valid_indices):
