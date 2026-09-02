@@ -45,17 +45,22 @@ def generate_edge_removal_candidates(
         current_name = str(variant.get("name", "legacy"))
         if variant_name is not None and current_name != variant_name:
             continue
-        edge_details = {
-            (str(edge["source"]), str(edge["target"])): edge
-            for edge in variant.get("edges", [])
-        }
+        edge_details: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for edge_spec in variant.get("edges", []):
+            pair = (str(edge_spec["source"]), str(edge_spec["target"]))
+            edge_details.setdefault(pair, []).append(edge_spec)
         for node in variant.get("nodes", []):
             target = str(node.get("name", ""))
             for source in list(node.get("dependencies", [])):
                 edge = (str(source), target)
-                details = edge_details.get(edge, {})
-                confidence = float(details.get("confidence", 0.5))
-                if (edge in protected or bool(details.get("protected", False))
+                evidence = edge_details.get(edge, [])
+                confidence = max(
+                    (float(item.get("confidence", 0.5)) for item in evidence),
+                    default=0.5,
+                )
+                if (edge in protected
+                        or any(bool(item.get("protected", False))
+                               for item in evidence)
                         or confidence > maximum_confidence):
                     continue
                 payload = json.loads(json.dumps(contract))
@@ -101,6 +106,24 @@ def _load_result(path: Path) -> dict[str, Any]:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {}
+
+
+def _semantic_fingerprint(data: dict[str, Any]) -> Optional[str]:
+    """Ignore cache byte digests that contain case-local absolute paths."""
+    output = data.get("validation_output_fingerprint")
+    memory = data.get("memory_invariant")
+    artifacts = data.get("artifacts")
+    if output is None or memory is None or not isinstance(artifacts, dict):
+        legacy = str(data.get("fingerprint", ""))
+        return legacy or None
+    payload = {
+        "output_prefix": output,
+        "memory_invariant": memory,
+        "artifact_file_count": artifacts.get("file_count"),
+    }
+    return hashlib.sha256(json.dumps(
+        payload, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
 
 
 def _edge_exercised(data: dict[str, Any], perturbation: dict[str, Any]
@@ -176,7 +199,7 @@ def run_contract_validation(
             (case_dir / "run.log").write_text(output, encoding="utf-8")
             data = _load_result(result_path)
             startup_report = _load_result(startup_report_path)
-            fingerprint = str(data.get("fingerprint", "")) or None
+            fingerprint = _semantic_fingerprint(data)
             if baseline_fingerprint is None and fingerprint and return_code == 0:
                 baseline_fingerprint = fingerprint
             attempts.append({
@@ -184,6 +207,7 @@ def run_contract_validation(
                 "timed_out": timed_out,
                 "elapsed_s": elapsed,
                 "fingerprint": fingerprint,
+                "raw_fingerprint": data.get("fingerprint"),
                 "matches_baseline": (
                     fingerprint == baseline_fingerprint
                     if baseline_fingerprint and fingerprint else None),

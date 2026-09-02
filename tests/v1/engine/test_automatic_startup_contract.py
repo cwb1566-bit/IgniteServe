@@ -27,7 +27,10 @@ from vllm.v1.engine.startup_analysis.workflow import (
     apply_edge_validation_report,
     verify_serial_equivalence,
 )
-from vllm.v1.engine.startup_analysis.validator import run_contract_validation
+from vllm.v1.engine.startup_analysis.validator import (
+    generate_edge_removal_candidates,
+    run_contract_validation,
+)
 
 
 def _event(path: Path, *items: dict) -> None:
@@ -237,6 +240,44 @@ def test_finalize_and_execute_generated_contract(tmp_path: Path) -> None:
     assert engine.events == ["prepare", "produce", "done"]
 
 
+def test_generated_execution_flushes_stage_trace(
+        tmp_path: Path, monkeypatch) -> None:
+    from vllm.v1.engine.startup_analysis import recorder as recorder_module
+
+    source = tmp_path / "engine.py"
+    discovery = tmp_path / "startup_discovery.json"
+    _synthetic_source(source)
+    _discovery(discovery)
+    outputs = StartupActionExtractor(
+        source, discovery, class_name="Engine", method_name="initialize",
+    ).generate(tmp_path / "analysis")
+    _mark_validated(outputs["contract"])
+    final = finalize_startup_contract(
+        outputs["contract"], outputs["adapter"], outputs["review"],
+        tmp_path / "final")
+
+    trace_dir = tmp_path / "trace"
+    monkeypatch.setenv("VLLM_STARTUP_OFFLINE_ANALYSIS_DIR", str(trace_dir))
+    monkeypatch.setenv("VLLM_STARTUP_ANALYSIS_AUDIT", "0")
+    monkeypatch.setenv("VLLM_STARTUP_ANALYSIS_NVTX", "0")
+    monkeypatch.setattr(recorder_module, "_RECORDER", None)
+
+    engine = _SyntheticEngine()
+    plan = prepare_generated_startup(
+        engine, _config(), {"input.config": SimpleNamespace(value="done")},
+        contract_path=final["contract"], source_path=source)
+    plan.execute()
+
+    trace = next(trace_dir.glob("startup_trace_*.jsonl"))
+    events = [json.loads(line) for line in trace.read_text(
+        encoding="utf-8").splitlines()]
+    completed = {
+        event.get("name") for event in events
+        if event.get("event") == "stage_end"
+    }
+    assert completed == {"prepare_3", "produce_4", "consume_5"}
+
+
 def test_finalize_requires_generated_adapter_serial_evidence(
         tmp_path: Path) -> None:
     source = tmp_path / "engine.py"
@@ -375,6 +416,31 @@ def test_apply_edge_validation_removes_only_safe_edges(tmp_path: Path) -> None:
     assert result["validation"]["edge_perturbations"]["status"] == "complete"
 
 
+def test_edge_candidate_keeps_pair_with_protected_evidence(
+        tmp_path: Path) -> None:
+    contract = {
+        "schema": "igniteserve-startup-contract-v2",
+        "variants": [{
+            "name": "D2",
+            "nodes": [
+                {"name": "a", "dependencies": []},
+                {"name": "b", "dependencies": ["a"]},
+            ],
+            "edges": [
+                {"source": "a", "target": "b", "kind": "static-use-def",
+                 "confidence": 0.85, "protected": True},
+                {"source": "a", "target": "b", "kind": "original-order",
+                 "confidence": 0.5, "protected": False},
+            ],
+        }],
+    }
+    contract_path = tmp_path / "contract.json"
+    contract_path.write_text(json.dumps(contract), encoding="utf-8")
+    candidates = generate_edge_removal_candidates(
+        contract_path, tmp_path / "candidates")
+    assert candidates == []
+
+
 def test_edge_validation_reads_generated_stage_report(tmp_path: Path) -> None:
     candidate = tmp_path / "candidate.json"
     candidate.write_text(json.dumps({
@@ -401,3 +467,35 @@ def test_edge_validation_reads_generated_stage_report(tmp_path: Path) -> None:
     assert result["classification"] == "safe_remove"
     assert result["attempts"][0]["edge_exercised"] is True
     assert result["attempts"][0]["startup_report"] is not None
+
+
+def test_edge_validation_ignores_case_local_artifact_digest(
+        tmp_path: Path) -> None:
+    candidate = tmp_path / "candidate.json"
+    candidate.write_text(json.dumps({
+        "perturbation": {
+            "variant": "D2",
+            "source": "a",
+            "target": "b",
+        },
+    }), encoding="utf-8")
+    script = (
+        "import json, os; from pathlib import Path; "
+        "Path(os.environ['VLLM_STARTUP_VALIDATION_RESULT']).write_text("
+        "json.dumps({'fingerprint':'case-local',"
+        "'validation_output_fingerprint':'same-output',"
+        "'memory_invariant':{'blocks':4},"
+        "'artifacts':{'file_count':3,'digest':'different'}})); "
+        "Path(os.environ['VLLM_STARTUP_GENERATED_REPORT']).write_text("
+        "json.dumps({'stages':{"
+        "'a':{'started_at':0.0,'finished_at':2.0},"
+        "'b':{'started_at':1.0,'finished_at':3.0}}}))"
+    )
+    report = run_contract_validation(
+        [sys.executable, "-c", script], [candidate], tmp_path / "runs",
+        timeout_s=10.0, repeats=2, baseline_elapsed_s=[10.0],
+        maximum_regression_fraction=0.05)
+    result = report["results"][0]
+    assert result["classification"] == "safe_remove"
+    assert all(attempt["matches_baseline"] is True
+               for attempt in result["attempts"])

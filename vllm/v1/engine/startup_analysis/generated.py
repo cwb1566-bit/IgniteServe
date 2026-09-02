@@ -126,23 +126,31 @@ class GeneratedStartupPlan:
 
     def execute(self) -> dict[str, Any]:
         started = time.perf_counter()
-        results = self.executor.run(self.dag, self.context)
-        report_path = os.environ.get("VLLM_STARTUP_GENERATED_REPORT")
-        if report_path:
-            output = Path(report_path)
-            output.parent.mkdir(parents=True, exist_ok=True)
-            output.write_text(json.dumps({
-                "schema": "igniteserve-generated-startup-run-v1",
-                "contract": str(self.contract_path),
-                "adapter": str(self.adapter_path),
-                "variant": self.variant["name"],
-                "elapsed_s": time.perf_counter() - started,
-                "facts": self.facts,
-                "stages": {name: result.__dict__
-                           for name, result in results.items()},
-                "state_keys": sorted(self.context.snapshot()),
-            }, indent=2, sort_keys=True, default=str), encoding="utf-8")
-        return results
+        from vllm.v1.engine.startup_analysis.recorder import (
+            get_startup_recorder,
+        )
+        recorder = get_startup_recorder()
+        try:
+            results = self.executor.run(self.dag, self.context)
+            report_path = os.environ.get("VLLM_STARTUP_GENERATED_REPORT")
+            if report_path:
+                output = Path(report_path)
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text(json.dumps({
+                    "schema": "igniteserve-generated-startup-run-v1",
+                    "contract": str(self.contract_path),
+                    "adapter": str(self.adapter_path),
+                    "variant": self.variant["name"],
+                    "elapsed_s": time.perf_counter() - started,
+                    "facts": self.facts,
+                    "stages": {name: result.__dict__
+                               for name, result in results.items()},
+                    "state_keys": sorted(self.context.snapshot()),
+                }, indent=2, sort_keys=True, default=str), encoding="utf-8")
+            return results
+        finally:
+            if recorder is not None:
+                recorder.flush()
 
 
 def prepare_generated_startup(
