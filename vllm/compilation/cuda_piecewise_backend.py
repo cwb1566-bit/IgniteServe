@@ -46,6 +46,29 @@ class ConcreteSizeEntry:
     concurrent_capture_gate: Optional[Any] = None
     concurrent_capture_pool: Optional[Any] = None
     concurrent_capture_stream: Optional[torch.cuda.Stream] = None
+    warmup_signature: Optional[Any] = None
+    concurrent_signature: Optional[Any] = None
+    replay_verified: bool = False
+
+
+def _input_signature(args: tuple[Any, ...]) -> tuple:
+    """Compare layouts and storage alias groups without reading tensor data."""
+    storages = {}
+    def describe(value):
+        if isinstance(value, torch.Tensor):
+            storage = (str(value.device), value.untyped_storage().data_ptr())
+            alias = storages.setdefault(storage, len(storages))
+            return ('tensor', tuple(value.shape), tuple(value.stride()),
+                    str(value.dtype), str(value.device), str(value.layout),
+                    value.storage_offset(), alias)
+        if isinstance(value, (tuple, list)):
+            return (type(value).__name__, tuple(describe(v) for v in value))
+        if isinstance(value, dict):
+            return ('dict', tuple((k, describe(v)) for k, v in value.items()))
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return (type(value).__name__, value)
+        raise TypeError(f'Unsupported concurrent capture input: {type(value)}')
+    return tuple(describe(arg) for arg in args)
 
 
 class CUDAPiecewiseBackend:
@@ -117,6 +140,7 @@ class CUDAPiecewiseBackend:
                 or entry.cudagraph is not None
                 or entry.concurrent_capture_in_progress
                 or entry.runnable is None
+                or entry.warmup_signature is None
                 or (entry.need_to_compile and not entry.compiled)
                 or entry.num_finished_warmup <
                 self.compilation_config.cudagraph_num_of_warmups):
@@ -158,6 +182,8 @@ class CUDAPiecewiseBackend:
         entry.concurrent_capture_gate = None
         entry.concurrent_capture_pool = None
         entry.concurrent_capture_stream = None
+        entry.concurrent_signature = None
+        entry.replay_verified = False
 
     def _run(self, mode: str, runnable: Callable, args: tuple[Any, ...]) -> Any:
         label = f"piece.{self.piecewise_compile_index}.{mode}"
@@ -260,6 +286,7 @@ class CUDAPiecewiseBackend:
         if not entry.use_cudagraph or skip_cuda_graphs:
             output = self._run("eager", entry.runnable, args)
             if entry.use_cudagraph and forward_context.cudagraph_runtime_warmup:
+                entry.warmup_signature = _input_signature(args)
                 # This target shape just completed a real eager execution.
                 # Count it as the required warmup so the idle controller can
                 # perform capture without repeating dummy model forwards.
@@ -319,6 +346,13 @@ class CUDAPiecewiseBackend:
                 x.data_ptr() for x in args if isinstance(x, torch.Tensor)
             ]
             entry.input_addresses = input_addresses
+            if forward_context.concurrent_cudagraph_capture:
+                signature = _input_signature(args)
+                if signature != entry.warmup_signature:
+                    raise RuntimeError(
+                        f'Warmup/capture input contract mismatch: '
+                        f'piece={self.piecewise_compile_index} shape={runtime_shape}')
+                entry.concurrent_signature = signature
             cudagraph = torch.cuda.CUDAGraph()
             piece_capture_started = time.perf_counter()
 
@@ -390,6 +424,21 @@ class CUDAPiecewiseBackend:
             # the weak ref of the output, so that pytorch can correctly
             # manage the memory during cuda graph capture
             return output
+
+        if entry.concurrent_signature is not None:
+            signature = _input_signature(args)
+            addresses = [x.data_ptr() for x in args if isinstance(x, torch.Tensor)]
+            if signature != entry.concurrent_signature or addresses != entry.input_addresses:
+                # A fallback piece may allocate new outputs. Its suffix must
+                # not replay graphs bound to the old intermediate addresses.
+                forward_context.skip_cuda_graphs = True
+                logger.warning('Concurrent graph input mismatch; using eager: piece=%d shape=%d',
+                               self.piecewise_compile_index, runtime_shape)
+                return self._run('concurrent-contract-fallback', entry.runnable, args)
+            if not entry.replay_verified:
+                entry.replay_verified = True
+                logger.info('Concurrent graph replay contract verified: piece=%d shape=%d',
+                            self.piecewise_compile_index, runtime_shape)
 
         if self.is_debugging_mode:
             # check if the input addresses are the same

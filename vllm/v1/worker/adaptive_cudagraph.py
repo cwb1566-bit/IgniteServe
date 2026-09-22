@@ -84,9 +84,8 @@ class CaptureMaintenancePlan:
 class AdaptiveCUDAGraphController:
     """Owns adaptive CUDA graph state and capture authorization.
 
-    The first implementation deliberately captures decode-only shapes at a
-    true idle point. Prefill and mixed batches are still observed so their
-    cost-aware execution policies can be added without conflating semantics.
+    Idle capture remains decode-only. A supported concurrent piecewise runner
+    explicitly enables prefill and mixed triggers after its capability checks.
     """
 
     def __init__(
@@ -94,10 +93,10 @@ class AdaptiveCUDAGraphController:
         enabled: Optional[bool] = None,
         min_hits: Optional[int] = None,
     ) -> None:
-        self.enabled = (_env_flag("VLLM_ENABLE_ADAPTIVE_CUDAGRAPH")
+        self.enabled = (_env_flag("VLLM_ENABLE_ADAPTIVE_CUDAGRAPH", True)
                         if enabled is None else enabled)
         self.min_hits = (int(
-            os.environ.get("VLLM_ADAPTIVE_CUDAGRAPH_MIN_HITS", "10"))
+            os.environ.get("VLLM_ADAPTIVE_CUDAGRAPH_MIN_HITS", "1"))
                          if min_hits is None else min_hits)
         self.extra_warmups = int(
             os.environ.get("VLLM_ADAPTIVE_CUDAGRAPH_EXTRA_WARMUPS", "0"))
@@ -132,10 +131,22 @@ class AdaptiveCUDAGraphController:
         self._fixed_capture_history_ms: list[float] = []
         self._maintenance_plan_rows: list[dict[str, object]] = []
         self._planned_capture_shape: Optional[int] = None
+        self.capture_phases = frozenset({"decode"})
 
-    @staticmethod
-    def _eligible_phase(phase: str) -> bool:
-        return phase == "decode"
+    def _eligible_phase(self, phase: str) -> bool:
+        return phase in self.capture_phases
+
+    def settle_shared_capture(self, phase: str, shape: int,
+                              error: Optional[BaseException] = None) -> None:
+        """Resolve other phase records sharing one piecewise shape capture."""
+        with self._lock:
+            for (other_phase, other_shape), record in self._records.items():
+                if other_shape != shape or other_phase == phase:
+                    continue
+                if record.state in (GraphState.OBSERVED, GraphState.WARMING,
+                                    GraphState.QUEUED, GraphState.CAPTURING):
+                    record.state = GraphState.READY if error is None else GraphState.FAILED
+                    record.failure = None if error is None else repr(error)
 
     def reset(self) -> None:
         with self._lock:

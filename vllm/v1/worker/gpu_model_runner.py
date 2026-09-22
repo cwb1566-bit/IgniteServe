@@ -459,6 +459,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         self.concurrent_piecewise_cudagraph_manager = (
             ConcurrentPiecewiseCUDAGraphCaptureManager(self))
+        self.adaptive_cudagraph_controller.capture_phases = frozenset(
+            {"decode", "mixed", "prefill"}
+            if self.concurrent_piecewise_cudagraph_manager.enabled
+            else {"decode"})
         self.enable_dynamic_cuda_graph_capture = (
             not self.enable_adaptive_cudagraph and os.environ.get(
                 "VLLM_DISABLE_DYNAMIC_CUDA_GRAPH_CAPTURE", "").lower() not in
@@ -1455,7 +1459,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             no_live_requests = (not self.requests
                                 and not self.input_batch.req_ids)
             if self.enable_adaptive_cudagraph:
-                if no_live_requests:
+                if (no_live_requests
+                        and not self.concurrent_piecewise_cudagraph_manager.enabled):
                     self.adaptive_cudagraph_controller.capture_pending(self)
             elif self.enable_dynamic_cuda_graph_capture:
                 if no_live_requests:
@@ -1764,6 +1769,32 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         else:
             hidden_states = model_output
             aux_hidden_states = None
+        if (os.environ.get("VLLM_MIXED_CAPTURE_SHADOW_VALIDATE") == "1"
+                and graph_execution
+                and num_input_tokens in self.dynamic_cuda_graph_captured):
+            # Diagnostic only: replay and compiled-eager see the same tokens,
+            # positions, attention metadata and KV slots in this scheduler step.
+            # Restricted to stateless Llama attention; not a performance run.
+            if (self.model_config.hf_config.model_type != "llama"
+                    or self.full_cuda_graph or self.use_aux_hidden_state_outputs
+                    or self.parallel_config.tensor_parallel_size != 1
+                    or self.parallel_config.pipeline_parallel_size != 1):
+                raise RuntimeError("Shadow validation supports single-GPU Llama only")
+            hidden_states = hidden_states.clone()
+            with set_forward_context(attn_metadata, self.vllm_config,
+                                     num_tokens=num_input_tokens,
+                                     skip_cuda_graphs=True):
+                reference = self.model(input_ids=input_ids, positions=positions,
+                                       intermediate_tensors=intermediate_tensors,
+                                       inputs_embeds=inputs_embeds)
+            actual_logits = self.model.compute_logits(hidden_states[logits_indices], None)
+            reference_logits = self.model.compute_logits(reference[logits_indices], None)
+            torch.testing.assert_close(actual_logits, reference_logits, rtol=1e-3, atol=1e-3)
+            if not torch.equal(actual_logits.argmax(-1), reference_logits.argmax(-1)):
+                raise RuntimeError("Same-step graph/eager greedy token mismatch")
+            logger.info("Mixed capture shadow verified: phase=%s shape=%d max_logit_error=%g",
+                        phase, num_input_tokens,
+                        (actual_logits - reference_logits).abs().max().item())
         # Broadcast PP output for external_launcher (torchrun)
         # to make sure we are synced across pp ranks
         # TODO: Support overlapping mirco-batches
@@ -2550,8 +2581,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         Piecewise attention remains eager and receives ``None`` metadata in
         this formal-capture pass, so it neither reads nor mutates the live KV
         cache. The persistent runner input buffers intentionally keep the same
-        addresses that normal replay will use. CUDA kernels are recorded on
-        the manager's private stream and execute once while CUDA records them.
+        addresses that normal replay will use. Captured kernels are recorded
+        on the manager's private stream, not executed during stream capture.
         Their outputs are discarded; foreground requests remain on eager until
         the complete piece chain is atomically published.
         """
@@ -3030,12 +3061,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     warmup_threshold = int(
                         os.environ.get(
                             "VLLM_CUDA_GRAPH_PRECAPTURE_MIN_HITS", "10"))
-                    selected_records = [
-                        record for record in ranked_records
-                        if record['hit_count'] > warmup_threshold
-                    ]
+                    # Compute the 99% prefix before applying eligibility or
+                    # minimum-hit filters; do not refill the removed tail.
+                    all_ranked_records = sorted(
+                        sizes_with_hits,
+                        key=lambda x: (x['hit_count'], x['capture_priority']),
+                        reverse=True)
+                    total_hits = sum(r['hit_count'] for r in all_ranked_records)
+                    cumulative_hits = 0
+                    selected_records = []
+                    for record in all_ranked_records:
+                        if cumulative_hits * 100 >= total_hits * 99:
+                            break
+                        cumulative_hits += record['hit_count']
+                        if (record['hit_count'] >= warmup_threshold
+                                and record['batch_size'] in capturable_sizes):
+                            selected_records.append(record)
                     selection_policy = (
-                        f"offline-hit-threshold>{warmup_threshold}")
+                        f"offline-top99-then-hit-threshold>={warmup_threshold}")
                 else:
                     selected_records = ranked_records[:top_k]
                     selection_policy = f"top-k={top_k}"
@@ -3053,6 +3096,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         int(value.strip())
                         for value in mandatory_text.split(',') if value.strip()
                     }
+                    mandatory_sizes.update({1, 2})
                     mandatory_sizes.intersection_update(capturable_sizes)
                     extracted_sizes.extend(mandatory_sizes)
                     extracted_sizes = list(set(extracted_sizes))

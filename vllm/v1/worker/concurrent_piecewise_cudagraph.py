@@ -38,6 +38,7 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 @dataclass(frozen=True)
 class _CaptureRequest:
+    phase: str
     shape: int
     warmup_ready: torch.cuda.Event
     queued_at: float
@@ -61,7 +62,7 @@ class ConcurrentPiecewiseCUDAGraphCaptureManager:
                 "Experimental concurrent piecewise CUDA graph capture is "
                 "enabled for single-GPU inference.")
         elif _env_flag(
-                "VLLM_ENABLE_CONCURRENT_PIECEWISE_CUDAGRAPH_CAPTURE"):
+                "VLLM_ENABLE_CONCURRENT_PIECEWISE_CUDAGRAPH_CAPTURE", True):
             logger.warning(
                 "Concurrent piecewise CUDA graph capture requested but "
                 "disabled: %s", self.disabled_reason)
@@ -70,7 +71,7 @@ class ConcurrentPiecewiseCUDAGraphCaptureManager:
     def _check_support(
             runner: "GPUModelRunner") -> tuple[bool, str]:
         if not _env_flag(
-                "VLLM_ENABLE_CONCURRENT_PIECEWISE_CUDAGRAPH_CAPTURE"):
+                "VLLM_ENABLE_CONCURRENT_PIECEWISE_CUDAGRAPH_CAPTURE", True):
             return False, "feature flag is off"
         if not getattr(runner, "enable_adaptive_cudagraph", False):
             return False, "adaptive CUDA graph controller is disabled"
@@ -121,7 +122,7 @@ class ConcurrentPiecewiseCUDAGraphCaptureManager:
 
     def enqueue_after_warmup(self, phase: str, shape: int) -> bool:
         """Claim a queued adaptive shape and record its warmup completion."""
-        if not self.enabled or phase != "decode":
+        if not self.enabled or phase not in {"decode", "mixed", "prefill"}:
             return False
         with self._lock:
             if self._stopping or shape in self._scheduled_shapes:
@@ -134,11 +135,11 @@ class ConcurrentPiecewiseCUDAGraphCaptureManager:
         warmup_ready = torch.cuda.Event()
         warmup_ready.record(torch.cuda.current_stream(self.runner.device))
         self._ensure_thread()
-        self._queue.put(_CaptureRequest(shape, warmup_ready,
+        self._queue.put(_CaptureRequest(phase, shape, warmup_ready,
                                         time.perf_counter()))
         logger.info(
             "Concurrent piecewise CUDA graph capture queued after real "
-            "warmup: shape=%d", shape)
+            "warmup: phase=%s shape=%d", phase, shape)
         return True
 
     def _piecewise_backends(self) -> list[Any]:
@@ -193,7 +194,7 @@ class ConcurrentPiecewiseCUDAGraphCaptureManager:
             raise
         return backends
 
-    def _publish(self, shape: int, backends: list[Any],
+    def _publish(self, phase: str, shape: int, backends: list[Any],
                  capture_gate: threading.Event, elapsed: float,
                  context_enter_seconds: float, body_seconds: float,
                  context_exit_seconds: float) -> None:
@@ -217,7 +218,7 @@ class ConcurrentPiecewiseCUDAGraphCaptureManager:
                 raise RuntimeError(
                     f"failed to publish piece {backend.piecewise_compile_index}")
         self.runner.adaptive_cudagraph_controller.mark_capture_ready(
-            "decode",
+            phase,
             shape,
             elapsed,
             context_enter_seconds=context_enter_seconds,
@@ -225,12 +226,14 @@ class ConcurrentPiecewiseCUDAGraphCaptureManager:
             context_exit_seconds=context_exit_seconds,
             captured_pieces=len(backends),
         )
+        self.runner.adaptive_cudagraph_controller.settle_shared_capture(
+            phase, shape)
 
     def _capture_one(self, request: _CaptureRequest) -> None:
         shape = request.shape
         started = time.perf_counter()
         self.runner.adaptive_cudagraph_controller.mark_capture_started(
-            "decode", shape)
+            request.phase, shape)
         backends: list[Any] = []
         try:
             runtime_init_started = time.perf_counter()
@@ -252,6 +255,7 @@ class ConcurrentPiecewiseCUDAGraphCaptureManager:
             finished = time.perf_counter()
             self._graph_pools[shape] = graph_pool
             self._publish(
+                request.phase,
                 shape,
                 backends,
                 capture_gate,
@@ -262,11 +266,11 @@ class ConcurrentPiecewiseCUDAGraphCaptureManager:
             )
             logger.info(
                 "[TIMER] Concurrent Piecewise CUDA Graph Capture: "
-                "shape=%d total=%.6fs queue_delay=%.6fs "
+                "phase=%s shape=%d total=%.6fs queue_delay=%.6fs "
                 "runtime_init=%.6fs warmup_wait=%.6fs "
                 "context_enter=%.6fs body=%.6fs "
                 "context_exit=%.6fs pieces=%d",
-                shape,
+                request.phase, shape,
                 finished - started,
                 started - request.queued_at,
                 runtime_init_finished - runtime_init_started,
@@ -281,7 +285,9 @@ class ConcurrentPiecewiseCUDAGraphCaptureManager:
                 backend.abort_concurrent_capture(shape)
             self._graph_pools.pop(shape, None)
             self.runner.adaptive_cudagraph_controller.mark_capture_failed(
-                "decode", shape, error)
+                request.phase, shape, error)
+            self.runner.adaptive_cudagraph_controller.settle_shared_capture(
+                request.phase, shape, error)
             logger.exception(
                 "Concurrent piecewise CUDA graph capture failed; shape %d "
                 "will remain eager", shape)
