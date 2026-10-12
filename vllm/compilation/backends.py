@@ -1104,18 +1104,53 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
             })
         if self.fake_run_map_filepath.exists():
             try:
-                return self._normalize_reuse_map(self._load_fake_run_metadata())
+                started = time.perf_counter()
+                reuse_map = self._normalize_reuse_map(
+                    self._load_fake_run_metadata())
+                logger.info(
+                    'Offline metadata timing reuse_map_load_s=%.6f '
+                    'graphs=%s canonical=%s path=%s',
+                    time.perf_counter() - started,
+                    len(reuse_map),
+                    len(set(reuse_map.values())),
+                    self.fake_run_map_filepath,
+                )
+                return reuse_map
             except Exception as exc:
                 logger.warning('Failed to load fake-run reuse metadata: %s', exc)
-        return self._normalize_reuse_map(self._build_structural_reuse_map())
+        started = time.perf_counter()
+        reuse_map = self._normalize_reuse_map(
+            self._build_structural_reuse_map())
+        self.fake_run_map_filepath.parent.mkdir(parents=True, exist_ok=True)
+        with self.fake_run_map_filepath.open('w', encoding='utf-8') as f:
+            json.dump(reuse_map, f, indent=2)
+        logger.info(
+            'Offline metadata timing reuse_map_build_s=%.6f graphs=%s '
+            'canonical=%s path=%s',
+            time.perf_counter() - started,
+            len(reuse_map),
+            len(set(reuse_map.values())),
+            self.fake_run_map_filepath,
+        )
+        return reuse_map
 
     def _try_load_cached_metadata(self) -> Optional[Dict[str, SubmoduleInputMetadata]]:
+        started = time.perf_counter()
+        loaded_count = 0
         try:
             metadata_list = self.serializer.load_all_metadata()
             if metadata_list:
+                loaded_count = len(metadata_list)
                 return {meta.submod_name: meta for meta in metadata_list}
         except Exception as exc:
             logger.warning('Failed to load cached metadata: %s', exc)
+        finally:
+            logger.info(
+                'Offline metadata timing load_s=%.6f loaded=%s path=%s',
+                time.perf_counter() - started,
+                loaded_count,
+                self.serializer.metadata_file,
+            )
         return None
 
     def run(self, *args):
@@ -1136,15 +1171,33 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
 
         if self.cached_metadata is not None:
             logger.info('Restoring submodule inputs from cache...')
+            restore_started = time.perf_counter()
             self.serializer.seed_symbol_table_from_args(tuple(fake_args))
             self._restore_from_cache()
+            logger.info(
+                'Offline metadata timing restore_s=%.6f restored=%s',
+                time.perf_counter() - restore_started,
+                len(self.vllm_backend.meta_data),
+            )
             return None
 
         logger.info('Running fake mode inference...')
+        fake_started = time.perf_counter()
         with self.fake_mode, enable_python_dispatcher():
             result = super().run(*fake_args)
+        logger.info(
+            'Offline metadata timing fake_inference_s=%.6f captured=%s',
+            time.perf_counter() - fake_started,
+            len(self.vllm_backend.meta_data),
+        )
 
+        save_started = time.perf_counter()
         self._save_metadata()
+        logger.info(
+            'Offline metadata timing save_s=%.6f path=%s',
+            time.perf_counter() - save_started,
+            self.serializer.metadata_file,
+        )
         return result
 
     def _load_fake_run_metadata(self) -> dict[str, int]:
