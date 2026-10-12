@@ -9,6 +9,11 @@ from collections import deque
 from typing import List, Dict, Optional
 from dataclasses import dataclass, field
 from vllm.compilation.startup_resources import resource_dir
+from vllm.logger import init_logger
+from vllm.v1.worker.cudagraph_profile import validate_cudagraph_profile_manifest
+
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -103,6 +108,7 @@ class HotspotAnalyzer:
             self.output_dir = Path(output_dir)
             self.output_dir.mkdir(parents=True, exist_ok=True)
             self.exporter_id = f"{os.getpid()}-{uuid.uuid4().hex}"
+            self.profile_manifest = None
 
             self.has_exported_final = False  # 避免压测结束后重复疯狂落盘
 
@@ -195,6 +201,21 @@ class HotspotAnalyzer:
         """Export this engine generation and atomically merge all generations."""
         if not self.stats:
             return
+
+        expected_manifest = self.profile_manifest
+        if expected_manifest is not None:
+            compatible, reason = validate_cudagraph_profile_manifest(
+                self.output_dir, expected_manifest)
+            if not compatible:
+                warning = (str(self.output_dir), reason)
+                if getattr(self, '_profile_export_warning', None) != warning:
+                    logger.warning(
+                        "Not exporting CUDA graph hotspots into incompatible "
+                        "directory %s: %s; use a configuration-specific "
+                        "VLLM_CUDA_GRAPH_HOTSPOT_DIR.", self.output_dir, reason)
+                    self._profile_export_warning = warning
+                return
+            self._profile_export_warning = None
 
         header = [
             'batch_size', 'hit_count', 'total_tokens', 'frequency',

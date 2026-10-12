@@ -6,6 +6,7 @@ import gc
 import time
 import weakref
 from contextlib import contextmanager
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 import numpy as np
@@ -376,6 +377,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              self.cudagraph_profile_manifest,
              allow_overwrite=allow_profile_overwrite,
          )
+        HotspotAnalyzer.output_dir = Path(hotspot_dir)
+        HotspotAnalyzer.profile_manifest = self.cudagraph_profile_manifest
         if self.cudagraph_profile_compatible:
             logger.info("CUDA graph profile manifest %s: %s", hotspot_dir,
                         profile_reason)

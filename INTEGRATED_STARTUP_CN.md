@@ -81,6 +81,66 @@ mixed捕获生命周期与输入契约、热点跨generation导出和图匹配�
 覆盖EngineCore原有模式转发、discover插桩及失败flush、generated预检回退、
 action失败不重启、deferred分布式入口，以及合并源码的无seed候选提取。
 
-本次使用修改版 `torch 2.7.0+ignite.concurrentcapture` 运行CPU/合成测试，
-未启动真实模型或重跑GPU性能矩阵。两个原分支既有GPU结果不能代替本分支
-的联合真实模型验收。
+合并时使用修改版 `torch 2.7.0+ignite.concurrentcapture` 运行CPU/合成测试，
+当时未启动真实模型。2026-10-12随后完成了本分支的Qwen3-4B单卡API冒烟，
+不等同于重跑完整GPU性能矩阵，也不覆盖旧自动合同的重新审核与验证。
+
+## 本地构建产物准备
+
+新Git工作目录不包含已编译的 `.so`、构建时生成的FlashAttention Python包
+及 `_version.py`。仅设置 `PYTHONPATH` 不能代替构建；缺少FlashAttention
+会在模型类检查时触发 `No module named vllm.vllm_flash_attn.layers`。
+
+在本服务器可复用可信、相同原生源码的已有构建：
+
+```bash
+conda activate vllm_concurrent_capture
+cd /data/wenbiao/igniteserve_integrated_startup
+python -m pip install --target "$PWD/.deps/build-tools" setuptools-scm
+python tools/prepare_local_runtime.py \
+  --from-checkout /home/wenbiao/vllm_my_A100
+```
+
+准备工具逐文件检查 `csrc/`、`cmake/` 和 `CMakeLists.txt`，补齐11个本地
+产物并生成本工作目录的版本文件；遇到原生源码差异、缺失产物或现有产物
+不一致时拒绝覆盖。版本生成依赖只装入本目录，不修改共享Conda环境。
+这只是本地开发辅助工具，不替代发布wheel的正式构建；CUDA和ABI兼容仍
+需要真实模型测试确认。
+
+## 单卡手动启动
+
+```bash
+conda activate vllm_concurrent_capture
+cd /data/wenbiao/igniteserve_integrated_startup
+PYTHONPATH="$PWD" CUDA_VISIBLE_DEVICES=0 VLLM_USE_V1=1 \
+VLLM_ENABLE_STARTUP_OPTIMIZATIONS=1 VLLM_STARTUP_DAG_MODE=execute \
+VLLM_ENABLE_SUBPROCESS_COMPILE=1 VLLM_ENABLE_ADAPTIVE_CUDAGRAPH=1 \
+python -m vllm.entrypoints.openai.api_server \
+  --model /data/wenbiao/models/Qwen3-4B --max-model-len 2048 --port 8000
+```
+
+上述命令执行人工DAG，不是 `execute-generated`。热点表缺失或不兼容时
+预捕获完整注册集合。建议额外指定独立的 `VLLM_CUDA_GRAPH_HOTSPOT_DIR`；
+模型、调度参数或软件版本改变后使用新目录并重新采集，不应改写旧manifest
+绕过检查。导出端现在也校验manifest，拒绝将新统计写入不兼容目录。
+
+## 真实模型冒烟记录
+
+产物：`A100_0606/integrated_api_smoke_20261012/`，保留每次尝试的环境、
+服务器日志、请求响应、结果和telemetry。使用GPU0，未停止其他GPU的任务。
+
+* 修复构建产物缺失后，健康检查、模型列表和实际生成API通过。
+* 日志确认人工DAG及Full-FX子进程编译路径，首次37个子图物化为4次编译、
+  33次结构复用。后续启动命中缓存，不能把其时间称为无缓存冷启动时间。
+* `attempt06` 从真实短测采集的热点表选中 `[1,2]`，按需捕获8个新shape：
+  prefill为8/24，mixed为96/48/144/184，decode为16/4。
+  每个shape捕获37个piece；观察到prefill和decode动态图replay。
+* 冒烟仅确认请求完成、非空生成及捕获/回放事件，不构成与原生vLLM的
+  数值等价证明或长期延迟稳定性结论。
+* 修复后 `attempt07` 的16次生成均成功，预捕获 `[1,2,16]` 后完成7个
+  新shape的后台捕获，覆盖prefill/mixed/decode。`attempt08` 重测上述
+  最简命令，3次生成通过；不兼容热点表的文件hash在运行前后保持不变。
+  所属进程组和8000端口均释放，GPU0显存回到0 MiB。
+* 73项CPU/合成测试通过，包括构建产物准备、旧热点表写入保护及合并功能。
+* 退出时仍有上游NCCL显式销毁提示；所属进程退出后另行核验GPU0显存释放，
+  不以退出码代替资源检查。
