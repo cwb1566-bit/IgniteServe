@@ -5,8 +5,6 @@ import json
 from pathlib import Path
 from typing import Any, Optional
 
-import torch.fx as fx
-
 from vllm.compilation.startup_resources import enabled_by_master
 
 
@@ -27,7 +25,7 @@ def canonical_model_identity(model_path: str) -> str:
         return model_path
     resolved = path.resolve()
     config_path = resolved / "config.json"
-    identity: dict[str, Any] = {"basename": resolved.name}
+    identity: dict[str, Any] = {}
     if config_path.exists():
         try:
             config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -92,30 +90,6 @@ def normalized_model_paths(vllm_config):
     yield normalized_config
 
 
-def _normalize_fx_target(target: Any) -> str:
-    import re
-    return re.sub(r"\d+", "#", str(target))
-
-
-def graph_semantic_key(graph: fx.GraphModule,
-                       runtime_shape: Optional[int],
-                       compiler_name: str) -> str:
-    nodes = []
-    for node in graph.graph.nodes:
-        nodes.append({
-            "op": node.op,
-            "target": _normalize_fx_target(node.target),
-            "args": _normalize_fx_target(node.args),
-            "kwargs": _normalize_fx_target(node.kwargs),
-        })
-    payload = {
-        "runtime_shape": runtime_shape,
-        "compiler": compiler_name,
-        "nodes": nodes,
-    }
-    return _hash_json(payload)
-
-
 class GlobalSubgraphCache:
     """Small JSON index from semantic subgraph keys to compiler handles."""
 
@@ -127,6 +101,7 @@ class GlobalSubgraphCache:
             compile_root = local.parent
         self.path = compile_root / "global_subgraph_cache.json"
         self.prefix = prefix
+        self.partition = local.relative_to(compile_root).as_posix()
         self.data: dict[str, Any] = self._load()
 
     def _load(self) -> dict[str, Any]:
@@ -137,25 +112,27 @@ class GlobalSubgraphCache:
         except Exception:
             return {}
 
-    def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = self.path.with_suffix(".tmp")
-        tmp_path.write_text(json.dumps(self.data, indent=2, sort_keys=True), encoding="utf-8")
-        os.replace(tmp_path, self.path)
-
     def lookup(self, key: str) -> Optional[Any]:
-        entry = self.data.get(key)
+        if key is None:
+            return None
+        entry = self.data.get(f"{self.partition}:{self.prefix}:{key}")
         if isinstance(entry, dict):
-            return entry.get("handle")
+            handle = entry.get("handle")
+            return tuple(handle) if isinstance(handle, (tuple, list)) else None
         return None
 
     def register(self, key: str, handle: Any, source_cache_dir: str,
                  graph_index: int, runtime_shape: Optional[int]) -> None:
-        self.data[key] = {
-            "handle": handle,
-            "source_cache_dir": source_cache_dir,
-            "graph_index": graph_index,
-            "runtime_shape": runtime_shape,
-            "prefix": self.prefix,
-        }
-        self.save()
+        if key is None:
+            return
+        from .startup_assets import locked, write_json
+        with locked(self.path):
+            self.data = self._load()
+            self.data[f"{self.partition}:{self.prefix}:{key}"] = {
+                "handle": handle,
+                "source_cache_dir": source_cache_dir,
+                "graph_index": graph_index,
+                "runtime_shape": runtime_shape,
+                "prefix": self.prefix,
+            }
+            write_json(self.path, self.data)

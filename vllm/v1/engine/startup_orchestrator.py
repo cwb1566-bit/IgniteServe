@@ -359,53 +359,43 @@ class ResourceAwareDAGExecutor:
 
 
 class StartupCostHistory:
-    """Small persistent median model keyed by startup state signature."""
+    """Per-state median costs; history is a hint, never a correctness guard."""
 
     def __init__(self, path: Path, max_samples: int = 9) -> None:
         self.path = path
         self.max_samples = max(1, max_samples)
 
-    def _read(self) -> dict[str, Any]:
-        if not self.path.exists():
-            return {"version": 1, "states": {}}
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-        except Exception:
-            return {"version": 1, "states": {}}
-        if not isinstance(data, dict):
-            return {"version": 1, "states": {}}
-        data.setdefault("version", 1)
-        data.setdefault("states", {})
-        return data
+    def _identity(self, state):
+        from vllm.compilation.startup_assets import source_hash
+        return {"state": state.signature(),
+                "source": source_hash("v1/engine/startup_orchestrator.py")}
 
-    def estimates(self, state: StartupState,
-                  defaults: Mapping[str, float]) -> dict[str, float]:
-        data = self._read()
-        stages = data.get("states", {}).get(state.signature(), {})
+    def _path(self, identity):
+        from vllm.compilation.startup_assets import digest
+        return self.path / f"{digest(identity)}.json" if not self.path.suffix else self.path
+
+    def estimates(self, state, defaults):
+        from vllm.compilation.startup_assets import read_record
+        identity = self._identity(state)
+        stages = read_record(self._path(identity), identity) or {}
         estimates = dict(defaults)
         for name, samples in stages.items():
             if isinstance(samples, list) and samples:
                 estimates[name] = float(median(float(x) for x in samples))
         return estimates
 
-    def update(self, state: StartupState,
-               results: Mapping[str, StageResult]) -> None:
-        data = self._read()
-        stages: MutableMapping[str, Any] = data.setdefault(
-            "states", {}).setdefault(state.signature(), {})
-        for name, result in results.items():
-            if result.status != "completed":
-                continue
-            samples = stages.setdefault(name, [])
-            samples.append(result.elapsed_s)
-            del samples[:-self.max_samples]
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile("w", delete=False,
-                                         dir=str(self.path.parent),
-                                         encoding="utf-8") as handle:
-            json.dump(data, handle, indent=2, sort_keys=True)
-            temp_name = handle.name
-        os.replace(temp_name, self.path)
+    def update(self, state, results):
+        from vllm.compilation.startup_assets import locked, read_record, record, write_json
+        identity = self._identity(state)
+        path = self._path(identity)
+        with locked(path):
+            stages = read_record(path, identity) or {}
+            for name, result in results.items():
+                if result.status == "completed":
+                    samples = stages.setdefault(name, [])
+                    samples.append(result.elapsed_s)
+                    del samples[:-self.max_samples]
+            write_json(path, record(identity, stages))
 
 
 def build_engine_startup_dag(

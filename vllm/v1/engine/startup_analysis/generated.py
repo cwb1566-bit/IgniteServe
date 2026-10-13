@@ -26,6 +26,20 @@ class GeneratedStartupRejected(RuntimeError):
     """Raised during preflight, before any generated action is invoked."""
 
 
+def repository_contract(vllm_config, source_path):
+    from vllm.compilation.startup_assets import digest, verify_bundle
+    from vllm.compilation.startup_resources import resource_dir
+    try:
+        facts = runtime_compatibility_facts(vllm_config, source_path=source_path)
+        facts.pop("cache_state", None)
+        root = resource_dir("startup_contract") / digest(facts)
+        if verify_bundle(root, facts):
+            return str(root / "startup_contract.json")
+    except (ValueError, TypeError, AttributeError, OSError):
+        pass
+    return None
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
@@ -179,6 +193,15 @@ def prepare_generated_startup(
             f"generated contract status is {payload.get('status')!r}, not 'final'")
 
     facts = runtime_compatibility_facts(vllm_config, source_path=source_path)
+    if (contract_path.parent / "manifest.json").exists():
+        from vllm.compilation.startup_assets import verify_bundle
+        identity = dict(facts)
+        identity.pop("cache_state", None)
+        if not verify_bundle(contract_path.parent, identity):
+            raise GeneratedStartupRejected("contract bundle integrity/compatibility mismatch")
+        # A cache-state label supplied by the caller is not a runtime probe.
+        # Repository contracts may not use it to authorize skipping actions.
+        facts["cache_state"] = None
     compatibility = dict(payload.get("compatibility", {}))
     if not _matches(compatibility, facts):
         mismatches = {

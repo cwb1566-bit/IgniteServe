@@ -31,11 +31,13 @@ from vllm.utils import is_torch_equal_or_newer, resolve_obj_by_qualname
 from .compiler_interface import (CompilerInterface, EagerAdaptor,
                                  InductorAdaptor, InductorStandaloneAdaptor,
                                  ThreadSafeInductorAdaptor)
-from .cache_reuse import (GlobalSubgraphCache, graph_semantic_key,
+from .cache_reuse import (GlobalSubgraphCache,
                           normalized_model_paths)
 from .startup_resources import (enabled_by_master, env_flag,
-                                parallel_compile_metadata_dir, resource_file)
+                                parallel_compile_metadata_dir, resource_dir, resource_file)
 from .counter import compilation_counter
+from . import startup_assets as assets
+from .input_contract import graph_key, input_contract
 from .inductor_pass import InductorPass
 from .pass_manager import PostGradPassManager
 
@@ -51,9 +53,10 @@ logger = init_logger(__name__)
 def _dump_dynamo_fx_artifact_probe(graph: fx.GraphModule,
                                    example_inputs: list[Any],
                                    traced_files: Sequence[str],
-                                   runtime_identity: dict[str, Any]) -> None:
+                                   runtime_identity: dict[str, Any],
+                                   output_dir=None) -> None:
     """Persist the pre-backend FX graph with PyTorch's wire serializer."""
-    output_dir = (os.getenv("VLLM_DYNAMO_FRONTEND_CACHE_DIR")
+    output_dir = output_dir or (os.getenv("VLLM_DYNAMO_FRONTEND_CACHE_DIR")
                   or os.getenv("VLLM_DYNAMO_ARTIFACT_PROBE_DIR"))
     if not output_dir:
         return
@@ -98,33 +101,16 @@ def _dump_dynamo_fx_artifact_probe(graph: fx.GraphModule,
         graph_path = probe_dir / f"{stem}.fxstruct.pkl"
         graph_path.write_bytes(graph_bytes)
 
-        from torch.fx._graph_pickler import GraphPickler
-        from torch.fx.experimental.symbolic_shapes import free_symbols
-        direct_symbols = tuple(
-            (node.name, node.meta["example_value"])
-            for node in graph.graph.nodes
-            if isinstance(node.meta.get("example_value"),
-                          (torch.SymInt, torch.SymFloat)))
-        direct_symbol_bytes = GraphPickler.dumps(direct_symbols)
-        direct_symbol_path = (
-            probe_dir / f"{stem}.direct_symbols.graphpickle")
-        direct_symbol_path.write_bytes(direct_symbol_bytes)
-        symbol_dependencies = {}
-        for node in graph.graph.nodes:
-            value = node.meta.get("example_value")
-            if value is None:
-                continue
-            symbols = sorted(str(symbol) for symbol in free_symbols(value))
-            if symbols:
-                symbol_dependencies[node.name] = symbols
+        from .frontend_metadata import dump_metadata
+        evidence_bytes = dump_metadata(graph, example_inputs)
+        evidence_path = probe_dir / f"{stem}.fake_evidence.graphpickle"
+        evidence_path.write_bytes(evidence_bytes)
 
         metadata.update({
             "fxstruct_bytes": len(graph_bytes),
             "fxstruct_path": str(graph_path),
-            "direct_symbols": len(direct_symbols),
-            "direct_symbol_graphpickle_bytes": len(direct_symbol_bytes),
-            "direct_symbol_graphpickle_path": str(direct_symbol_path),
-            "symbol_dependencies": symbol_dependencies,
+            "fake_evidence_bytes": len(evidence_bytes),
+            "fake_evidence_path": str(evidence_path),
             "structural_seconds": time.perf_counter() - structural_started,
         })
     except Exception as exc:
@@ -216,20 +202,29 @@ class CompilerManager:
     def initialize_cache(self,
                          cache_dir: str,
                          disable_cache: bool = False,
-                         prefix: str = ''):
+                         prefix: str = '', identity=None):
         self.disable_cache = disable_cache
         self.cache_dir = cache_dir
         self.cache_file_path = os.path.join(cache_dir, 'vllm_compile_cache.py')
         self.cache_metadata_file_path = os.path.join(
             cache_dir, 'vllm_compile_reuse_cache.py')
+        self.contract_path = Path(cache_dir) / "input_contracts.json"
+        self.cache_identity = {"schema": "compile-map-v1", "runtime": identity}
+        self.cache_contracts = assets.read_record(self.contract_path, {"schema": "compiled-inputs-v1"}) or {}
+        valid = assets.verify_bundle(Path(cache_dir), self.cache_identity)
 
-        if not disable_cache and os.path.exists(self.cache_file_path):
+        if valid and not disable_cache and os.path.exists(self.cache_file_path):
             with open(self.cache_file_path) as f:
                 self.cache = ast.literal_eval(f.read())
 
-        if not disable_cache and os.path.exists(self.cache_metadata_file_path):
+        if valid and not disable_cache and os.path.exists(self.cache_metadata_file_path):
             with open(self.cache_metadata_file_path) as f:
                 self.compile_metadata_for_reuse = ast.literal_eval(f.read())
+
+        self.cache = {k: self._disk_handle(v, restore=True) for k, v in self.cache.items()}
+        self.compile_metadata_for_reuse = {
+            k: (index, self._disk_handle(handle, restore=True))
+            for k, (index, handle) in self.compile_metadata_for_reuse.items()}
 
         if (not disable_cache
                 and os.environ.get(
@@ -246,16 +241,50 @@ class CompilerManager:
     def initialize_cache_model_meta(self, model_name: str):
         del model_name
 
+    def _disk_handle(self, handle, restore=False):
+        from .startup_resources import resource_root
+        if restore:
+            if len(handle) == 3 and handle[2] == "repository-relative":
+                return (handle[0], str(assets.member(resource_root(), handle[1])))
+            return tuple(handle)
+        try:
+            relative = Path(handle[1]).resolve().relative_to(resource_root())
+            return (handle[0], relative.as_posix(), "repository-relative")
+        except (ValueError, TypeError):
+            return handle  # Explicit external cache directories stay external.
+
     def save_to_file(self):
+        if self.disable_cache:
+            return
+        # Publish both maps and their contracts together under one lock.
+        with assets.locked(Path(self.cache_dir) / "maps"):
+            self._save_to_file()
+
+    def _save_to_file(self):
         if not self.disable_cache and self.is_cache_updated:
             printer = pprint.PrettyPrinter(indent=4)
-            with open(self.cache_file_path, 'w') as f:
-                f.write(printer.pformat(self.cache))
+            data = {k: self._disk_handle(v) for k, v in self.cache.items()}
+            assets.atomic_write(Path(self.cache_file_path), printer.pformat(data).encode())
 
         if not self.disable_cache and self.is_cache_metadata_updated:
             printer = pprint.PrettyPrinter(indent=4)
-            with open(self.cache_metadata_file_path, 'w') as f:
-                f.write(printer.pformat(self.compile_metadata_for_reuse))
+            data = {k: (i, self._disk_handle(h)) for k, (i, h) in self.compile_metadata_for_reuse.items()}
+            assets.atomic_write(Path(self.cache_metadata_file_path), printer.pformat(data).encode())
+        assets.write_json(self.contract_path, assets.record({"schema": "compiled-inputs-v1"}, self.cache_contracts))
+        files = [Path(p).name for p in (self.cache_file_path, self.cache_metadata_file_path,
+                                       self.contract_path) if Path(p).is_file()]
+        if files:
+            assets.publish_bundle(Path(self.cache_dir), self.cache_identity, files)
+
+    def _input_key(self, graph, example_inputs):
+        try:
+            contract = input_contract(tuple(example_inputs))
+            # Inductor evaluates its own stored guards at load time. Unrelated
+            # guards accumulated later in Dynamo must not change this key.
+            contract.pop("guards")
+            return assets.digest([graph_key(graph), contract])
+        except (ValueError, TypeError, AttributeError):
+            return None
 
     def has_cached_graph(self,
                          graph_index: int,
@@ -290,6 +319,7 @@ class CompilerManager:
         source_graph = self.get_compiled_graph(source_index, runtime_shape)
         if source_handle is not None:
             self.cache[self._cache_key(runtime_shape, graph_index)] = source_handle
+            self.cache_contracts[str(self._cache_key(runtime_shape, graph_index))] = self.cache_contracts.get(str(self._cache_key(runtime_shape, source_index)))
             self.compile_metadata_for_reuse[
                 self._cache_key(runtime_shape, graph_index)
             ] = (source_index, source_handle)
@@ -305,7 +335,7 @@ class CompilerManager:
                                   graph_index: int,
                                   runtime_shape: Optional[int],
                                   compiled_graph: Optional[Any],
-                                  handle: Any) -> None:
+                                  handle: Any, example_inputs=()) -> None:
         if compiled_graph is not None:
             self.compiled_graph_list[
                 self._compiled_key(runtime_shape, graph_index)
@@ -315,6 +345,7 @@ class CompilerManager:
             return
 
         cache_key = self._cache_key(runtime_shape, graph_index)
+        self.cache_contracts[str(cache_key)] = self._input_key(graph, example_inputs)
         self.cache[cache_key] = handle
         self.is_cache_updated = True
 
@@ -334,7 +365,7 @@ class CompilerManager:
         self.is_cache_metadata_updated = True
         if self.global_cache is not None:
             self.global_cache.register(
-                graph_semantic_key(graph, runtime_shape, self.compiler.name),
+                self._input_key(graph, example_inputs),
                 handle,
                 self.cache_dir,
                 graph_index,
@@ -350,11 +381,12 @@ class CompilerManager:
     def record_compiled_handle(self,
                                graph_index: int,
                                runtime_shape: Optional[int],
-                               handle: Any) -> None:
+                               handle: Any, graph=None, example_inputs=()) -> None:
         if handle is None:
             raise RuntimeError(
                 'Subprocess compile requires a persistent compiler handle.')
         cache_key = self._cache_key(runtime_shape, graph_index)
+        self.cache_contracts[str(cache_key)] = self._input_key(graph, example_inputs) if graph is not None else None
         self.cache[cache_key] = handle
         self.compile_metadata_for_reuse[cache_key] = (graph_index, handle)
         self.is_cache_updated = True
@@ -371,19 +403,24 @@ class CompilerManager:
         self._maybe_start_timer(graph_index, track_metrics)
 
         handle = self.get_cached_handle(graph_index, runtime_shape)
+        current_key = self._input_key(graph, example_inputs)
+        if (current_key is None or self.cache_contracts.get(str(self._cache_key(runtime_shape, graph_index))) != current_key):
+            self.cache.pop(self._cache_key(runtime_shape, graph_index), None)
+            handle = None
         global_hit = False
         if (handle is None and self.global_cache is not None
                 and os.environ.get(
                     'VLLM_ENABLE_GLOBAL_SUBGRAPH_DIRECT_LOOKUP', '').lower()
                 in {'1', 'true', 'yes', 'on'}):
             handle = self.global_cache.lookup(
-                graph_semantic_key(graph, runtime_shape, self.compiler.name))
+                current_key)
             global_hit = handle is not None
         if handle is None:
             return None
         if global_hit:
             cache_key = self._cache_key(runtime_shape, graph_index)
             self.cache[cache_key] = handle
+            self.cache_contracts[str(cache_key)] = current_key
             self.compile_metadata_for_reuse[cache_key] = (graph_index, handle)
             self.is_cache_updated = True
             self.is_cache_metadata_updated = True
@@ -405,8 +442,13 @@ class CompilerManager:
                                          'Loading')
                 return reusable_graph
 
-        compiled_graph = self.compiler.load(handle, graph, example_inputs,
-                                            graph_index, runtime_shape)
+        try:
+            compiled_graph = self.compiler.load(handle, graph, example_inputs,
+                                                graph_index, runtime_shape)
+        except Exception as exc:
+            logger.warning("Compiled asset load rejected for graph %s: %s; recompiling", graph_index, exc)
+            self.cache.pop(self._cache_key(runtime_shape, graph_index), None)
+            return None
         self.compiled_graph_list[
             self._compiled_key(runtime_shape, graph_index)
         ] = compiled_graph
@@ -473,7 +515,7 @@ class CompilerManager:
         assert compiled_graph is not None, 'Failed to compile the graph'
 
         self._record_compiled_artifact(graph, graph_index, runtime_shape,
-                                       compiled_graph, handle)
+                                       compiled_graph, handle, example_inputs)
         if handle is not None:
             if graph_index == 0:
                 logger.info('Cache the graph of shape %s for later use',
@@ -557,6 +599,8 @@ class TensorMetadata:
     stride: Optional[List[int]] = None
     requires_grad: bool = False
     is_sparse: bool = False
+    storage_offset: int = 0
+    layout: str = "torch.strided"
 
     def to_dict(self) -> Dict:
         """转换为字典（用于 JSON 序列化）"""
@@ -567,6 +611,8 @@ class TensorMetadata:
             'stride': [str(s) for s in self.stride] if self.stride else None,
             'requires_grad': self.requires_grad,
             'is_sparse': self.is_sparse,
+            'storage_offset': self.storage_offset,
+            'layout': self.layout,
         }
 
     @staticmethod
@@ -582,6 +628,8 @@ class TensorMetadata:
             stride=data['stride'] if data['stride'] else None,
             requires_grad=data.get('requires_grad', False),
             is_sparse=data.get('is_sparse', False),
+            storage_offset=data.get('storage_offset', 0),
+            layout=data.get('layout', "torch.strided"),
         )
 
 
@@ -613,21 +661,35 @@ class SubmoduleInputMetadata:
     args_metadata: List[Any]  # TensorMetadata | SymIntMetadata | 原始值
     kwargs_metadata: Dict[str, Any]
     sym_shape_indices: List[int]
+    graph_signature: Optional[str] = None
+    contract: Optional[dict] = None
 
     def to_dict(self) -> Dict:
         """转换为可序列化的字典"""
+        def encode(value):
+            if hasattr(value, "to_dict"):
+                return value.to_dict()
+            if isinstance(value, tuple):
+                return {"__tuple__": [encode(v) for v in value]}
+            if isinstance(value, list):
+                return [encode(v) for v in value]
+            if isinstance(value, dict):
+                return {k: encode(v) for k, v in value.items()}
+            return value
         return {
             'submod_name': self.submod_name,
             'index': self.index,
             'args_metadata': [
-                arg.to_dict() if hasattr(arg, 'to_dict') else arg
+                encode(arg)
                 for arg in self.args_metadata
             ],
             'kwargs_metadata': {
-                k: v.to_dict() if hasattr(v, 'to_dict') else v
+                k: encode(v)
                 for k, v in self.kwargs_metadata.items()
             },
             'sym_shape_indices': self.sym_shape_indices,
+            'graph_signature': self.graph_signature,
+            'contract': self.contract,
         }
 
     @staticmethod
@@ -635,11 +697,16 @@ class SubmoduleInputMetadata:
         """从字典恢复"""
 
         def restore_arg(arg):
+            if isinstance(arg, list):
+                return [restore_arg(v) for v in arg]
             if isinstance(arg, dict):
+                if "__tuple__" in arg:
+                    return tuple(restore_arg(v) for v in arg["__tuple__"])
                 if 'shape' in arg and 'dtype' in arg:
                     return TensorMetadata.from_dict(arg)
                 elif 'expr' in arg:
                     return SymIntMetadata.from_dict(arg)
+                return {k: restore_arg(v) for k, v in arg.items()}
             return arg
 
         return SubmoduleInputMetadata(
@@ -650,6 +717,8 @@ class SubmoduleInputMetadata:
                 k: restore_arg(v) for k, v in data['kwargs_metadata'].items()
             },
             sym_shape_indices=data['sym_shape_indices'],
+            graph_signature=data.get('graph_signature'),
+            contract=data.get('contract'),
         )
 
 
@@ -657,14 +726,16 @@ class SubmoduleInputMetadata:
 class SubmoduleInputSerializer:
     """子模块输入的序列化/反序列化工具"""
 
-    def __init__(self, metadata_cache_dir: str, model_name):
-        self.metadata_cache_dir = Path(metadata_cache_dir)
+    def __init__(self, metadata_cache_dir: str, model_name, identity=None):
+        path = Path(metadata_cache_dir)
+        self.metadata_cache_dir = path.parent if path.suffix == ".json" else path
         self.metadata_cache_dir.mkdir(parents=True, exist_ok=True)
-        self.metadata_file = self.metadata_cache_dir / f"submodule_inputs_metadata_for_{model_name}.json"
+        self.metadata_file = path if path.suffix == ".json" else (
+            path / f"submodule_inputs_metadata_for_{model_name}.json")
+        self.identity = {"schema": "submodule-inputs-v2", "runtime": identity}
         # Reuse the same symbolic object for the same textual expression so
         # reconstructed fake inputs preserve cross-argument shape relations.
         self.symbol_table: Dict[str, Any] = {}
-        self.symbol_hints: Dict[str, int] = {}
 
     def seed_symbol_table_from_arg(self, arg: Any) -> None:
         """Seed symbolic dims from the current Dynamo/FakeTensor inputs."""
@@ -722,6 +793,8 @@ class SubmoduleInputSerializer:
             stride=stride,
             requires_grad=tensor.requires_grad,
             is_sparse=tensor.is_sparse,
+            storage_offset=int(tensor.storage_offset()),
+            layout=str(tensor.layout),
         )
 
     def extract_symint_metadata(self, sym_int: torch.SymInt) -> SymIntMetadata:
@@ -781,8 +854,9 @@ class SubmoduleInputSerializer:
             'submodules': [meta.to_dict() for meta in metadata_list],
         }
 
-        with open(self.metadata_file, 'w') as f:
-            json.dump(data, f, indent=2)
+        with assets.locked(self.metadata_file):
+            assets.write_json(self.metadata_file, assets.record(
+                self.identity, data))
 
         logger.info(
             f"Saved metadata for {len(metadata_list)} submodules to "
@@ -795,8 +869,9 @@ class SubmoduleInputSerializer:
             logger.warning(f"Metadata file not found: {self.metadata_file}")
             return []
 
-        with open(self.metadata_file, 'r') as f:
-            data = json.load(f)
+        data = assets.read_record(self.metadata_file, self.identity)
+        if data is None:
+            return []
 
         metadata_list = [
             SubmoduleInputMetadata.from_dict(submod_data)
@@ -836,10 +911,17 @@ class SubmoduleInputSerializer:
             else:
                 shape.append(s)
 
-        # 创建 FakeTensor
+        if metadata.is_sparse or metadata.layout != "torch.strided" or metadata.storage_offset:
+            raise ValueError("unsupported layout or storage offset in cached input")
+        if metadata.stride is None:
+            raise ValueError("cached tensor has no stride")
+        stride = [int(s) if str(s).isdigit() else self._create_symint(str(s), fake_mode)
+                  for s in metadata.stride]
+        # Preserve layout instead of silently rebuilding a contiguous tensor.
         with fake_mode:
-            fake_tensor = torch.empty(
+            fake_tensor = torch.empty_strided(
                 shape,
+                stride,
                 dtype=dtype,
                 device=device,
                 requires_grad=metadata.requires_grad,
@@ -868,90 +950,23 @@ class SubmoduleInputSerializer:
         if cached_symbol is not None:
             return cached_symbol
 
-        if os.environ.get("VLLM_SUBPROCESS_CONCRETE_SYMINT", "").lower() in {
-                "1", "true", "yes", "on"}:
-            value = hint or self.symbol_hints.get(expr) or 1024
-            self.symbol_table[expr] = value
-            return value
+        # Only expressions bound to the current Dynamo ShapeEnv are reusable.
+        # Never manufacture a new unbacked symbol or substitute a hint.
+        operators = {ast.Add: operator.add, ast.Sub: operator.sub,
+                     ast.Mult: operator.mul, ast.FloorDiv: operator.floordiv,
+                     ast.Mod: operator.mod}
 
-        if expr.isdigit():
-            value = int(expr)
-            self.symbol_table[expr] = value
-            return value
+        def resolve(node):
+            if isinstance(node, ast.Constant) and type(node.value) is int:
+                return node.value
+            if isinstance(node, ast.Name) and node.id in self.symbol_table:
+                return self.symbol_table[node.id]
+            if isinstance(node, ast.BinOp) and type(node.op) in operators:
+                return operators[type(node.op)](resolve(node.left), resolve(node.right))
+            raise ValueError(f"unbound or unsupported symbol: {expr}")
 
-        # ========== 提取符号名称和提示值 ==========
-        # 处理简单符号（如 "s0"）
-        if expr.startswith('s') and expr[1:].isdigit():
-            sym_name = expr
-            hint = hint or self.symbol_hints.get(expr) or 1024  # 默认提示值
-        else:
-            # 处理复杂表达式（如 "s0 * 2"）
-            # 简化处理：提取第一个符号
-            import re
-            match = re.search(r's\d+', expr)
-            if match:
-                sym_name = match.group()
-                hint = hint or self.symbol_hints.get(sym_name) or 1024
-            else:
-                # 无法解析，使用默认值
-                logger.warning(f"Cannot parse symbol expression: {expr}")
-                value = hint or 1024
-                self.symbol_table[expr] = value
-                return value
-
-        if expr != sym_name:
-            try:
-                symbol_names = set(re.findall(r's\d+', expr))
-                local_symbols = {
-                    name: self._create_symint(name, fake_mode, hint)
-                    for name in symbol_names
-                }
-                evaluated = eval(expr, {"__builtins__": {}}, local_symbols)
-                self.symbol_table[expr] = evaluated
-                return evaluated
-            except Exception:
-                logger.debug("Falling back to base symbol reconstruction for %s",
-                             expr)
-
-        # ========== 从 ShapeEnv 获取或创建符号 ==========
-        shape_env = fake_mode.shape_env
-
-        # ========== 方法 1：实验性使用带 hint 的 unspecified/backed SymInt ==========
-        if os.environ.get("VLLM_SUBPROCESS_UNSPECIFIED_SYMINT", "").lower() in {
-                "1", "true", "yes", "on"}:
-            try:
-                from torch.fx.experimental.symbolic_shapes import DimDynamic
-                from torch._dynamo.source import ConstantSource
-
-                symint = shape_env.create_unspecified_symint_and_symbol(
-                    int(hint),
-                    source=ConstantSource(f"vllm_{sym_name}"),
-                    dynamic_dim=DimDynamic.DYNAMIC,
-                )
-                logger.debug(
-                    f"Created unspecified SymInt for {sym_name} with hint {hint}")
-                self.symbol_table[expr] = symint
-                self.symbol_table.setdefault(sym_name, symint)
-                return symint
-            except Exception as exc:
-                logger.warning(
-                    "Failed to create unspecified SymInt for %s: %s; "
-                    "falling back to unbacked SymInt", sym_name, exc)
-
-        # ========== 方法 2：使用 create_unbacked_symint（原始实现）==========
-        try:
-            symint = shape_env.create_unbacked_symint()
-            logger.debug(f"Created unbacked SymInt for {sym_name}")
-            self.symbol_table[expr] = symint
-            self.symbol_table.setdefault(sym_name, symint)
-            return symint
-
-        except AttributeError:
-            pass
-
-        value = hint or 1024
+        value = resolve(ast.parse(expr, mode="eval").body)
         self.symbol_table[expr] = value
-        self.symbol_table.setdefault(sym_name, value)
         return value
 
     def reconstruct_symint(
@@ -985,28 +1000,12 @@ class SubmoduleInputSerializer:
         else:
             return arg_metadata
 
-    def _collect_symbol_hints(self, arg_metadata: Any) -> None:
-        if isinstance(arg_metadata, SymIntMetadata):
-            if arg_metadata.hint is not None:
-                self.symbol_hints[arg_metadata.expr] = int(arg_metadata.hint)
-        elif isinstance(arg_metadata, (list, tuple)):
-            for item in arg_metadata:
-                self._collect_symbol_hints(item)
-        elif isinstance(arg_metadata, dict):
-            for item in arg_metadata.values():
-                self._collect_symbol_hints(item)
-
     def reconstruct_submodule_inputs(
             self,
             metadata: SubmoduleInputMetadata,
             fake_mode,
     ) -> Tuple[Tuple, Dict]:
         """重建子模块的输入"""
-        for arg_meta in metadata.args_metadata:
-            self._collect_symbol_hints(arg_meta)
-        for v_meta in metadata.kwargs_metadata.values():
-            self._collect_symbol_hints(v_meta)
-
         args = tuple([
             self.reconstruct_arg(arg_meta, fake_mode)
             for arg_meta in metadata.args_metadata
@@ -1043,7 +1042,12 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
         self.extra_traceback = False
 
         model_name = vllm_config.model_config.model.split('/')[-1]
-        self.serializer = SubmoduleInputSerializer(metadata_cache_dir, model_name)
+        from .startup_resources import parallel_compile_metadata_identity
+        parallel = vllm_config.parallel_config
+        identity = parallel_compile_metadata_identity(
+            self.compilation_config.local_cache_dir, parallel.rank,
+            parallel.data_parallel_rank, vllm_backend.prefix, vllm_config)
+        self.serializer = SubmoduleInputSerializer(metadata_cache_dir, model_name, identity)
         self.restore_input_metadata = enabled_by_master(
             "VLLM_ENABLE_PARALLEL_COMPILE_METADATA")
         self.cached_metadata = (
@@ -1076,15 +1080,11 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
             normalized[str(index)] = mapped_index
         return normalized
 
-    def _normalize_target(self, target: Any) -> str:
-        return re.sub(r'\d+', '#', str(target))
-
     def _submodule_signature(self, submod: torch.fx.GraphModule) -> tuple[Any, ...]:
-        signature: list[tuple[str, str]] = []
-        for node in submod.graph.nodes:
-            target = self._normalize_target(node.target)
-            signature.append((node.op, target))
-        return tuple(signature)
+        try:
+            return (graph_key(submod),)
+        except (ValueError, TypeError, AttributeError):
+            return (id(submod),)  # Opaque graphs never alias another graph.
 
     def _build_structural_reuse_map(self) -> dict[str, int]:
         signature_to_index: dict[tuple[Any, ...], int] = {}
@@ -1102,37 +1102,7 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
                 str(index): index
                 for index in range(len(self.compile_submod_names))
             })
-        if self.fake_run_map_filepath.exists():
-            try:
-                started = time.perf_counter()
-                reuse_map = self._normalize_reuse_map(
-                    self._load_fake_run_metadata())
-                logger.info(
-                    'Offline metadata timing reuse_map_load_s=%.6f '
-                    'graphs=%s canonical=%s path=%s',
-                    time.perf_counter() - started,
-                    len(reuse_map),
-                    len(set(reuse_map.values())),
-                    self.fake_run_map_filepath,
-                )
-                return reuse_map
-            except Exception as exc:
-                logger.warning('Failed to load fake-run reuse metadata: %s', exc)
-        started = time.perf_counter()
-        reuse_map = self._normalize_reuse_map(
-            self._build_structural_reuse_map())
-        self.fake_run_map_filepath.parent.mkdir(parents=True, exist_ok=True)
-        with self.fake_run_map_filepath.open('w', encoding='utf-8') as f:
-            json.dump(reuse_map, f, indent=2)
-        logger.info(
-            'Offline metadata timing reuse_map_build_s=%.6f graphs=%s '
-            'canonical=%s path=%s',
-            time.perf_counter() - started,
-            len(reuse_map),
-            len(set(reuse_map.values())),
-            self.fake_run_map_filepath,
-        )
-        return reuse_map
+        return self._normalize_reuse_map(self._build_structural_reuse_map())
 
     def _try_load_cached_metadata(self) -> Optional[Dict[str, SubmoduleInputMetadata]]:
         started = time.perf_counter()
@@ -1141,7 +1111,17 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
             metadata_list = self.serializer.load_all_metadata()
             if metadata_list:
                 loaded_count = len(metadata_list)
-                return {meta.submod_name: meta for meta in metadata_list}
+                by_graph = {meta.graph_signature: meta for meta in metadata_list
+                            if meta.graph_signature and meta.contract}
+                matched = {}
+                for name in self.compile_submod_names:
+                    try:
+                        meta = by_graph.get(graph_key(self.fetch_attr(name)))
+                        if meta is not None:
+                            matched[name] = meta
+                    except ValueError:
+                        pass
+                return matched or None
         except Exception as exc:
             logger.warning('Failed to load cached metadata: %s', exc)
         finally:
@@ -1161,8 +1141,9 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
         if self.cached_metadata is not None and not args:
             logger.info('Restoring submodule inputs from cache without '
                         'replaying full-graph example inputs...')
-            self._restore_from_cache()
-            return None
+            if self._restore_from_cache():
+                return None
+            raise ValueError("frontend replay lacks validated current subgraph inputs")
 
         fake_args = [
             self.fake_mode.from_tensor(t) if isinstance(t, torch.Tensor) else t
@@ -1173,13 +1154,14 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
             logger.info('Restoring submodule inputs from cache...')
             restore_started = time.perf_counter()
             self.serializer.seed_symbol_table_from_args(tuple(fake_args))
-            self._restore_from_cache()
+            restored = self._restore_from_cache()
             logger.info(
                 'Offline metadata timing restore_s=%.6f restored=%s',
                 time.perf_counter() - restore_started,
                 len(self.vllm_backend.meta_data),
             )
-            return None
+            if restored:
+                return None
 
         logger.info('Running fake mode inference...')
         fake_started = time.perf_counter()
@@ -1193,16 +1175,13 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
 
         save_started = time.perf_counter()
         self._save_metadata()
+        self._validate_reuse_inputs()
         logger.info(
             'Offline metadata timing save_s=%.6f path=%s',
             time.perf_counter() - save_started,
             self.serializer.metadata_file,
         )
         return result
-
-    def _load_fake_run_metadata(self) -> dict[str, int]:
-        with self.fake_run_map_filepath.open('r', encoding='utf-8') as f:
-            return json.load(f)
 
     def _record_submodule_metadata(self,
                                    target: str,
@@ -1223,22 +1202,64 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
         return index
 
     def _restore_from_cache(self):
+        restored = {}
         for submod_name in self.compile_submod_names:
             if submod_name not in self.cached_metadata:
                 logger.warning('No cached metadata for %s', submod_name)
                 continue
 
             meta = self.cached_metadata[submod_name]
-            args, kwargs = self.serializer.reconstruct_submodule_inputs(
-                meta, self.fake_mode)
+            try:
+                call = next(n for n in self.module.graph.nodes
+                            if n.op == "call_module" and n.target == submod_name)
+                def example(node):
+                    if "val" in node.meta:
+                        return node.meta["val"]
+                    return node.meta["example_value"]
+                try:
+                    current = fx.node.map_arg((call.args, call.kwargs), example)
+                except KeyError:
+                    # split_module preserves Dynamo evidence on the submodule
+                    # placeholders, but not on newly created parent getitems.
+                    if call.kwargs:
+                        raise ValueError("unresolved keyword input evidence")
+                    placeholders = [n for n in self.fetch_attr(submod_name).graph.nodes
+                                    if n.op == "placeholder"]
+                    current = (tuple(example(n) for n in placeholders), {})
+                if input_contract(current) != meta.contract:
+                    raise ValueError("current inputs or guards differ")
+                args, kwargs = self.serializer.reconstruct_submodule_inputs(meta, self.fake_mode)
+                if input_contract((args, kwargs)) != meta.contract:
+                    raise ValueError("restored inputs, aliasing or guards differ")
+            except (ValueError, KeyError, TypeError, StopIteration, AttributeError) as exc:
+                logger.info("Input metadata miss for %s: %s", submod_name, exc)
+                continue
             submod = self.fetch_attr(submod_name)
-            self.vllm_backend.meta_data[submod_name] = {
+            restored[submod_name] = {
                 'submod': submod,
                 'args': args,
                 'kwargs': kwargs,
                 'sym_shape_indices': meta.sym_shape_indices,
-                'index': meta.index,
+                'index': self.compile_submod_names.index(submod_name),
             }
+        self.vllm_backend.meta_data.update(restored)
+        self._validate_reuse_inputs()
+        return len(restored) == len(self.compile_submod_names)
+
+    def _validate_reuse_inputs(self):
+        for index, name in enumerate(self.compile_submod_names):
+            mapped = self.fake_run_map_list[str(index)]
+            if mapped == index:
+                continue
+            a = self.vllm_backend.meta_data.get(name)
+            b = self.vllm_backend.meta_data.get(self.compile_submod_names[mapped])
+            try:
+                if a is None or b is None or input_contract((a['args'], a['kwargs'])) != input_contract((b['args'], b['kwargs'])):
+                    self.fake_run_map_list[str(index)] = index
+            except (ValueError, TypeError, AttributeError):
+                self.fake_run_map_list[str(index)] = index
+        self.vllm_backend.reuse_index_map = {
+            int(i): int(j) for i, j in self.fake_run_map_list.items()}
 
     def _save_metadata(self):
         metadata_list = []
@@ -1247,18 +1268,21 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
                 logger.warning('No metadata for %s', submod_name)
                 continue
             data = self.vllm_backend.meta_data[submod_name]
-            metadata_list.append(
-                self.serializer.extract_submodule_metadata(
+            try:
+                meta = self.serializer.extract_submodule_metadata(
                     submod_name=submod_name,
                     args=data['args'],
                     kwargs=data['kwargs'],
                     sym_shape_indices=data['sym_shape_indices'],
                     index=data['index'],
-                ))
+                )
+                meta.graph_signature = graph_key(data['submod'])
+                meta.contract = input_contract((data['args'], data['kwargs']))
+                metadata_list.append(meta)
+            except (ValueError, TypeError, AttributeError) as exc:
+                logger.info("Not persisting unsupported inputs for %s: %s", submod_name, exc)
 
         self.serializer.save_all_metadata(metadata_list)
-        with self.fake_run_map_filepath.open('w', encoding='utf-8') as f:
-            json.dump(self.fake_run_map_list, f, indent=2)
 
     def call_module(self, target: torch.fx.node.Target,
                     args: tuple[torch.fx.node.Argument, ...],
@@ -1270,9 +1294,16 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
         index = self._record_submodule_metadata(target, args, kwargs)
         mapped_index = int(self.fake_run_map_list.get(str(index), index))
         if mapped_index != index and mapped_index in self.fake_run_results_metadata:
-            reused_output = self.fake_run_results_metadata[mapped_index]
-            self.fake_run_results_metadata[index] = reused_output
-            return reused_output
+            other = self.vllm_backend.meta_data[self.compile_submod_names[mapped_index]]
+            try:
+                equal = input_contract((args, kwargs)) == input_contract((other['args'], other['kwargs']))
+            except (ValueError, TypeError, AttributeError):
+                equal = False
+            if equal:
+                reused_output = self.fake_run_results_metadata[mapped_index]
+                self.fake_run_results_metadata[index] = reused_output
+                return reused_output
+            self.fake_run_map_list[str(index)] = index
 
         output = super().call_module(target, args, kwargs)
         self.fake_run_results_metadata[index] = output
@@ -1738,7 +1769,7 @@ class ParallelCompileManager:
         dp_rank = vllm_config.parallel_config.data_parallel_rank
         if enabled_by_master("VLLM_ENABLE_PARALLEL_COMPILE_METADATA"):
             metadata_cache_dir = str(parallel_compile_metadata_dir(
-                compilation_config.cache_dir, rank, dp_rank, prefix))
+                compilation_config.cache_dir, rank, dp_rank, prefix, vllm_config))
         else:
             metadata_cache_dir = os.path.join(
                 compilation_config.local_cache_dir,
@@ -1927,7 +1958,9 @@ class ParallelCompileManager:
                 artifact = result.artifacts[0]
                 handle = (artifact.cache_key, artifact.artifact_path)
                 compiler_manager.record_compiled_handle(
-                    graph_index, runtime_shape, handle)
+                    graph_index, runtime_shape, handle,
+                    metadata_by_index[graph_index]['submod'],
+                    metadata_by_index[graph_index]['args'])
                 succeeded_indices.add(graph_index)
                 compilation_counter.num_backend_compilations += 1
                 if (compiler_manager.compiler.name.startswith('inductor')
@@ -2187,6 +2220,17 @@ class ParallelCompileManager:
         try:
             for index, future in graph_futures.items():
                 compiled_graph, action = future.result()
+                if compiled_graph is None:
+                    source = canonical_map[index]
+                    compiled_graph = compiled_by_index.get(source)
+                    if compiled_graph is None:
+                        logger.warning("Artifact rejected for graph %s; compiling with current inputs", index)
+                        compiled_graph, action = self._compile_source_graph_serial(
+                            metadata_by_index[index], compiler_manager,
+                            compilation_config, index, num_graphs, runtime_shape)
+                    else:
+                        compiler_manager.alias_graph(index, source, runtime_shape)
+                        action = 'reuse'
                 compiled_by_index[index] = compiled_graph
                 action_counts[action] += 1
         finally:
@@ -2377,6 +2421,9 @@ class VllmBackend:
             "config_hash": config_hash,
             "compiler_hash": compiler_hash,
             "prefix": self.prefix,
+            "rank": self.vllm_config.parallel_config.rank,
+            "dp_rank": self.vllm_config.parallel_config.data_parallel_rank,
+            "source": assets.source_hash("compilation", "model_executor"),
         }
         self._dynamo_frontend_identity = identity
         return identity
@@ -2395,7 +2442,8 @@ class VllmBackend:
         if not getattr(self, "_dynamo_frontend_replaying", False):
             _dump_dynamo_fx_artifact_probe(
                 graph, example_inputs, self.compilation_config.traced_files,
-                self.dynamo_frontend_runtime_identity())
+                self.dynamo_frontend_runtime_identity(),
+                output_dir=getattr(self, "_frontend_cache_dir", None))
         from .monitor import torch_compile_start_time
         dynamo_frontend_time = time.time() - torch_compile_start_time
         logger.info("Dynamo frontend before backend entry: %.6f s",
@@ -2450,8 +2498,7 @@ class VllmBackend:
                                    usedforsecurity=False).hexdigest()[:10]
 
             cache_dir = os.path.join(
-                envs.VLLM_CACHE_ROOT,
-                "torch_compile_cache",
+                str(resource_dir("compile")),
                 hash_key,
             )
             self.compilation_config.cache_dir = cache_dir
@@ -2459,46 +2506,6 @@ class VllmBackend:
         cache_dir = self.compilation_config.cache_dir
         os.makedirs(cache_dir, exist_ok=True)
         self.compilation_config.cache_dir = cache_dir
-
-        # -------------------更新全局缓存搜索表---------------------
-        # 改---全局缓存搜索表---待进一步优化
-        model_path = vllm_config.model_config.model
-        model_name = model_path.split('/')[-1]
-        key = f"{model_path}|{model_name}"
-        if enabled_by_master("VLLM_ENABLE_COMPILE_CACHE_ALIAS"):
-            from .cache_reuse import canonical_model_identity
-            key = f"{canonical_model_identity(model_path)}|{model_name}"
-        global_cache_file = str(resource_file(
-            "compile_cache_alias", "global_model_cache_map.json"))
-        os.makedirs(os.path.dirname(global_cache_file), exist_ok=True)
-        # 1. 文件不存在 → 创建并写入
-        if not os.path.exists(global_cache_file):
-            with open(global_cache_file, 'w') as f:
-                json.dump({key: cache_dir}, f, indent=1)
-        # 2. 文件存在
-        else:
-            with open(global_cache_file, 'r') as f:
-                content = f.read().strip()
-                if not content:
-                    data = {}
-                else:
-                    data = json.loads(content)
-            # 2.1 键不存在 → 追加
-            if key not in data:
-                data[key] = cache_dir
-                with open(global_cache_file, 'w') as f:
-                    json.dump(data, f, indent=1)
-            # 2.2 键存在
-            else:
-                # 缓存路径不存在 → 覆盖
-                if not os.path.exists(data[key]):
-                    data[key] = cache_dir
-                    with open(global_cache_file, 'w') as f:
-                        json.dump(data, f, indent=1)
-                # 缓存路径存在 → 跳过
-                else:
-                    pass
-        # -------------------更新全局缓存搜索表---------------------
 
         rank = vllm_config.parallel_config.rank
         dp_rank = vllm_config.parallel_config.data_parallel_rank
@@ -2510,7 +2517,8 @@ class VllmBackend:
             logger.info("vLLM's torch.compile cache is disabled.")
         else:
             logger.info("Using cache directory: %s for vLLM's torch.compile", local_cache_dir)
-        self.compiler_manager.initialize_cache(local_cache_dir, disable_cache, self.prefix)
+        self.compiler_manager.initialize_cache(local_cache_dir, disable_cache, self.prefix,
+                                               self.dynamo_frontend_runtime_identity())
         timer.end("analyzing cache_dir and files")
         logger.info("Compilation cache analysis time: %.6f s",
                     time.perf_counter() - cache_analysis_started)
@@ -2559,7 +2567,7 @@ class VllmBackend:
         if enabled_by_master("VLLM_ENABLE_PARALLEL_COMPILE_METADATA"):
             submodule_inputs_metadata_cache_dir = str(
                 parallel_compile_metadata_dir(cache_dir, rank, dp_rank,
-                                              self.prefix))
+                                              self.prefix, self.vllm_config))
         else:
             submodule_inputs_metadata_cache_dir = os.path.join(
                 local_cache_dir,

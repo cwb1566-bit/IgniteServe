@@ -1,5 +1,7 @@
 # Dynamo 前端缓存实验说明
 
+> 2026-10-13 更新：本文保留原分支实验结果。集成分支统一仓库现使用 `fake_evidence.graphpickle` 保存无数值的节点张量元信息和后端入口，替代下文历史的 direct-symbol-only 格式，以满足新增输入校验。当前格式与验证边界见 `STARTUP_ASSETS_CN.md`；旧格式未命中时重新 tracing 生成，不绕过校验。
+
 > 实验分支：`igniteServe/dynamo-frontend-cache`
 >
 > 基线提交：`e77091cf2e`（并发 piecewise CUDA Graph 实验分支）

@@ -223,6 +223,16 @@ def finalize_startup_contract(
     contract_output = output_dir / "startup_contract.json"
     contract_output.write_text(json.dumps(result, indent=2, sort_keys=True),
                                encoding="utf-8")
+    # An exportable bundle is published only for a complete runtime identity.
+    identity = dict(result.get("compatibility", {}))
+    identity.pop("cache_state", None)
+    required = {"model", "model_architecture", "dtype", "max_model_len",
+                "max_num_batched_tokens", "max_num_seqs", "tensor_parallel_size",
+                "pipeline_parallel_size", "data_parallel_size", "torch_version",
+                "cuda_version", "gpu_compute_capability", "gpu_name", "source_sha256"}
+    if required <= identity.keys() and all(identity[k] is not None for k in required):
+        from vllm.compilation.startup_assets import publish_bundle
+        publish_bundle(output_dir, identity, [adapter_output.name, contract_output.name])
     report["outputs"] = {
         "adapter": str(adapter_output),
         "contract": str(contract_output),

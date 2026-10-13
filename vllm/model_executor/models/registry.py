@@ -5,6 +5,7 @@ Whenever you add an architecture to this page, please also update
 `tests/models/registry.py` with example HuggingFace models for it.
 """
 import hashlib
+from pathlib import Path
 import importlib
 import importlib.util
 import json
@@ -309,7 +310,7 @@ def _model_info_cache_key(module_name: str, class_name: str) -> Optional[str]:
 
     Returns ``None`` when the independently controllable model-info cache is
     disabled. The key is invalidated by vLLM version changes and by edits to
-    the model's source file (mtime + size), so a stale cache is never used.
+    model/interface source contents. Unidentified plugins are not cached.
     """
     try:
         from vllm.compilation.startup_resources import enabled_by_master
@@ -318,6 +319,7 @@ def _model_info_cache_key(module_name: str, class_name: str) -> Optional[str]:
     except Exception:
         return None
 
+    from vllm.compilation.startup_assets import source_hash
     parts = [module_name, class_name]
     try:
         from vllm.version import __version__ as vllm_version
@@ -325,24 +327,26 @@ def _model_info_cache_key(module_name: str, class_name: str) -> Optional[str]:
     except Exception:
         parts.append("unknown")
 
-    # Include the model source file's mtime+size so local code edits
-    # automatically invalidate the cache. Resolved via find_spec, which does
-    # NOT import the (heavy) model module itself.
+    # Resolve source without importing the heavy model module.
     try:
         spec = importlib.util.find_spec(module_name)
         if spec is not None and spec.origin and os.path.isfile(spec.origin):
-            st = os.stat(spec.origin)
-            parts.append(str(st.st_mtime_ns))
-            parts.append(str(st.st_size))
+            from vllm.compilation.startup_assets import file_hash
+            parts.append(file_hash(Path(spec.origin)))
+        else:
+            return None
+        if not module_name.startswith("vllm.model_executor.models."):
+            return None  # Custom plugins need an explicit dependency identity.
+        parts.append(source_hash("model_executor/models", "model_executor/layers"))
     except Exception:
-        pass
+        return None
 
     return hashlib.sha256("|".join(parts).encode()).hexdigest()[:32]
 
 
 def _model_info_cache_file(key: str):
     from vllm.compilation.startup_resources import resource_dir
-    return resource_dir("model_info_cache") / f"{key}.json"
+    return resource_dir("model_info") / f"{key}.json"
 
 
 def _load_cached_model_info(module_name: str,
@@ -354,8 +358,10 @@ def _load_cached_model_info(module_name: str,
         path = _model_info_cache_file(key)
         if not path.is_file():
             return None
-        with open(path) as f:
-            data = json.load(f)
+        from vllm.compilation.startup_assets import read_record
+        data = read_record(path, {"key": key, "module": module_name, "class": class_name})
+        if data is None:
+            return None
         return _ModelInfo(**data)
     except Exception:
         logger.warning("Failed to load cached model info for %s:%s",
@@ -370,11 +376,10 @@ def _store_cached_model_info(module_name: str, class_name: str,
         return
     try:
         path = _model_info_cache_file(key)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f"{key}.{os.getpid()}.tmp")
-        with open(tmp, "w") as f:
-            json.dump(asdict(info), f)
-        os.replace(tmp, path)
+        from vllm.compilation.startup_assets import locked, record, write_json
+        with locked(path):
+            write_json(path, record({"key": key, "module": module_name,
+                                     "class": class_name}, asdict(info)))
     except Exception:
         logger.warning("Failed to store cached model info for %s:%s",
                        module_name, class_name, exc_info=True)

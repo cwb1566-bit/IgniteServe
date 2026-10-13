@@ -78,6 +78,9 @@ class EngineCore:
         if requested_mode == "execute-generated":
             contract = os.environ.get("VLLM_STARTUP_CONTRACT_PATH")
             adapter = os.environ.get("VLLM_STARTUP_ADAPTER_PATH")
+            if not contract:
+                from vllm.v1.engine.startup_analysis.generated import repository_contract
+                contract = repository_contract(vllm_config, Path(__file__))
             if contract:
                 from vllm.v1.engine.startup_analysis.generated import (
                     GeneratedStartupRejected,
@@ -496,7 +499,7 @@ class EngineCore:
         executor_fail_callback: Optional[Callable],
     ) -> None:
         """Plan from EngineCore construction and expand after state probing."""
-        from vllm.compilation.startup_resources import resource_dir
+        from vllm.compilation.startup_resources import resource_dir, run_dir
         from vllm.v1.engine.startup_orchestrator import (
             ResourceAwareDAGExecutor,
             StartupContext,
@@ -509,11 +512,11 @@ class EngineCore:
             write_plan,
         )
 
-        root = resource_dir("startup_orchestration")
+        root = run_dir()
         model_name = Path(str(vllm_config.model_config.model)).name
         plan_path = root / "plans" / (
             f"{model_name}_{os.getpid()}_{time.time_ns()}.json")
-        history = StartupCostHistory(root / "startup_costs.json")
+        history = StartupCostHistory(resource_dir("startup_cost"))
         bootstrap_state = StartupState(
             model=str(vllm_config.model_config.model),
             compile_mode="bootstrap",
@@ -803,13 +806,13 @@ class EngineCore:
         )
 
     def _startup_orchestration_paths(self) -> tuple[Path, Path]:
-        from vllm.compilation.startup_resources import resource_dir
+        from vllm.compilation.startup_resources import resource_dir, run_dir
 
-        root = resource_dir("startup_orchestration")
+        root = run_dir()
         plan_root = root / "plans"
         model_name = Path(str(self.vllm_config.model_config.model)).name
         plan_name = f"{model_name}_{os.getpid()}_{time.time_ns()}.json"
-        return root / "startup_costs.json", plan_root / plan_name
+        return resource_dir("startup_cost"), plan_root / plan_name
 
     def _write_startup_dag_shadow_plan(self) -> None:
         from vllm.v1.engine.startup_orchestrator import (

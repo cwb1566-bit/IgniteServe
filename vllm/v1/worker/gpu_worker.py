@@ -1048,7 +1048,10 @@ class Worker(WorkerBase):
                 kv_value = None
         elif kv_profile_cache.enabled():
             kv_value, kv_key, _, _ = kv_profile_cache.lookup(
-                self.vllm_config, self.device)
+                self.vllm_config, self.device,
+                weights_memory=getattr(self.model_runner, "model_memory_usage", None),
+                requested_memory=getattr(self, "requested_memory", None),
+                init_snapshot=getattr(self, "init_snapshot", None))
         return {
             **static_state,
             "rank": self.rank,
@@ -1069,15 +1072,13 @@ class Worker(WorkerBase):
             except OSError:
                 return False
 
-        compile_root = Path(os.environ.get(
-            "VLLM_CACHE_ROOT",
-            str(Path.home() / ".cache" / "vllm")))
+        compile_root = resource_dir("compile")
         best_config_path = resource_dir("best_config")
         transformed_path = resource_dir("transformed_code")
-        metadata_path = resource_dir("parallel_compile_metadata")
+        metadata_path = resource_dir("input_metadata")
         hotspot_path = Path(os.environ.get(
             "VLLM_CUDA_GRAPH_HOTSPOT_DIR",
-            str(resource_dir("cuda_graph_hotspots"))))
+            str(resource_dir("hotspots"))))
         return {
             "rank": self.rank,
             "compile_cache_present": has_entries(compile_root),
@@ -1180,7 +1181,10 @@ class Worker(WorkerBase):
         )
         if use_persisted_profile_cache:
             cached_value, cache_key, _, cache_entry = kv_profile_cache.lookup(
-                self.vllm_config, self.device)
+                self.vllm_config, self.device,
+                weights_memory=int(self.model_runner.model_memory_usage),
+                requested_memory=self.requested_memory,
+                init_snapshot=self.init_snapshot)
             if cached_value is not None:
                 logger.info(
                     "Skipping profile_run using persisted KV profile cache "
@@ -1238,7 +1242,8 @@ class Worker(WorkerBase):
                 self.vllm_config,
                 self.device,
                 int(available_kv_cache_memory),
-                profile_result=profile_result)
+                profile_result=profile_result,
+                weights_memory=int(self.model_runner.model_memory_usage))
             logger.info(
                 "Persisted KV profile cache key=%s path=%s value=%.2f GiB",
                 cache_key[:16], cache_path, GiB(available_kv_cache_memory))

@@ -215,7 +215,7 @@ def compile_only_forward(model_runner: Any, *, autotune: bool = False,
         device = getattr(model_runner, "device", None)
     semantic = (build_semantic_best_map(offline_root)
                 if resolve_best_config and offline_root else {})
-    pending_saves: list[tuple[str, str | None, dict[str, Any]]] = []
+    pending_saves: list[tuple[str, str | None, dict[str, Any], dict | None]] = []
 
     original_ca_run = CachingAutotuner.run
     original_mm = extern_kernels.mm
@@ -256,15 +256,17 @@ def compile_only_forward(model_runner: Any, *, autotune: bool = False,
             configs_hash = None
 
         data_items: list[dict[str, Any]] = []
+        signature = best_config_cache.tuning_signature(self_ca, args, kwargs)
         if configs_hash:
             best_data, _, _, _ = best_config_cache.lookup(
-                kernel_name, configs_hash, device)
+                kernel_name, configs_hash, device, signature=signature)
             if best_data is not None:
                 data_items = [best_data]
-            elif semantic:
+            elif semantic and signature is not None:
                 candidates = semantic.get((kernel_name, configs_hash))
                 if candidates:
-                    data_items = candidates
+                    data_items = [item for item in candidates
+                                  if item.get("signature") == signature]
 
         if data_items:
             unique = _unique_matching_launchers(self_ca.launchers, data_items)
@@ -278,7 +280,7 @@ def compile_only_forward(model_runner: Any, *, autotune: bool = False,
         _autotune(self_ca, args, kwargs, stream)
         if persist_best_config and self_ca.launchers:
             data = _config_to_best_data(self_ca.launchers[0].config, configs_hash)
-            pending_saves.append((kernel_name, configs_hash, data))
+            pending_saves.append((kernel_name, configs_hash, data, signature))
 
     def compile_only_ca_run(self_ca, *args, stream=None, benchmark_run=False, **kwargs):
         ident = id(self_ca)
@@ -323,12 +325,13 @@ def compile_only_forward(model_runner: Any, *, autotune: bool = False,
         if model_config is not None:
             model_name = getattr(model_config, "model", None)
         saved = 0
-        for kernel_name, configs_hash, data in pending_saves:
+        for kernel_name, configs_hash, data, signature in pending_saves:
             if not configs_hash:
                 continue
             try:
                 best_config_cache.save(kernel_name, configs_hash, "", data,
-                                       source_model=model_name, device=device)
+                                       source_model=model_name, device=device,
+                                       signature=signature)
                 saved += 1
             except Exception as exc:
                 logger.warning(

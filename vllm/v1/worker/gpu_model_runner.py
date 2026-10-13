@@ -353,10 +353,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Offline hit distributions and GPU costs are configuration-specific.
         # Never let a manually selected directory silently authorize replay
         # decisions for a different model, graph mode, or GPU architecture.
-        hotspot_dir = os.environ.get(
-            "VLLM_CUDA_GRAPH_HOTSPOT_DIR",
-            str(resource_dir("cuda_graph_hotspots")),
-        )
         self.cudagraph_profile_manifest = build_cudagraph_profile_manifest(
             model_config=self.model_config,
             cache_config=self.cache_config,
@@ -368,6 +364,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             torch_version=torch.__version__,
             vllm_version=vllm_version,
         )
+        from vllm.compilation.startup_assets import digest
+        from vllm.compilation.startup_resources import run_dir
+        self.hotspot_profile_dir = resource_dir("hotspots") / digest(self.cudagraph_profile_manifest)
+        hotspot_dir = os.environ.get("VLLM_CUDA_GRAPH_HOTSPOT_DIR", str(self.hotspot_profile_dir))
         allow_profile_overwrite = os.environ.get(
             "VLLM_CUDAGRAPH_PROFILE_ALLOW_OVERWRITE", "").lower() in (
                 "1", "true", "yes", "on")
@@ -377,7 +377,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              self.cudagraph_profile_manifest,
              allow_overwrite=allow_profile_overwrite,
          )
-        HotspotAnalyzer.output_dir = Path(hotspot_dir)
+        # Observations belong to this run, not the frozen offline profile.
+        HotspotAnalyzer.output_dir = run_dir() / "hotspots"
+        ensure_cudagraph_profile_manifest(HotspotAnalyzer.output_dir, self.cudagraph_profile_manifest)
         HotspotAnalyzer.profile_manifest = self.cudagraph_profile_manifest
         if self.cudagraph_profile_compatible:
             logger.info("CUDA graph profile manifest %s: %s", hotspot_dir,
@@ -2989,7 +2991,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hotspot_csv_paths.append(
                 os.path.join(env_hotspot_dir, "cuda_graph_hits.csv"))
         hotspot_csv_paths.append(
-            str(resource_file("cuda_graph_hotspots", "cuda_graph_hits.csv")))
+            str(self.hotspot_profile_dir / "cuda_graph_hits.csv"))
         hotspot_csv_paths.append("./analysis_results/cuda_graph_hits.csv")
         csv_path = None
         for path in hotspot_csv_paths:
@@ -3021,6 +3023,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 with open(csv_path, 'r', encoding='utf-8') as f:
                     reader = csv.DictReader(f)
                     for row in reader:
+                        if int(row['batch_size']) <= 0 or int(row['hit_count']) < 0:
+                            raise ValueError("invalid hotspot shape or count")
                         sizes_with_hits.append({
                             'batch_size': int(row['batch_size']),
                             'hit_count': int(row['hit_count']),

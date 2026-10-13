@@ -213,6 +213,11 @@ def _support_torch_compile(
                     or os.getenv("VLLM_ENABLE_DYNAMO_FRONTEND_CACHE", "").lower()
                     in {"1", "true", "yes", "on"}):
                 timer.start("Tracing")
+                from .input_contract import input_contract
+                try:
+                    self._frontend_entry_contract = input_contract((args, kwargs))
+                except (ValueError, TypeError, AttributeError):
+                    self._frontend_entry_contract = None
                 if self.try_restore_dynamo_frontend():
                     with self.dispatch_to_code(0):
                         return self.forward(*args, **kwargs)

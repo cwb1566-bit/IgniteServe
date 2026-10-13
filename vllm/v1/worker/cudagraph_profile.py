@@ -96,6 +96,16 @@ def manifest_path(directory: str | Path) -> Path:
 
 def load_cudagraph_profile_manifest(
         directory: str | Path) -> dict[str, Any] | None:
+    from vllm.compilation.startup_assets import read_record, verify_bundle
+    bundle = Path(directory) / "manifest.json"
+    if bundle.exists():
+        try:
+            identity = json.loads(bundle.read_text())["identity"]
+            if verify_bundle(Path(directory), identity):
+                return identity.get("runtime_profile", identity)
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        return None
     path = manifest_path(directory)
     if not path.is_file():
         return None

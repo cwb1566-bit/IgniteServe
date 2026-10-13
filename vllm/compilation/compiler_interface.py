@@ -422,13 +422,11 @@ class ThreadSafeInductorAdaptor(CompilerInterface):
         # 验证
         if not envs.VLLM_DISABLE_COMPILE_CACHE:
             if hash_str is None:
-                raise RuntimeError(
-                    f"[Thread-{thread_id}] Failed to compile graph_{graph_index}. "
-                    "The most likely reason for this is that a previous compilation "
-                    "failed, leading to a corrupted compilation artifact. "
-                    "We recommend trying to "
-                    "remove ~/.cache/vllm/torch_compile_cache and try again "
-                    "to see the real issue.")
+                # An AOT cache hit can return a callable without invoking the
+                # inner-compile hook. It has no new exportable handle.
+                if callable(compiled_graph):
+                    return compiled_graph, None
+                raise RuntimeError(f"Compilation produced no callable for graph_{graph_index}")
             assert file_path is not None, (
                 f"[Thread-{thread_id}] Failed to get the file path of the compiled graph")
 
@@ -658,17 +656,16 @@ class ThreadSafeInductorAdaptor(CompilerInterface):
         from torch._inductor.codecache import FxGraphCache
 
         with ExitStack() as exit_stack:
-            exit_stack.enter_context(
-                patch("torch._inductor.codecache.FxGraphCache._get_shape_env",
-                      lambda *args, **kwargs: AlwaysHitShapeEnv()))
-
-            if hasattr(AOTAutogradCache, "_get_shape_env"):
-                exit_stack.enter_context(
-                    patch(
-                        "torch._functorch._aot_autograd.autograd_cache.AOTAutogradCache._get_shape_env",
-                        lambda *args, **kwargs: AlwaysHitShapeEnv()))
-
             exit_stack.enter_context(self.metrics_context())
+
+            # Cache lookup runs in a loader thread, outside Dynamo's TLS.
+            # Supply the actual input ShapeEnv, never an always-true guard stub.
+            from torch._guards import TracingContext, detect_fake_mode, tracing
+            if TracingContext.try_get() is None:
+                mode = detect_fake_mode(example_inputs)
+                if mode is None or mode.shape_env is None:
+                    raise ValueError("cache load requires the current input ShapeEnv")
+                exit_stack.enter_context(tracing(TracingContext(mode)))
 
             if torch.__version__.startswith("2.5"):
                 inductor_compiled_graph = FxGraphCache._lookup_graph(

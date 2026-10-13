@@ -8,7 +8,7 @@ from pathlib import Path
 from collections import deque
 from typing import List, Dict, Optional
 from dataclasses import dataclass, field
-from vllm.compilation.startup_resources import resource_dir
+from vllm.compilation.startup_resources import resource_dir, run_dir
 from vllm.logger import init_logger
 from vllm.v1.worker.cudagraph_profile import validate_cudagraph_profile_manifest
 
@@ -367,8 +367,5 @@ class HotspotAnalyzer:
 
 HotspotAnalyzer = HotspotAnalyzer(analysis_thresholds=[1000, 5000, 10000],
             auto_plot=False,
-            output_dir=os.environ.get(
-                "VLLM_CUDA_GRAPH_HOTSPOT_DIR",
-                str(resource_dir("cuda_graph_hotspots")),
-            )
+            output_dir=run_dir() / "hotspots"
 )

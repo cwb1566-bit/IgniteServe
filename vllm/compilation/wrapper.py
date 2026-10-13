@@ -18,9 +18,10 @@ logger = init_logger(__name__)
 
 
 def _dump_dynamo_frontend_artifact_probe(frame, old_code: CodeType,
-                                         new_code: CodeType) -> None:
+                                         new_code: CodeType, *,
+                                         output_dir=None, identity=None) -> None:
     """Dump serialization facts for Dynamo-generated frontend state."""
-    output_dir = (os.getenv("VLLM_DYNAMO_FRONTEND_CACHE_DIR")
+    output_dir = output_dir or (os.getenv("VLLM_DYNAMO_FRONTEND_CACHE_DIR")
                   or os.getenv("VLLM_DYNAMO_ARTIFACT_PROBE_DIR"))
     if not output_dir:
         return
@@ -81,6 +82,14 @@ def _dump_dynamo_frontend_artifact_probe(frame, old_code: CodeType,
     }
     with (probe_dir / f"{stem}.json").open("w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2, sort_keys=True)
+    if identity is not None:
+        from .startup_assets import publish_bundle
+        fx_stem = f"dynamo_fx_rank_{rank}_{os.getpid()}"
+        files = [f"{stem}.json", f"{stem}_transformed_code.marshal",
+                 f"{fx_stem}.json", f"{fx_stem}.fxstruct.pkl",
+                 f"{fx_stem}.fake_evidence.graphpickle"]
+        if all((probe_dir / name).is_file() for name in files):
+            publish_bundle(probe_dir, identity, files)
 
 
 class TorchCompileWrapperWithCustomDispatcher:
@@ -145,6 +154,17 @@ class TorchCompileWrapperWithCustomDispatcher:
         replay_dir_text = (os.getenv("VLLM_DYNAMO_FRONTEND_CACHE_DIR")
                            or os.getenv("VLLM_DYNAMO_FRONTEND_REPLAY_DIR"))
         backend = self._dynamo_backend
+        from .startup_assets import digest, verify_bundle, read_record
+        from .startup_resources import resource_dir
+        from .transformed_code_cache import _code_hash
+        identity = {
+            "runtime": backend.dynamo_frontend_runtime_identity()
+            if backend is not None and not isinstance(backend, str) else None,
+            "code": _code_hash(self.original_code_object),
+            "wrapper": f"{self.__class__.__module__}.{self.__class__.__qualname__}",
+            "entry_inputs": getattr(self, "_frontend_entry_contract", None),
+        }
+        self._frontend_identity = identity
         if not replay_dir_text:
             from vllm.compilation.startup_resources import (env_flag,
                                                              resource_dir)
@@ -152,23 +172,16 @@ class TorchCompileWrapperWithCustomDispatcher:
                 import hashlib
                 import json
                 from vllm.compilation.transformed_code_cache import _code_hash
-                identity = {
-                    "runtime": backend.dynamo_frontend_runtime_identity()
-                    if backend is not None and not isinstance(backend, str)
-                    else None,
-                    "code": _code_hash(self.original_code_object),
-                    "wrapper": (f"{self.__class__.__module__}."
-                                f"{self.__class__.__qualname__}"),
-                }
-                key = hashlib.sha256(json.dumps(
-                    identity, sort_keys=True).encode("utf-8")).hexdigest()[:20]
+                key = digest(identity)
                 rank = self.vllm_config.parallel_config.rank
                 dp_rank = self.vllm_config.parallel_config.data_parallel_rank
                 prefix = getattr(backend, "prefix", "default") or "default"
                 replay_dir_text = str(
                     resource_dir("dynamo_frontend") / key /
                     f"rank_{rank}_{dp_rank}" / prefix)
-                os.environ["VLLM_DYNAMO_FRONTEND_CACHE_DIR"] = replay_dir_text
+        self._frontend_cache_dir = replay_dir_text
+        if backend is not None and not isinstance(backend, str):
+            backend._frontend_cache_dir = replay_dir_text
         if not replay_dir_text or backend is None or isinstance(backend, str):
             return False
 
@@ -180,6 +193,10 @@ class TorchCompileWrapperWithCustomDispatcher:
         from pathlib import Path
 
         replay_dir = Path(replay_dir_text)
+        if identity["entry_inputs"] is None or not verify_bundle(replay_dir, identity):
+            logger.info("Dynamo frontend miss: missing validated bundle/input contract in %s", replay_dir)
+            return False
+        published = read_record(replay_dir / "manifest.json", identity)["files"]
         bundles = []
         for code_metadata_path in replay_dir.glob(
                 "dynamo_frontend_rank_*.json"):
@@ -192,17 +209,13 @@ class TorchCompileWrapperWithCustomDispatcher:
                     f"dynamo_frontend_{suffix}_transformed_code.marshal"),
                 "fx_metadata": replay_dir / f"{fx_stem}.json",
                 "graph": replay_dir / f"{fx_stem}.fxstruct.pkl",
-                "direct_symbols": replay_dir / (
-                    f"{fx_stem}.direct_symbols.graphpickle"),
-                "example_values": replay_dir / (
-                    f"{fx_stem}.example_values.graphpickle"),
+                "evidence": replay_dir / (
+                    f"{fx_stem}.fake_evidence.graphpickle"),
             }
             required = (
                 bundle["code_metadata"], bundle["code"],
-                bundle["fx_metadata"], bundle["graph"])
-            if (all(path.is_file() for path in required)
-                    and (bundle["direct_symbols"].is_file()
-                         or bundle["example_values"].is_file())):
+                bundle["fx_metadata"], bundle["graph"], bundle["evidence"])
+            if all(path.name in published for path in required):
                 bundles.append(bundle)
         if not bundles:
             logger.info("Dynamo frontend replay miss: incomplete artifacts in %s",
@@ -275,37 +288,16 @@ class TorchCompileWrapperWithCustomDispatcher:
         graph = _deserialize_graph_module_for_subprocess(graph_payload)
         graph_restore_s = time.perf_counter() - graph_restore_started
         symbol_restore_started = time.perf_counter()
-        from torch._subclasses.fake_tensor import FakeTensorMode
-        from torch.fx._graph_pickler import GraphPickler
-        from torch.fx.experimental.symbolic_shapes import ShapeEnv
-        fake_mode = FakeTensorMode(shape_env=ShapeEnv())
-        nodes_by_name = {node.name: node for node in graph.graph.nodes}
-        if bundle["direct_symbols"].is_file():
-            direct_symbols = GraphPickler.loads(
-                bundle["direct_symbols"].read_bytes(), fake_mode)
-            symbols_by_name = {}
-            direct_node_names = set()
-            for node_name, symbolic_value in direct_symbols:
-                nodes_by_name[node_name].meta["example_value"] = symbolic_value
-                direct_node_names.add(node_name)
-                symbols_by_name[str(symbolic_value.node.expr)] = (
-                    symbolic_value.node.expr)
-            for node_name, symbol_names in fx_metadata.get(
-                    "symbol_dependencies", {}).items():
-                if node_name in direct_node_names:
-                    continue
-                nodes_by_name[node_name].meta["example_value"] = tuple(
-                    symbols_by_name[name] for name in symbol_names)
-        else:
-            example_values = GraphPickler.loads(
-                bundle["example_values"].read_bytes(), fake_mode)
-            for node_name, example_value in example_values:
-                nodes_by_name[node_name].meta["example_value"] = example_value
+        from .frontend_metadata import restore_metadata
+        fake_mode, example_inputs = restore_metadata(
+            graph, bundle["evidence"].read_bytes())
         symbol_restore_s = time.perf_counter() - symbol_restore_started
         backend_started = time.perf_counter()
         backend._dynamo_frontend_replaying = True
         try:
-            compiled_graph = backend(graph, ())
+            from torch._guards import TracingContext, tracing
+            with tracing(TracingContext(fake_mode)):
+                compiled_graph = backend(graph, example_inputs)
         finally:
             backend._dynamo_frontend_replaying = False
         backend_s = time.perf_counter() - backend_started
@@ -373,7 +365,10 @@ class TorchCompileWrapperWithCustomDispatcher:
 
         self.compiled_codes.append(new_code)
         try:
-            _dump_dynamo_frontend_artifact_probe(frame, old_code, new_code)
+            _dump_dynamo_frontend_artifact_probe(
+                frame, old_code, new_code,
+                output_dir=getattr(self, "_frontend_cache_dir", None),
+                identity=getattr(self, "_frontend_identity", None))
         except Exception:
             logger.exception("Failed to dump Dynamo frontend artifact probe")
         local_cache_dir = self.vllm_config.compilation_config.local_cache_dir
