@@ -666,6 +666,7 @@ if _build_custom_ops():
 package_data = {
     "vllm": [
         "py.typed",
+        "v1/engine/startup_contract.json",
         "model_executor/layers/fused_moe/configs/*.json",
         "model_executor/layers/quantization/utils/configs/*.json",
     ]

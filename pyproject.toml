@@ -49,7 +49,7 @@ lora_filesystem_resolver = "vllm.plugins.lora_resolvers.filesystem_resolver:regi
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["vllm*"]
+include = ["vllm*", "igniteserve_startup*"]
 
 [tool.yapfignore]
 ignore_patterns = [

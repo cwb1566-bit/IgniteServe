@@ -76,6 +76,13 @@ class EngineCore:
         requested_mode = os.environ.get(
             "VLLM_STARTUP_DAG_MODE", "off").strip().lower()
         if requested_mode == "execute-generated":
+            from vllm.v1.engine.declarative_startup import uses_v3
+            if uses_v3(os.environ.get("VLLM_STARTUP_CONTRACT_PATH")):
+                self._initialize_engine_core(
+                    vllm_config, executor_class, log_stats,
+                    executor_fail_callback)
+                return
+        if requested_mode == "execute-generated":
             contract = os.environ.get("VLLM_STARTUP_CONTRACT_PATH")
             adapter = os.environ.get("VLLM_STARTUP_ADAPTER_PATH")
             if not contract:
@@ -173,12 +180,13 @@ class EngineCore:
         deferred_supported = bool(
             getattr(executor_class, "supports_deferred_startup",
                     lambda: False)())
-        if requested_dag_mode == "execute" and deferred_supported:
-            self._initialize_with_full_startup_dag(
+        if requested_dag_mode in {"execute", "execute-generated"} and deferred_supported:
+            if self._initialize_with_full_startup_dag(
                 vllm_config, executor_class, log_stats,
-                executor_fail_callback)
-            timer.end("Total Init")
-            return
+                executor_fail_callback):
+                timer.end("Total Init")
+                return
+            self._startup_dag_mode_override = "off"
         if requested_dag_mode == "execute" and not deferred_supported:
             logger.warning(
                 "Executor %s does not expose deferred startup stages; "
@@ -492,274 +500,11 @@ class EngineCore:
         self._adaptive_cudagraph_last_slo_capture_step = 0
 
     def _initialize_with_full_startup_dag(
-        self,
-        vllm_config: VllmConfig,
-        executor_class: type[Executor],
-        log_stats: bool,
-        executor_fail_callback: Optional[Callable],
-    ) -> None:
-        """Plan from EngineCore construction and expand after state probing."""
-        from vllm.compilation.startup_resources import resource_dir, run_dir
-        from vllm.v1.engine.startup_orchestrator import (
-            ResourceAwareDAGExecutor,
-            StartupContext,
-            StartupCostHistory,
-            StartupState,
-            build_bootstrap_startup_dag,
-            build_engine_startup_dag,
-            combine_startup_dags,
-            write_bootstrap_plan,
-            write_plan,
-        )
-
-        root = run_dir()
-        model_name = Path(str(vllm_config.model_config.model)).name
-        plan_path = root / "plans" / (
-            f"{model_name}_{os.getpid()}_{time.time_ns()}.json")
-        history = StartupCostHistory(resource_dir("startup_cost"))
-        bootstrap_state = StartupState(
-            model=str(vllm_config.model_config.model),
-            compile_mode="bootstrap",
-            kv_profile_hit=False,
-            attributes={
-                "planning_state": "before_worker_state",
-                "executor_class": (executor_class.__module__ + "." +
-                                   executor_class.__qualname__),
-                "device": str(vllm_config.device_config.device),
-                "dtype": str(vllm_config.model_config.dtype),
-                "max_model_len": vllm_config.model_config.max_model_len,
-                "max_num_batched_tokens": (
-                    vllm_config.scheduler_config.max_num_batched_tokens),
-                "max_num_seqs": vllm_config.scheduler_config.max_num_seqs,
-                "tensor_parallel_size": (
-                    vllm_config.parallel_config.tensor_parallel_size),
-                "pipeline_parallel_size": (
-                    vllm_config.parallel_config.pipeline_parallel_size),
-                "data_parallel_size": (
-                    vllm_config.parallel_config.data_parallel_size),
-            },
-        )
-
-        def timed(stage_name, action):
-            def invoke(context):
-                timer.start(stage_name)
-                try:
-                    return action(context)
-                finally:
-                    timer.end(stage_name)
-            return invoke
-
-        def construct_core(_):
-            self._initialize_engine_core_fields(vllm_config, log_stats)
-            logger.info("Initializing a V1 LLM engine (v%s) with config: %s",
-                        VLLM_VERSION, vllm_config)
-
-        def load_plugins(_):
-            from vllm.plugins import load_general_plugins
-            load_general_plugins()
-
-        def executor_shell(_):
-            self.model_executor = executor_class(vllm_config, defer_init=True)
-            if executor_fail_callback is not None:
-                self.model_executor.register_failure_callback(
-                    executor_fail_callback)
-
-        def state_probe(context):
-            state = self._collect_startup_state()
-            static_states = context.get("static_worker_states")
-            if static_states:
-                state.attributes["static_worker_states"] = static_states
-            return context.put("startup_state", state)
-
-        def static_resource_probe(context):
-            snapshots = self.collective_rpc(
-                "get_static_startup_resource_snapshot")
-            return context.put("static_worker_states", snapshots)
-
-        bootstrap_actions = {
-            "engine_core_construct": timed("EngineCore Construct",
-                                             construct_core),
-            "plugins": timed("Plugin Initialization", load_plugins),
-            "executor_shell": timed("Executor Shell", executor_shell),
-            "worker_wrapper": timed(
-                "Worker Wrapper",
-                lambda _: self.model_executor.initialize_worker_wrapper()),
-            "worker_prepare": timed(
-                "Worker Prepare", lambda _: self.model_executor.prepare_worker()),
-            "worker_construct": timed(
-                "Worker Construct",
-                lambda _: self.model_executor.construct_worker()),
-            "static_resource_probe": timed(
-                "Static Resource Probe", static_resource_probe),
-            "cuda_device": timed(
-                "CUDA Device Initialization",
-                lambda _: self.model_executor.initialize_cuda_device()),
-            "distributed_environment": timed(
-                "Distributed Environment",
-                lambda _: self.model_executor.
-                initialize_distributed_environment()),
-            "compile_worker_prewarm": timed(
-                "Compile Worker Prewarm",
-                lambda _: self.model_executor.
-                initialize_compile_worker_prewarm()),
-            "model_runner": timed(
-                "GPU ModelRunner Initialization",
-                lambda _: self.model_executor.initialize_model_runner()),
-            "usage_reporting": timed(
-                "Usage Reporting",
-                lambda _: self.model_executor.initialize_usage_reporting()),
-            "state_probe": timed("Startup State Probe", state_probe),
-        }
-        bootstrap = build_bootstrap_startup_dag(bootstrap_actions)
-        bootstrap_defaults = {
-            name: node.estimated_cost_s for name, node in bootstrap.nodes.items()
-        }
-        bootstrap = build_bootstrap_startup_dag(
-            bootstrap_actions,
-            history.estimates(bootstrap_state, bootstrap_defaults))
-        write_bootstrap_plan(plan_path, bootstrap)
-
-        bootstrap_executor = ResourceAwareDAGExecutor(
-            max_workers=max(1, int(os.environ.get(
-                "VLLM_STARTUP_DAG_BOOTSTRAP_MAX_WORKERS", "2"))),
-            resource_capacities={
-                "worker_rpc": 1,
-                "gpu_runtime": 1,
-                "gpu_memory": 1,
-                "compiler_cpu": 1,
-                "cpu": 2,
-            })
-        context = StartupContext(bootstrap_state)
-        timer.start("Startup DAG Bootstrap")
-        try:
-            bootstrap_results = bootstrap_executor.run(bootstrap, context)
-        finally:
-            timer.end("Startup DAG Bootstrap")
-        history.update(bootstrap_state, bootstrap_results)
-
-        state = context.require("startup_state")
-        overlap_weight_compile = os.environ.get(
-            "VLLM_ENABLE_WEIGHT_COMPILE_OVERLAP", "").strip().lower() in {
-                "1", "true", "yes", "on"
-            }
-
-        def init_model(_):
-            self.model_executor.init_model()
-
-        def stop_weight_prewarm(_):
-            stop_async_weight_prewarm_from_env("EngineCore.load_weights")
-
-        def load_weights(_):
-            if overlap_weight_compile:
-                self.model_executor.load_weights_and_trigger_compile()
-            else:
-                self.model_executor.load_weights()
-
-        def compile_model(_):
-            if not overlap_weight_compile:
-                self.model_executor.run_to_trigger_compile()
-
-        def kv_profile(ctx):
-            return ctx.put(
-                "available_gpu_memory",
-                self.model_executor.determine_available_memory())
-
-        def kv_cache_allocate(ctx):
-            available = ctx.require("available_gpu_memory")
-            gpu_blocks, cpu_blocks, config = self._initialize_kv_caches(
-                self.vllm_config, available)
-            self.vllm_config.cache_config.num_gpu_blocks = gpu_blocks
-            self.vllm_config.cache_config.num_cpu_blocks = cpu_blocks
-            self.collective_rpc("initialize_cache",
-                                args=(gpu_blocks, cpu_blocks))
-            return ctx.put("kv_cache_config", config)
-
-        def structured_output(_):
-            self.structured_output_manager = StructuredOutputManager(
-                self.vllm_config)
-
-        def mm_input_cache(_):
-            self.mm_input_cache_server = MirroredProcessingCache(
-                self.vllm_config.model_config)
-
-        def create_scheduler(ctx):
-            scheduler_cls = self.vllm_config.scheduler_config.scheduler_cls
-            Scheduler = (resolve_obj_by_qualname(scheduler_cls)
-                         if isinstance(scheduler_cls, str) else scheduler_cls)
-            self.scheduler = Scheduler(
-                vllm_config=self.vllm_config,
-                kv_cache_config=ctx.require("kv_cache_config"),
-                structured_output_manager=self.structured_output_manager,
-                include_finished_set=(self.vllm_config.parallel_config.
-                                      data_parallel_size > 1),
-                log_stats=self.log_stats,
-            )
-
-        def create_batch_queue(_):
-            self.batch_queue_size = self.model_executor.max_concurrent_batches
-            self.batch_queue = None
-            if self.batch_queue_size > 1:
-                self.batch_queue = queue.Queue(self.batch_queue_size)
-
-        runtime_actions = {
-            "init_model": timed("Init Model", init_model),
-            "stop_weight_prewarm": stop_weight_prewarm,
-            "load_weights": timed(
-                "Weight-Compile Overlap" if overlap_weight_compile else
-                "Loading Weights", load_weights),
-            "compile_model": timed("Model Compilation", compile_model),
-            "kv_profile": timed("KV Profile", kv_profile),
-            "kv_cache_allocate": timed("KV Cache Allocation",
-                                         kv_cache_allocate),
-            "cuda_graph_precapture": timed(
-                "CUDA Graph Pre-capture",
-                lambda _: self.model_executor.compile_or_warm_up_model()),
-            "structured_output": timed("Others.Structured Output",
-                                         structured_output),
-            "mm_input_cache": timed("Others.MM Input Cache", mm_input_cache),
-            "scheduler": timed("Others.Scheduler", create_scheduler),
-            "batch_queue": timed("Others.Batch Queue", create_batch_queue),
-            "ready": lambda _: None,
-        }
-        runtime = build_engine_startup_dag(state, runtime_actions)
-        runtime_defaults = {
-            name: node.estimated_cost_s for name, node in runtime.nodes.items()
-        }
-        runtime = build_engine_startup_dag(
-            state, runtime_actions, history.estimates(state, runtime_defaults))
-        expanded = combine_startup_dags(bootstrap, runtime)
-        write_plan(plan_path, state, expanded, bootstrap_results)
-
-        runtime_executor = ResourceAwareDAGExecutor(
-            # Two workers are the minimum needed to preserve the established
-            # compile-only/weight-loading overlap. A one-worker schedule would
-            # execute compile-only against unloaded parameters.
-            max_workers=max(2, int(os.environ.get(
-                "VLLM_STARTUP_DAG_MAX_WORKERS", "2"))),
-            resource_capacities={
-                "worker_rpc": 2,
-                "disk_io": 1,
-                "compiler_cpu": 1,
-                "gpu_compute": 1,
-                "gpu_memory": 1,
-                "cpu": 2,
-            })
-        timer.start("Startup DAG Runtime")
-        try:
-            runtime_results = runtime_executor.run(runtime, context)
-        finally:
-            timer.end("Startup DAG Runtime")
-        history.update(state, runtime_results)
-        all_results = {**bootstrap_results, **runtime_results}
-        write_plan(plan_path, state, expanded, all_results)
-        logger.info(
-            "Full startup DAG finished: plan=%s bootstrap_nodes=%d "
-            "runtime_nodes=%d state=%s", plan_path, len(bootstrap.nodes),
-            len(runtime.nodes), state.signature()[:16])
-        from vllm.v1.engine.startup_analysis.recorder import get_startup_recorder
-        startup_recorder = get_startup_recorder()
-        if startup_recorder is not None:
-            startup_recorder.flush()
+        self, vllm_config, executor_class, log_stats, executor_fail_callback,
+    ) -> bool:
+        from vllm.v1.engine.declarative_startup import run
+        return run(self, vllm_config, executor_class, log_stats,
+                   executor_fail_callback)
 
     def _collect_startup_state(self):
         from vllm.v1.engine.startup_orchestrator import StartupState
