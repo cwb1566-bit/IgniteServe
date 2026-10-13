@@ -1,6 +1,41 @@
 # 统一启动资产仓库
 
-适用于 `IgniteServe/integrated-startup-contract-mixed`。不改变现有优化开关或启动模式的默认值。
+适用于 `IgniteServe/integrated-startup-contract-mixed`。
+
+## 一键启动优化
+
+构造 `VllmConfig` 时，`VLLM_ENABLE_STARTUP_OPTIMIZATIONS=1` 为下列未设置的子项填入默认值。显式子项始终优先，例如 `VLLM_STARTUP_DAG_MODE=off/discover/execute-generated` 或某项 `=0` 不会被覆盖。
+
+| 功能 | 子项及默认值 |
+|---|---|
+| 已有人工 DAG | `VLLM_STARTUP_DAG_MODE=execute` |
+| Dynamo 前端缓存 | `VLLM_ENABLE_DYNAMO_FRONTEND_CACHE=1` |
+| 子进程并行编译 | `VLLM_ENABLE_SUBPROCESS_COMPILE=1` |
+| 自适应 CUDA 图管理 | `VLLM_ENABLE_ADAPTIVE_CUDAGRAPH=1` |
+| 编译池快速关闭 | `TORCHINDUCTOR_FULL_FX_FAST_SHUTDOWN=1` |
+| 权重分片预取 | `VLLM_ENABLE_WEIGHT_SHARD_PIPELINE=1` |
+| 权重加载与编译重叠 | `VLLM_ENABLE_WEIGHT_COMPILE_OVERLAP=1` |
+| 两阶段编译 worker 预热 | `VLLM_ENABLE_TWO_PHASE_FULL_FX_PREWARM=1` |
+| 编译器身份异步预热 | `VLLM_ENABLE_ASYNC_COMPILER_HASH_PREWARM=1` |
+
+只在主开关开启时填默认值；关闭或不设置主开关时，不改写原有环境。环境配置是进程级的，解析后供引擎及子进程继承；不要在同一进程内通过反复修改主开关切换实例配置，应使用独立进程。
+
+上述配置不会绕过硬件、模型或执行器能力检查，不会自动批准生成合同，也不会开启 persistent shell。已存在的显式 FILE/DIR 路径继续有效。没有兼容冻结热点表时仍回退默认预捕获图集合。
+
+权重加载/编译重叠不再按模型架构名称限制；仍检查编译模式、非量化、无 LoRA/推测解码及 auto/safetensors 加载格式，并保留权重就绪屏障。自定义 loader 若替换参数存储或改变张量属性，应先关闭重叠并单独验证。
+
+服务器当前账户的默认仓库已通过 `~/.config/igniteserve/config.json` 设置为 `~/igniteserve_assets`。手动启动：
+
+```bash
+conda activate vllm_concurrent_capture
+cd ~/data/igniteserve_integrated_startup
+PYTHONPATH="$PWD" CUDA_VISIBLE_DEVICES=0 VLLM_ENABLE_STARTUP_OPTIMIZATIONS=1 \
+python -m vllm.entrypoints.openai.api_server \
+  --model /data/wenbiao/models/Qwen3-4B --max-model-len 2048 \
+  --host 127.0.0.1 --port 8000
+```
+
+需要改用其他资产仓库时设置 `VLLM_STARTUP_RESOURCE_ROOT`。确认所选 GPU 空闲；既有 shell 若残留子项 `=0` 或其他 DAG 模式，需先取消相应覆盖。
 
 ## 目录与读取
 

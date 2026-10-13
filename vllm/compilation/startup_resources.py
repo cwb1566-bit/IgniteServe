@@ -37,6 +37,31 @@ def startup_optimizations_enabled() -> bool:
     return env_flag("VLLM_ENABLE_STARTUP_OPTIMIZATIONS", False)
 
 
+STARTUP_OPTIMIZATION_DEFAULTS = {
+    "VLLM_STARTUP_DAG_MODE": "execute",
+    "VLLM_ENABLE_DYNAMO_FRONTEND_CACHE": "1",
+    "VLLM_ENABLE_SUBPROCESS_COMPILE": "1",
+    "VLLM_ENABLE_ADAPTIVE_CUDAGRAPH": "1",
+    "TORCHINDUCTOR_FULL_FX_FAST_SHUTDOWN": "1",
+    "VLLM_ENABLE_WEIGHT_SHARD_PIPELINE": "1",
+    "VLLM_ENABLE_WEIGHT_COMPILE_OVERLAP": "1",
+    "VLLM_ENABLE_TWO_PHASE_FULL_FX_PREWARM": "1",
+    "VLLM_ENABLE_ASYNC_COMPILER_HASH_PREWARM": "1",
+}
+
+
+def apply_startup_optimization_defaults() -> dict[str, str]:
+    """Resolve process-wide defaults before creating any engine workers.
+
+    Explicit child settings win, including off/discover/generated DAG modes.
+    Environment settings remain fixed for this engine process and its children.
+    """
+    if not startup_optimizations_enabled():
+        return {}
+    return {name: os.environ.setdefault(name, value)
+            for name, value in STARTUP_OPTIMIZATION_DEFAULTS.items()}
+
+
 def repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 

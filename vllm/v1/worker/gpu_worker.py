@@ -926,18 +926,9 @@ class Worker(WorkerBase):
         self.model_runner.load_weights()
 
     def _weight_compile_overlap_eligibility(self) -> tuple[bool, list[str]]:
-        """Check whether compile-only may observe an in-place weight load."""
+        """Gate overlap by loading configuration, not architecture names."""
         reasons: list[str] = []
         model_config = self.vllm_config.model_config
-        architectures = set(
-            getattr(model_config.hf_config, "architectures", None) or ())
-        supported_architectures = {
-            "LlamaForCausalLM",
-            "Qwen2ForCausalLM",
-        }
-        if not architectures or not architectures.issubset(
-                supported_architectures):
-            reasons.append(f"unsupported_architectures={sorted(architectures)}")
         if model_config.quantization is not None:
             reasons.append(f"quantization={model_config.quantization}")
         if self.vllm_config.speculative_config is not None:

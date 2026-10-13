@@ -4531,6 +4531,12 @@ class VllmConfig:
         """Verify configs are valid & consistent with each other.
         """
 
+        from vllm.compilation.startup_resources import (
+            apply_startup_optimization_defaults)
+        startup_defaults = apply_startup_optimization_defaults()
+        if startup_defaults:
+            logger.info("Startup optimization settings: %s", startup_defaults)
+
         self.try_verify_and_update_config()
 
         if self.model_config is not None:

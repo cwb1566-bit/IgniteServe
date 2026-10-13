@@ -10,12 +10,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--dag", default="execute")
+    parser.add_argument("--dag")
     parser.add_argument("--memory-utilization", type=float, default=0.35)
     parser.add_argument("--max-model-len", type=int, default=128)
     args = parser.parse_args()
     import os
-    os.environ["VLLM_STARTUP_DAG_MODE"] = args.dag
+    if args.dag is not None:
+        os.environ["VLLM_STARTUP_DAG_MODE"] = args.dag
     from vllm import LLM, SamplingParams
     from vllm.compilation.startup_resources import resource_root
     started = time.perf_counter()
@@ -25,7 +26,8 @@ def main():
     startup = time.perf_counter() - started
     outputs = llm.generate(["The capital of France is", "Explain a compiler in one sentence."],
                            SamplingParams(temperature=0, max_tokens=16))
-    result = {"model": args.model, "dag": args.dag, "root": str(resource_root()),
+    result = {"model": args.model, "dag": os.getenv("VLLM_STARTUP_DAG_MODE", "off"),
+              "root": str(resource_root()),
               "startup_s": startup,
               "tokens": [o.outputs[0].token_ids for o in outputs],
               "texts": [o.outputs[0].text for o in outputs]}

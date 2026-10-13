@@ -10,7 +10,7 @@
 本分支保留 mixed 版本的运行时、分布式启动优化、persistent shell、
 Dynamo frontend cache，以及自动合同分支的发现、生成、审核和验证工具。
 
-`VLLM_STARTUP_DAG_MODE` 默认仍为 `off`，可选：
+未开启主开关时，`VLLM_STARTUP_DAG_MODE` 默认为 `off`；开启 `VLLM_ENABLE_STARTUP_OPTIMIZATIONS=1` 后，未显式设置的 DAG 模式默认 `execute`。九项一键默认及覆盖规则见 `STARTUP_ASSETS_CN.md`。可选模式：
 
 | 值 | 行为 |
 |---|---|
@@ -36,8 +36,8 @@ discover 的 off 基线保留引擎原本的权重加载线程等内部行为；
 * 显式 TOP_K、强制全图及关闭开关继续有效。
 * shadow 校验默认关闭。
 
-建议在启动配置中显式设置 `VLLM_ENABLE_ADAPTIVE_CUDAGRAPH=1`，使
-EngineCore 的旧 idle/SLO 开关与 worker controller 一致。
+主开关现在为未设置的 `VLLM_ENABLE_ADAPTIVE_CUDAGRAPH` 填入1，使
+EngineCore 的 idle/SLO 开关与 worker controller 一致；单项仍可显式覆盖。
 详细参数见 `MIXED_CAPTURE_DEFAULTS.md`。
 
 HotspotAnalyzer 合入了按 engine generation 保存分片、原子汇总CSV的逻辑，
@@ -112,9 +112,7 @@ python tools/prepare_local_runtime.py \
 ```bash
 conda activate vllm_concurrent_capture
 cd /data/wenbiao/igniteserve_integrated_startup
-PYTHONPATH="$PWD" CUDA_VISIBLE_DEVICES=0 VLLM_USE_V1=1 \
-VLLM_ENABLE_STARTUP_OPTIMIZATIONS=1 VLLM_STARTUP_DAG_MODE=execute \
-VLLM_ENABLE_SUBPROCESS_COMPILE=1 VLLM_ENABLE_ADAPTIVE_CUDAGRAPH=1 \
+PYTHONPATH="$PWD" CUDA_VISIBLE_DEVICES=0 VLLM_ENABLE_STARTUP_OPTIMIZATIONS=1 \
 python -m vllm.entrypoints.openai.api_server \
   --model /data/wenbiao/models/Qwen3-4B --max-model-len 2048 --port 8000
 ```
@@ -123,6 +121,15 @@ python -m vllm.entrypoints.openai.api_server \
 预捕获完整注册集合。建议额外指定独立的 `VLLM_CUDA_GRAPH_HOTSPOT_DIR`；
 模型、调度参数或软件版本改变后使用新目录并重新采集，不应改写旧manifest
 绕过检查。导出端现在也校验manifest，拒绝将新统计写入不兼容目录。
+
+## 权重加载与编译重叠
+
+`VLLM_ENABLE_WEIGHT_COMPILE_OVERLAP=1` 不再按模型架构名称设白名单；
+主开关默认启用，显式设置为0仍可关闭完整DAG路径的重叠。
+编译模式、非量化、无LoRA/推测解码以及auto/safetensors加载格式检查保持不变。
+真实调优和首次编译结果执行前仍等待权重就绪；移除架构名单不等于任意自定义
+loader已获正确性验证。自定义loader若替换参数存储或改变张量属性，应显式关闭
+重叠并先验证。旧off路径的加载线程不由此开关统一控制。
 
 ## 真实模型冒烟记录
 
