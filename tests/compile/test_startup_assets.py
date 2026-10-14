@@ -300,7 +300,8 @@ def test_rejected_artifact_recompiles(monkeypatch):
     manager = ParallelCompileManager(1)
     monkeypatch.setattr(manager, "_can_use_subprocess_compile", lambda *a: False)
     monkeypatch.delenv("VLLM_ENABLE_SUBPROCESS_COMPILE", raising=False)
-    compiler = SimpleNamespace(has_cached_graph=lambda *a: True,
+    compiler = SimpleNamespace(semantic_identity=lambda *a: None,
+                               has_cached_graph=lambda *a: True,
                                load=lambda *a, **kw: None)
     runnable = lambda x: x + 1
     monkeypatch.setattr(manager, "_compile_source_graph_serial",

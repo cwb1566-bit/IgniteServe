@@ -43,6 +43,11 @@ def verify(root):
                 raise ValueError("record invalid")
             if path.name == "manifest.json" and not assets.verify_bundle(path.parent, identity):
                 raise ValueError("bundle invalid")
+            if isinstance(identity, dict) and identity.get("schema") == "subgraph-v1":
+                from vllm.compilation.cache_reuse import GlobalSubgraphCache
+                if (path.stem != assets.digest(identity)
+                        or not GlobalSubgraphCache.verify_entry(root, value["data"])):
+                    raise ValueError("subgraph payload missing or invalid")
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
             failures.append({"path": str(path), "reason": str(exc)})
     return {"checked": checked, "failures": failures}

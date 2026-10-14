@@ -109,6 +109,54 @@ checks exactly-once node coverage and real overlap, and removes raw temporary
 traces/cache data automatically. This is empirical validation, not a proof for
 all model/configuration combinations.
 
+## Hierarchical compilation reuse
+
+With `VLLM_ENABLE_STARTUP_OPTIMIZATIONS=1`, the existing global-subgraph switch
+defaults on. Explicit `VLLM_ENABLE_GLOBAL_SUBGRAPH_CACHE=0` disables persistent
+global reuse; `VLLM_ENABLE_GLOBAL_SUBGRAPH_DIRECT_LOOKUP=0` disables its reads.
+No new switch is required. Local backend caches remain in their original layout:
+
+```text
+~/igniteserve_assets/compile/
+  subgraphs/<semantic-key>.json
+  <launch-key>/rank_<rank>_<dp_rank>/<prefix>/...local maps...
+  <launch-key>/rank_<rank>_<dp_rank>/inductor_cache/...
+  <launch-key>/rank_<rank>_<dp_rank>/triton_cache/...
+```
+
+`VLLM_STARTUP_RESOURCE_ROOT` changes the repository root. A SubArtifact descriptor
+contains the canonical graph/input-output identity, backend/options/native-code
+identity, distributed context, relative handle and payload checksums. Its source
+index is provenance, not a lookup condition. Unknown code dependencies or missing
+output evidence conservatively disable semantic reuse for that graph. Freezing
+weights into code is not supported by this value-free semantic identity.
+
+The manager checks instance memory, the launch-local map, then the global index
+before scheduling compilation. Same-key graphs with matching current symbolic
+constraints share a source Future. Persistent loading still evaluates Inductor
+guards with the current ShapeEnv and binds current constants; a JSON hit alone
+does not certify reuse. New subprocess handles are published only after successful
+parent loading. Invalid/missing payloads fall back to compilation.
+
+Global loading passes verified FX-cache bytes to the backend without changing
+process-wide cache directories. It does not copy the entire producer cache;
+Inductor may rematerialize runtime wrappers/kernel files in the consumer cache.
+Supported persistent loading is the current ThreadSafeInductorAdaptor FX format
+(Torch 2.6+); other adaptors retain their local paths. Explicit cache directories
+outside the repository are not exported to the global index.
+
+Export/import retains the existing trusted-code requirement and verifies descriptor
+references. Transfer the whole repository, not just `subgraphs/`. Producer launch
+directories may remain referenced and must not be independently deleted as unused
+cache. Relocation does not waive backend/ABI/guard checks; unavailable backend
+dependencies are misses. Checksums are corruption checks, not authentication.
+
+The optional `VLLM_TEST_REUSE_GPU=1` test in
+`tests/compile/test_hierarchical_reuse.py` exercises separate producer/consumer
+processes, different launch paths and indices, and different parameter values.
+Startup acceptance also requires actual global hits from a new compilation
+directory while preserving greedy outputs and generated-DAG coverage.
+
 ## Porting
 
 Copy/install only `igniteserve_startup` for another engine; it imports neither

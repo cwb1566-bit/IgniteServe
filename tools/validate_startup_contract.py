@@ -27,6 +27,7 @@ def validate(root, model, gpu, output, contract=None):
                 cases.append((f"{'prewarm' if prewarm else 'standard'}-{workers}",
                               "execute", workers, prewarm, "assets"))
         cases.append(("cold", "execute", 4, True, "cold-assets"))
+        cases.append(("global-reuse", "execute", 4, True, "assets"))
         cases.append(("no-weight-overlap", "execute", 4, True, "assets"))
         baseline = None
         for name, mode, workers, prewarm, assets in cases:
@@ -48,6 +49,8 @@ def validate(root, model, gpu, output, contract=None):
             env["VLLM_STARTUP_ADAPTER_PATH"] = str(adapter)
             command = [sys.executable, str(root / "tests/startup_runtime/smoke_declarative_startup.py"),
                        "--model", model, "--output", str(tokens)]
+            if name == "global-reuse":
+                command += ["--compile-cache-dir", str(directory / assets / "compile/new-launch")]
             print(f"START {name}", flush=True)
             with (directory / f"{name}.log").open("w+") as log:
                 proc = subprocess.Popen(command, env=env, stdout=log,
@@ -64,6 +67,10 @@ def validate(root, model, gpu, output, contract=None):
                 if code:
                     log.seek(0)
                     raise RuntimeError(log.read()[-18000:])
+                log.seek(0)
+                global_hits = log.read().count("Global subgraph hit graph_")
+                if name == "global-reuse":
+                    assert global_hits > 0, "new launch directory did not load global subgraphs"
             value = json.loads(tokens.read_text())
             if name == "baseline":
                 baseline = value
@@ -97,6 +104,7 @@ def validate(root, model, gpu, output, contract=None):
                                       compile_route=compile_route,
                                       kv_route=result["results"]["kv_profile"]["route"],
                                       prepared_assets=prepared, reused_reads=reused,
+                                      global_subgraph_hits=global_hits,
                                       elapsed=max(v["finished_at"] for v in intervals)
                                       - min(v["started_at"] for v in intervals)))
             print(f"PASS {name}", flush=True)

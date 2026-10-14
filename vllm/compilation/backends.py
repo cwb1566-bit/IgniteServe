@@ -31,8 +31,8 @@ from vllm.utils import is_torch_equal_or_newer, resolve_obj_by_qualname
 from .compiler_interface import (CompilerInterface, EagerAdaptor,
                                  InductorAdaptor, InductorStandaloneAdaptor,
                                  ThreadSafeInductorAdaptor)
-from .cache_reuse import (GlobalSubgraphCache,
-                          normalized_model_paths)
+from .cache_reuse import (GlobalSubgraphCache, compilation_context,
+                          normalized_model_paths, subgraph_identity)
 from .startup_resources import (enabled_by_master, env_flag,
                                 parallel_compile_metadata_dir, resource_dir, resource_file)
 from .counter import compilation_counter
@@ -164,6 +164,10 @@ class CompilerManager:
         self.compilation_config = compilation_config
         self.compiler = make_compiler(compilation_config)
         self.global_cache: Optional[GlobalSubgraphCache] = None
+        self.reuse_context = None
+        self.semantic_graphs = {}
+        self.global_entries = {}
+        self.pending_artifacts = {}
 
     def _cache_key(self,
                    runtime_shape: Optional[int],
@@ -227,9 +231,9 @@ class CompilerManager:
             for k, (index, handle) in self.compile_metadata_for_reuse.items()}
 
         if (not disable_cache
-                and os.environ.get(
-                    'VLLM_ENABLE_GLOBAL_SUBGRAPH_CACHE', '').lower()
-                in {'1', 'true', 'yes', 'on'}):
+                and isinstance(self.compiler, ThreadSafeInductorAdaptor)
+                and is_torch_equal_or_newer("2.6")
+                and enabled_by_master('VLLM_ENABLE_GLOBAL_SUBGRAPH_CACHE')):
             self.global_cache = GlobalSubgraphCache(cache_dir, prefix)
         else:
             self.global_cache = None
@@ -275,6 +279,47 @@ class CompilerManager:
                                        self.contract_path) if Path(p).is_file()]
         if files:
             assets.publish_bundle(Path(self.cache_dir), self.cache_identity, files)
+        # Publish after successful parent-side binding, including subprocess
+        # results. Descriptors never certify a handle that has only been queued.
+        if self.global_cache is not None:
+            for identity, handle, index, shape in self.pending_artifacts.values():
+                self.global_cache.register(identity, handle, index, shape)
+            self.pending_artifacts.clear()
+
+    def configure_reuse(self, vllm_config):
+        if not structural_reuse_enabled() and self.global_cache is None:
+            return
+        try:
+            self.reuse_context = compilation_context(
+                vllm_config, self.compiler,
+                self.compilation_config.inductor_compile_config)
+        except (ValueError, TypeError, AttributeError) as exc:
+            self.reuse_context = None
+            logger.info("Semantic subgraph reuse disabled: %s", exc)
+
+    def semantic_identity(self, graph, example_inputs, runtime_shape=None):
+        if self.reuse_context is None:
+            return None
+        try:
+            identity = subgraph_identity(graph, example_inputs, self.reuse_context,
+                                         runtime_shape)
+            assets.digest(identity)  # Reject non-deterministic/non-finite fields.
+            return identity
+        except (ValueError, TypeError, KeyError, AttributeError, StopIteration):
+            return None
+
+    def _remember_semantic(self, graph, inputs, index, shape, compiled, handle):
+        identity = self.semantic_identity(graph, inputs, shape)
+        if identity is not None and compiled is not None:
+            key = assets.digest(identity)
+            self.semantic_graphs[self._memory_key(identity, inputs)] = (compiled, index)
+            if handle is not None:
+                self.pending_artifacts[key] = (identity, handle, index, shape)
+
+    def _memory_key(self, identity, inputs):
+        # Direct callable sharing cannot run the disk loader's guard checks.
+        # Keep exact current symbolic constraints for this fast path.
+        return assets.digest([identity, input_contract(tuple(inputs))])
 
     def _input_key(self, graph, example_inputs):
         try:
@@ -288,8 +333,23 @@ class CompilerManager:
 
     def has_cached_graph(self,
                          graph_index: int,
-                         runtime_shape: Optional[int] = None) -> bool:
-        return self._cache_key(runtime_shape, graph_index) in self.cache
+                         runtime_shape: Optional[int] = None,
+                         graph=None, example_inputs=()) -> bool:
+        if self._cache_key(runtime_shape, graph_index) in self.cache:
+            return True
+        return self._global_entry(graph, example_inputs, runtime_shape) is not None
+
+    def _global_entry(self, graph, inputs, shape):
+        if (self.global_cache is None or graph is None
+                or not env_flag('VLLM_ENABLE_GLOBAL_SUBGRAPH_DIRECT_LOOKUP', True)):
+            return None
+        identity = self.semantic_identity(graph, inputs, shape)
+        if identity is None:
+            return None
+        key = assets.digest(identity)
+        if key not in self.global_entries:
+            self.global_entries[key] = self.global_cache.lookup(identity)
+        return self.global_entries[key]
 
     def get_cached_handle(self,
                           graph_index: int,
@@ -340,6 +400,8 @@ class CompilerManager:
             self.compiled_graph_list[
                 self._compiled_key(runtime_shape, graph_index)
             ] = compiled_graph
+            self._remember_semantic(graph, example_inputs, graph_index,
+                                    runtime_shape, compiled_graph, handle)
 
         if handle is None:
             return
@@ -363,14 +425,6 @@ class CompilerManager:
 
         self.compile_metadata_for_reuse[cache_key] = (reuse_source, handle)
         self.is_cache_metadata_updated = True
-        if self.global_cache is not None:
-            self.global_cache.register(
-                self._input_key(graph, example_inputs),
-                handle,
-                self.cache_dir,
-                graph_index,
-                runtime_shape,
-            )
 
     def supports_external_compile_handles(self) -> bool:
         return (not self.disable_cache and isinstance(
@@ -402,34 +456,21 @@ class CompilerManager:
              count_backend_compilations: bool = True) -> Optional[Callable]:
         self._maybe_start_timer(graph_index, track_metrics)
 
+        identity = self.semantic_identity(graph, example_inputs, runtime_shape)
+        reusable = (self.semantic_graphs.get(self._memory_key(identity, example_inputs))
+                    if identity and structural_reuse_enabled() else None)
+        if reusable is not None:
+            compiled_graph, source = reusable
+            self.alias_graph(graph_index, source, runtime_shape)
+            return compiled_graph
+
         handle = self.get_cached_handle(graph_index, runtime_shape)
         current_key = self._input_key(graph, example_inputs)
         if (current_key is None or self.cache_contracts.get(str(self._cache_key(runtime_shape, graph_index))) != current_key):
             self.cache.pop(self._cache_key(runtime_shape, graph_index), None)
+            self.compile_metadata_for_reuse.pop(self._cache_key(runtime_shape, graph_index), None)
             handle = None
-        global_hit = False
-        if (handle is None and self.global_cache is not None
-                and os.environ.get(
-                    'VLLM_ENABLE_GLOBAL_SUBGRAPH_DIRECT_LOOKUP', '').lower()
-                in {'1', 'true', 'yes', 'on'}):
-            handle = self.global_cache.lookup(
-                current_key)
-            global_hit = handle is not None
-        if handle is None:
-            return None
-        if global_hit:
-            cache_key = self._cache_key(runtime_shape, graph_index)
-            self.cache[cache_key] = handle
-            self.cache_contracts[str(cache_key)] = current_key
-            self.compile_metadata_for_reuse[cache_key] = (graph_index, handle)
-            self.is_cache_updated = True
-            self.is_cache_metadata_updated = True
-            logger.info('Loaded graph %s for shape %s from global subgraph cache.',
-                        graph_index, str(runtime_shape))
-        if count_backend_compilations:
-            compilation_counter.num_backend_compilations += 1
-
-        reuse_source = self.get_reuse_source(graph_index, runtime_shape)
+        reuse_source = self.get_reuse_source(graph_index, runtime_shape) if handle else graph_index
         if reuse_source != graph_index:
             reusable_graph = self.get_compiled_graph(reuse_source,
                                                      runtime_shape)
@@ -442,13 +483,38 @@ class CompilerManager:
                                          'Loading')
                 return reusable_graph
 
-        try:
-            compiled_graph = self.compiler.load(handle, graph, example_inputs,
-                                                graph_index, runtime_shape)
-        except Exception as exc:
-            logger.warning("Compiled asset load rejected for graph %s: %s; recompiling", graph_index, exc)
-            self.cache.pop(self._cache_key(runtime_shape, graph_index), None)
+        compiled_graph = None
+        if handle is not None:
+            try:
+                compiled_graph = self.compiler.load(handle, graph, example_inputs,
+                                                    graph_index, runtime_shape)
+            except Exception as exc:
+                logger.warning("Local compiled asset rejected for graph %s: %s", graph_index, exc)
+                self.cache.pop(self._cache_key(runtime_shape, graph_index), None)
+                self.compile_metadata_for_reuse.pop(self._cache_key(runtime_shape, graph_index), None)
+        if compiled_graph is None:
+            entry = self._global_entry(graph, example_inputs, runtime_shape)
+            if entry is not None:
+                try:
+                    handle = (entry['handle'][0], str(assets.member(
+                        self.global_cache.root, entry['handle'][1])))
+                    compiled_graph = self.compiler.load(
+                        handle, graph, example_inputs, graph_index, runtime_shape,
+                        artifact_payloads=self.global_cache.payloads(entry))
+                    if compiled_graph is not None:
+                        self._record_compiled_artifact(graph, graph_index,
+                            runtime_shape, compiled_graph, handle, example_inputs)
+                        logger.info("Global subgraph hit graph_%s key=%s", graph_index,
+                                    assets.digest(identity))
+                except Exception as exc:
+                    logger.warning("Global compiled asset rejected for graph %s: %s", graph_index, exc)
+                    self.global_entries[assets.digest(identity)] = None
+        if compiled_graph is None:
             return None
+        if count_backend_compilations:
+            compilation_counter.num_backend_compilations += 1
+        self._remember_semantic(graph, example_inputs, graph_index, runtime_shape,
+                                compiled_graph, handle)
         self.compiled_graph_list[
             self._compiled_key(runtime_shape, graph_index)
         ] = compiled_graph
@@ -2041,17 +2107,27 @@ class ParallelCompileManager:
             for name, meta in metadata.items() if name in submod_names
         }
         canonical_map = {}
+        semantic_sources = {}
         for index in metadata_by_index:
             source_index = self._resolve_reuse_source(index, reuse_index_map)
             if source_index not in metadata_by_index:
                 source_index = index
+            meta = metadata_by_index[index]
+            identity = compiler_manager.semantic_identity(
+                meta['submod'], meta['args'], runtime_shape)
+            if identity is not None and structural_reuse_enabled():
+                source_index = semantic_sources.setdefault(
+                    compiler_manager._memory_key(identity, meta['args']), index)
             canonical_map[index] = source_index
 
         source_futures = {}
         source_indices = sorted(set(canonical_map.values()))
         cached_source_indices = [
             source_index for source_index in source_indices
-            if compiler_manager.has_cached_graph(source_index, runtime_shape)
+            if compiler_manager.has_cached_graph(
+                source_index, runtime_shape,
+                metadata_by_index[source_index]['submod'],
+                metadata_by_index[source_index]['args'])
         ]
         missing_source_indices = [
             source_index for source_index in source_indices
@@ -2540,6 +2616,7 @@ class VllmBackend:
         split_started = time.perf_counter()
         self.graph = graph
         self.configure_post_pass()
+        self.compiler_manager.configure_reuse(vllm_config)
         self.split_gm, self.piecewise_graphs = split_graph(graph, self.compilation_config.splitting_ops)
         from .operator_pipeline_manifest import export_operator_pipeline_manifest
         pipeline_manifest = export_operator_pipeline_manifest(

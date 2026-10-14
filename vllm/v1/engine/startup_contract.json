@@ -494,7 +494,10 @@
     "igniteserve_startup/contract.py": "7f1e318c9fd275602a1868ecbd52d3e3ec50cb6cbeee14acd125dcf9461424d2",
     "vllm/compilation/startup_assets.py": "edc04bf83298db248cec9c5e70479dec686955fbd2e37f2f0e3181d7c1e3544b",
     "vllm/v1/worker/kv_profile_cache.py": "fbfdc2ab39520801dcca57345cd3c92c0ff57959fb6d090b3500f1b3c4cc21a3",
-    "vllm/compilation/compiler_interface.py": "c871c4cd5f68598420d3aad4585555b9484d81e22b900f5894667e326ad2eacb"
+    "vllm/compilation/compiler_interface.py": "080bc4e8c0062d073cfc39b2e0b1aac1cfc83f3a8d7f87c0d9d95c77c0d9a0ff",
+    "vllm/compilation/backends.py": "81359f5d6d27a313aecbd1b7f1fa6359ee6a9876956bc2fe2f1832e40d9575ba",
+    "vllm/compilation/cache_reuse.py": "2e1e7ccdd33ed1c81a1719a70dc4c7556cf05b5f1efd3a47389f3cd5b0ebd257",
+    "vllm/compilation/input_contract.py": "444cad1ed397f960187b000f023bf001cf3823b00cbcabf158938c1eeee12856"
   },
   "resource_capacities": {
     "cpu": 2,
@@ -538,9 +541,9 @@
     }
   ],
   "validation": {
-    "identity": "a7da732d60121e4840b83cbdbd71bf7e9a584d465b054059cb572c9a432ddb46",
+    "identity": "58980cd6c25768685694bb3c7aae52b907239bd9ddff2592e35579cf36a1004e",
     "review": {
-      "identity": "a7da732d60121e4840b83cbdbd71bf7e9a584d465b054059cb572c9a432ddb46",
+      "identity": "58980cd6c25768685694bb3c7aae52b907239bd9ddff2592e35579cf36a1004e",
       "reviewer": "Codex source review",
       "actions": {
         "engine_core_construct": "approved",
@@ -571,10 +574,10 @@
         "ready": "approved"
       },
       "constraints": "approved",
-      "rationale": "Retain reviewed deferred vLLM lifecycle and readiness constraints. Prepare bounded JSON/CSV data in the consuming worker after runner construction, before init_model. File versions invalidate prepared copies; record identity/checksum, input contracts and live KV memory checks remain. The fused weight/compile action joins both tasks before publishing weights.compile_completed. Only then may compile_already_ready publish ready.compile_model without worker/compiler resources. try_cached_profile retains GPU reservations and may fall back after live validation. All routes retain node inputs/outputs; dispatched routes cannot be changed. ready releases worker-local prepared copies. Named worker affinity and CUDA initialization ordering remain. Cached graph import/binding is serialized across loader threads. Synthetic state/route/resource tests and real serial/scheduled inference validate this single-GPU scope."
+      "rationale": "Reviewed unchanged deferred actions and readiness/resource constraints. Semantic reuse changes are confined to compilation: match current graph input/output evidence, context and distributed identity; validate repository members/checksums; load under real ShapeEnv and metrics/event scopes; reject incompatible artifacts and compile. Subprocess publication follows successful parent loading. No DAG dependency or GPU reservation is removed. Acceptance includes serial/scheduled equivalence and observed cross-launch global hits on Qwen3-4B; this does not certify TP/PP or arbitrary custom kernels."
     },
     "verification": {
-      "identity": "a7da732d60121e4840b83cbdbd71bf7e9a584d465b054059cb572c9a432ddb46",
+      "identity": "58980cd6c25768685694bb3c7aae52b907239bd9ddff2592e35579cf36a1004e",
       "serial_equivalence": true,
       "scheduled_equivalence": true,
       "variants": [
@@ -594,11 +597,12 @@
           "prepared_assets": [
             {
               "files": 14,
-              "bytes": 514613
+              "bytes": 550717
             }
           ],
           "reused_reads": 5,
-          "elapsed": 12.825173699762672
+          "global_subgraph_hits": 0,
+          "elapsed": 15.990762245375663
         },
         {
           "case": "prewarm-4",
@@ -610,11 +614,12 @@
           "prepared_assets": [
             {
               "files": 14,
-              "bytes": 514613
+              "bytes": 550717
             }
           ],
           "reused_reads": 5,
-          "elapsed": 12.253326798789203
+          "global_subgraph_hits": 0,
+          "elapsed": 12.962125450838357
         },
         {
           "case": "standard-1",
@@ -626,11 +631,12 @@
           "prepared_assets": [
             {
               "files": 14,
-              "bytes": 514613
+              "bytes": 550717
             }
           ],
           "reused_reads": 5,
-          "elapsed": 12.126897525042295
+          "global_subgraph_hits": 0,
+          "elapsed": 12.490351336076856
         },
         {
           "case": "standard-4",
@@ -642,11 +648,12 @@
           "prepared_assets": [
             {
               "files": 14,
-              "bytes": 514613
+              "bytes": 550717
             }
           ],
           "reused_reads": 5,
-          "elapsed": 28.323515119962394
+          "global_subgraph_hits": 0,
+          "elapsed": 13.796178057789803
         },
         {
           "case": "cold",
@@ -662,7 +669,25 @@
             }
           ],
           "reused_reads": 0,
-          "elapsed": 43.36779436422512
+          "global_subgraph_hits": 0,
+          "elapsed": 43.43546521803364
+        },
+        {
+          "case": "global-reuse",
+          "nodes": 26,
+          "overlap": true,
+          "token_match": true,
+          "compile_route": "already_compiled",
+          "kv_route": "try_cached_profile",
+          "prepared_assets": [
+            {
+              "files": 14,
+              "bytes": 550717
+            }
+          ],
+          "reused_reads": 17,
+          "global_subgraph_hits": 3,
+          "elapsed": 13.970400915015489
         },
         {
           "case": "no-weight-overlap",
@@ -674,11 +699,12 @@
           "prepared_assets": [
             {
               "files": 14,
-              "bytes": 514613
+              "bytes": 550717
             }
           ],
           "reused_reads": 5,
-          "elapsed": 14.401963210199028
+          "global_subgraph_hits": 0,
+          "elapsed": 15.253194299992174
         }
       ]
     }

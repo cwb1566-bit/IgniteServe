@@ -645,7 +645,8 @@ class ThreadSafeInductorAdaptor(CompilerInterface):
         graph: fx.GraphModule,
         example_inputs: list[Any],
         graph_index: int,
-        runtime_shape: Optional[int] = None
+        runtime_shape: Optional[int] = None,
+        artifact_payloads=None,
     ) -> Callable:
         """加载缓存的编译图（线程安全）"""
         assert isinstance(handle, tuple)
@@ -662,6 +663,10 @@ class ThreadSafeInductorAdaptor(CompilerInterface):
 
         with _cached_graph_load_lock, ExitStack() as exit_stack:
             exit_stack.enter_context(self.metrics_context())
+            # Triton bundle restoration increments top-level compile metrics.
+            # A loader thread has neither Dynamo's event span nor its TLS.
+            from torch._dynamo.utils import dynamo_timed
+            exit_stack.enter_context(dynamo_timed("igniteserve_artifact_load"))
 
             # Cache lookup runs in a loader thread, outside Dynamo's TLS.
             # Supply the actual input ShapeEnv, never an always-true guard stub.
@@ -672,7 +677,30 @@ class ThreadSafeInductorAdaptor(CompilerInterface):
                     raise ValueError("cache load requires the current input ShapeEnv")
                 exit_stack.enter_context(tracing(TracingContext(mode)))
 
-            if torch.__version__.startswith("2.5"):
+            if artifact_payloads is not None:
+                # Feed source cache bytes through Inductor's cache-reader API.
+                # Never switch process-wide cache directories during parallel
+                # compilation. Deserialization still checks the current guards
+                # and rebinds constants to the current graph.
+                import base64
+                from torch._inductor.output_code import CompiledFxGraphConstantsWithGm
+                constants = CompiledFxGraphConstantsWithGm(graph)
+                class Candidate:
+                    def __init__(self, payload):
+                        self.payload = payload
+
+                    def get(self, key):
+                        return {"data": base64.b64encode(self.payload).decode("ascii")}
+
+                inductor_compiled_graph = None
+                for payload in artifact_payloads:
+                    inductor_compiled_graph, _ = FxGraphCache._lookup_graph(
+                        hash_str, example_inputs, False, Candidate(payload), constants)
+                    if inductor_compiled_graph is not None:
+                        break
+                if inductor_compiled_graph is None:
+                    raise ValueError("global artifact guards or dependencies rejected")
+            elif torch.__version__.startswith("2.5"):
                 inductor_compiled_graph = FxGraphCache._lookup_graph(
                     hash_str, example_inputs, True, False)
                 assert inductor_compiled_graph is not None, (

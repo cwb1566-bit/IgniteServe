@@ -4,19 +4,32 @@ import torch
 from .startup_assets import digest
 
 
-def input_contract(value):
+def input_contract(value, *, canonical=False):
     storages = {}
     symbols = {}
     guards = {}
+    shape_envs = set()
+
+    def expression(expr):
+        if not canonical:
+            return str(expr)
+        import sympy
+        for symbol in sorted(expr.free_symbols, key=str):
+            symbols.setdefault(symbol, sympy.Symbol(f"s{len(symbols)}"))
+        return str(expr.xreplace(symbols))
 
     def dim(v):
         if isinstance(v, torch.SymInt):
-            expr = str(v.node.expr)
+            expr = expression(v.node.expr)
             # Keep expressions and their common ShapeEnv, not just a hint.
             env = v.node.shape_env
-            guards.update({str(k): str(r) for k, r in env.var_to_range.items()})
-            guards["expressions"] = [str(g.expr) for g in env.guards]
-            symbols[expr] = str(v.node.expr)
+            if canonical:
+                shape_envs.add(id(env))
+                if len(shape_envs) > 1:
+                    raise ValueError("multiple input ShapeEnvs")
+            else:
+                guards.update({str(k): str(r) for k, r in env.var_to_range.items()})
+                guards["expressions"] = [str(g.expr) for g in env.guards]
             return {"symbol": expr}
         return int(v)
 
@@ -31,7 +44,8 @@ def input_contract(value):
                                "dtype": str(v.dtype), "device": str(v.device),
                                "layout": str(v.layout),
                                "offset": dim(v.storage_offset()), "alias": group,
-                               "requires_grad": v.requires_grad}}
+                               "requires_grad": v.requires_grad,
+                               "conjugate": v.is_conj(), "negative": v.is_neg()}}
         if isinstance(v, torch.SymInt):
             return dim(v)
         if isinstance(v, (tuple, list)):
@@ -42,7 +56,10 @@ def input_contract(value):
             return v
         raise ValueError(f"unsupported input type: {type(v)}")
 
-    return {"value": visit(value), "guards": guards}
+    result = visit(value)
+    # Backend loading evaluates the stored guards against today's ShapeEnv.
+    # Symbol spelling is not semantic; relations across inputs/outputs are.
+    return {"value": result, "guards": guards}
 
 
 def graph_key(graph):
@@ -65,6 +82,8 @@ def graph_key(graph):
             return value
         if isinstance(value, (torch.dtype, torch.device, torch.layout)):
             return str(value)
+        if isinstance(value, torch._ops.OpOverload):
+            return {"operator": str(value)}
         raise ValueError(f"unsupported graph constant: {type(value)}")
 
     description = []

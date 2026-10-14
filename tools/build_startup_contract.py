@@ -53,6 +53,8 @@ def build(root, output):
         "igniteserve_startup/runtime.py", "igniteserve_startup/contract.py",
         "vllm/compilation/startup_assets.py", "vllm/v1/worker/kv_profile_cache.py",
         "vllm/compilation/compiler_interface.py",
+        "vllm/compilation/backends.py", "vllm/compilation/cache_reuse.py",
+        "vllm/compilation/input_contract.py",
     ]
     variants = []
     for prewarm in (True, False):
