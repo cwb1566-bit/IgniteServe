@@ -27,6 +27,7 @@ def validate(root, model, gpu, output, contract=None):
                 cases.append((f"{'prewarm' if prewarm else 'standard'}-{workers}",
                               "execute", workers, prewarm, "assets"))
         cases.append(("cold", "execute", 4, True, "cold-assets"))
+        cases.append(("no-weight-overlap", "execute", 4, True, "assets"))
         baseline = None
         for name, mode, workers, prewarm, assets in cases:
             report = directory / f"{name}.report.json"
@@ -38,6 +39,7 @@ def validate(root, model, gpu, output, contract=None):
                 VLLM_ENABLE_STARTUP_OPTIMIZATIONS="1", VLLM_STARTUP_DAG_MODE=mode,
                 VLLM_STARTUP_DAG_MAX_WORKERS=str(workers),
                 VLLM_ENABLE_TWO_PHASE_FULL_FX_PREWARM="1" if prewarm else "0",
+                VLLM_ENABLE_WEIGHT_COMPILE_OVERLAP="0" if name == "no-weight-overlap" else "1",
                 VLLM_STARTUP_ALLOW_CANDIDATE_VALIDATION="1",
                 VLLM_STARTUP_GENERATED_REPORT=str(report),
                 VLLM_STARTUP_RESOURCE_ROOT=str(directory / assets),
@@ -82,8 +84,19 @@ def validate(root, model, gpu, output, contract=None):
                     assert not overlap
                 elif not overlap:
                     raise AssertionError("Scheduled test did not exercise overlap")
+                compile_route = result["results"]["compile_model"]["route"]
+                assert compile_route == ("default" if name == "no-weight-overlap"
+                                         else "already_compiled")
+                prepared = result["prepared_assets"]
+                released = result["released_assets"]
+                reused = sum(s["reused_reads"] for s in released)
+                if name == "prewarm-4":
+                    assert reused > 0, "Warm startup did not consume prepared assets"
                 summaries.append(dict(case=name, nodes=len(expected), overlap=overlap,
                                       token_match=True,
+                                      compile_route=compile_route,
+                                      kv_route=result["results"]["kv_profile"]["route"],
+                                      prepared_assets=prepared, reused_reads=reused,
                                       elapsed=max(v["finished_at"] for v in intervals)
                                       - min(v["started_at"] for v in intervals)))
             print(f"PASS {name}", flush=True)

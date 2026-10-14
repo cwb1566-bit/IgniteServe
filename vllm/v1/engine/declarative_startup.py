@@ -78,6 +78,8 @@ def run(engine, config, executor_class, log_stats, fail_callback):
             "identity": identity(payload), "execution_kind": "generated_adapter",
             "results": {name: value.__dict__ for name, value in results.items()},
             "states": sorted(context.snapshot()),
+            "prepared_assets": context.get("assets.prepared", []),
+            "released_assets": context.get("assets.released", []),
         }, indent=2))
     logger.info("Declarative startup completed: %d/%d actions", len(results), len(dag.nodes))
     return True

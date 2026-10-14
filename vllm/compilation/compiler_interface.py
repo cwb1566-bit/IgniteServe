@@ -23,6 +23,11 @@ from .inductor_pass import pass_context
 from vllm.logger import init_logger
 logger = init_logger(__name__)
 
+# Cached graph materialization imports Triton extension modules with shared
+# launcher names. Serialize this import/binding phase across loader threads;
+# compilation in separate processes and subsequent graph execution stay parallel.
+_cached_graph_load_lock = threading.RLock()
+
 
 class CompilerInterface:
     """
@@ -655,7 +660,7 @@ class ThreadSafeInductorAdaptor(CompilerInterface):
         from torch._functorch._aot_autograd.autograd_cache import AOTAutogradCache
         from torch._inductor.codecache import FxGraphCache
 
-        with ExitStack() as exit_stack:
+        with _cached_graph_load_lock, ExitStack() as exit_stack:
             exit_stack.enter_context(self.metrics_context())
 
             # Cache lookup runs in a loader thread, outside Dynamo's TLS.

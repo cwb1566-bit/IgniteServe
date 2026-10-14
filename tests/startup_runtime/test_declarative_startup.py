@@ -18,6 +18,58 @@ from igniteserve_startup.runtime import (
 
 
 class SchedulerTests(unittest.TestCase):
+    def test_asset_event_changes_route_cost_and_resources(self):
+        dag, context, order = StartupDAG(), StartupContext(), []
+        release = threading.Event()
+        def prepare_asset(ctx):
+            ctx.put("asset.valid", True)
+            self.assertTrue(release.wait(2))
+        def restore(ctx):
+            order.append("restore")
+            ctx.put("value", 7)
+            release.set()
+        dag.add_node(StageNode("prepare", prepare_asset, resources={"gpu": 1},
+                               produced_state={"asset.valid"}))
+        dag.add_node(StageNode("use", lambda _: self.fail("wrong route"),
+            required_state={"asset.valid"}, produced_state={"value"}, resources={"gpu": 1},
+            routes=[dict(name="restore", when={"asset.valid": True}, action=restore,
+                         resources={}, estimated_cost_s=.01, thread_affinity=None)]))
+        result = ResourceAwareDAGExecutor(2, {"gpu": 1}).run(dag, context)
+        self.assertEqual(order, ["restore"])
+        self.assertEqual(result["use"].route, "restore")
+        self.assertEqual(context.require("value"), 7)
+
+    def test_route_miss_generates_and_preserves_outputs(self):
+        dag, context = StartupDAG(), StartupContext()
+        context.put("asset.valid", False)
+        dag.add_node(StageNode("use", lambda ctx: ctx.put("value", 7),
+            required_state={"asset.valid"}, produced_state={"value"},
+            routes=[dict(name="restore", when={"asset.valid": True},
+                         action=lambda _: self.fail("restored invalid asset"),
+                         resources={}, estimated_cost_s=0., thread_affinity=None)]))
+        result = ResourceAwareDAGExecutor().run(dag, context)
+        self.assertEqual(result["use"].route, "default")
+        self.assertEqual(context.require("value"), 7)
+
+    def test_running_route_is_not_reselected(self):
+        dag, context = StartupDAG(), StartupContext()
+        started, changed = threading.Event(), threading.Event()
+        context.put("asset.valid", True)
+        def restore(ctx):
+            started.set()
+            self.assertTrue(changed.wait(2))
+        def mutate(ctx):
+            self.assertTrue(started.wait(2))
+            ctx.put("asset.valid", False)
+            changed.set()
+        dag.add_node(StageNode("use", lambda _: self.fail("restarted"),
+            required_state={"asset.valid"}, routes=[dict(name="restore",
+                when={"asset.valid": True}, action=restore, resources={},
+                estimated_cost_s=1., thread_affinity=None)]))
+        dag.add_node(StageNode("mutate", mutate))
+        result = ResourceAwareDAGExecutor(2).run(dag, context)
+        self.assertEqual(result["use"].route, "restore")
+
     def test_runtime_has_no_engine_or_torch_imports(self):
         import igniteserve_startup
         root = str(Path(igniteserve_startup.__file__).parent.parent)
@@ -196,6 +248,34 @@ class ContractTests(unittest.TestCase):
         self.payload["variants"][0]["nodes"][0]["resources"] = {"unknown": 1}
         with self.assertRaises(ContractRejected):
             self.load(allow_candidate=True)
+
+    def test_route_binding_and_schema(self):
+        node = self.payload["variants"][0]["nodes"][0]
+        # Use an actual input so predicates have a declared producer.
+        node["required_state"] = ["asset.valid"]
+        self.payload["initial_state"] = ["asset.valid"]
+        route = dict(name="restore", when={"asset.valid": True}, action_id="build",
+                     resources={}, estimated_cost_s=.001, thread_affinity=None)
+        node["routes"] = [route]
+        self.contract.write_text(json.dumps(self.payload))
+        dag, ctx, caps, _ = prepare(self.contract, self.adapter, 40,
+            {"asset.valid": True}, {"engine": "synthetic"}, self.root, allow_candidate=True)
+        result = ResourceAwareDAGExecutor(1, caps).run(dag, ctx)
+        self.assertEqual(ctx.require("answer"), 42)
+        self.assertEqual(result["build"].route, "restore")
+        for field, value in [("resources", {"gpu": 1}), ("action_id", "unknown"),
+                             ("when", {"undeclared": True}),
+                             ("estimated_cost_s", -1), ("dependencies", [])]:
+            node["routes"] = [{**route, field: value}]
+            self.contract.write_text(json.dumps(self.payload))
+            with self.assertRaises(ContractRejected):
+                prepare(self.contract, self.adapter, 40, {"asset.valid": True},
+                        {"engine": "synthetic"}, self.root, allow_candidate=True)
+        node["routes"] = [route, {**route, "name": "ambiguous"}]
+        self.contract.write_text(json.dumps(self.payload))
+        with self.assertRaises(ContractRejected):
+            prepare(self.contract, self.adapter, 40, {"asset.valid": True},
+                    {"engine": "synthetic"}, self.root, allow_candidate=True)
 
     def test_discovery_covers_statements(self):
         source = self.root / "engine.py"

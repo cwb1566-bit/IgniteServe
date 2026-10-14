@@ -3020,7 +3020,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         elif csv_path is not None:
             try:
                 sizes_with_hits = []
-                with open(csv_path, 'r', encoding='utf-8') as f:
+                from io import StringIO
+                from vllm.compilation.startup_assets import read_text
+                with StringIO(read_text(Path(csv_path))) as f:
                     reader = csv.DictReader(f)
                     for row in reader:
                         if int(row['batch_size']) <= 0 or int(row['hit_count']) < 0:

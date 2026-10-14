@@ -7,6 +7,8 @@ import json
 import logging
 import os
 import tempfile
+import threading
+from copy import deepcopy
 from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
@@ -16,6 +18,84 @@ from .startup_resources import resource_dir
 
 logger = logging.getLogger(__name__)
 SCHEMA = "igniteserve-asset-v1"
+
+# Speculative reads never certify compatibility. Consumers still validate each
+# record/bundle, and a changed file invalidates the process-local prepared copy.
+_prepared: dict[Path, tuple[tuple, str, Any]] = {}
+_prepared_lock = threading.Lock()
+_prepared_hits = 0
+
+
+def _version(path: Path) -> tuple:
+    stat = path.stat()
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+
+def clear_prepared() -> dict:
+    global _prepared_hits
+    with _prepared_lock:
+        summary = {"files": len(_prepared), "reused_reads": _prepared_hits}
+        _prepared.clear()
+        _prepared_hits = 0
+    return summary
+
+
+def prefetch(paths, max_bytes: int = 16 * 1024 * 1024, max_files: int = 32) -> dict:
+    """Bounded CPU-only reads; do not import code, unpickle or touch CUDA."""
+    used, count = 0, 0
+    for candidate in paths:
+        if count >= max_files or used >= max_bytes:
+            break
+        path = Path(candidate).expanduser().resolve()
+        try:
+            before = _version(path)
+            if before[2] > max_bytes - used:
+                continue
+            with path.open("rb") as handle:
+                raw = handle.read(max_bytes - used + 1)
+            if len(raw) > max_bytes - used or _version(path) != before:
+                continue
+            text = raw.decode("utf-8")
+            value = json.loads(text) if path.suffix == ".json" else None
+            with _prepared_lock:
+                _prepared[path] = (before, text, value)
+            used += len(raw)
+            count += 1
+        except (OSError, ValueError, UnicodeError):
+            continue
+    return {"files": count, "bytes": used}
+
+
+def _prepared_read(path: Path):
+    global _prepared_hits
+    path = Path(path).expanduser().resolve()
+    with _prepared_lock:
+        entry = _prepared.get(path)
+    if entry is not None:
+        try:
+            unchanged = _version(path) == entry[0]
+        except OSError:
+            unchanged = False
+        if unchanged:
+            with _prepared_lock:
+                _prepared_hits += 1
+            return entry
+        with _prepared_lock:
+            _prepared.pop(path, None)
+    return None
+
+
+def read_text(path: Path) -> str:
+    entry = _prepared_read(path)
+    return entry[1] if entry else Path(path).read_text(encoding="utf-8")
+
+
+def read_json(path: Path) -> Any:
+    entry = _prepared_read(path)
+    # Callers may mutate metadata while binding it to the current engine.
+    if entry:
+        return deepcopy(entry[2]) if entry[2] is not None else json.loads(entry[1])
+    return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
 def digest(value: Any) -> str:
@@ -90,7 +170,7 @@ def record(identity: Any, data: Any) -> dict:
 
 def read_record(path: Path, identity: Any) -> Any:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = read_json(path)
         if (value["schema"] != SCHEMA or digest(value["identity"]) != digest(identity)
                 or value["checksum"] != digest([identity, value["data"]])):
             raise ValueError("schema, identity or checksum mismatch")
@@ -113,7 +193,7 @@ def load(kind: str, identity: Any, override: str | None = None) -> Any:
     # entries are misses. New entries use the same validation as the repository.
     path = Path(override).expanduser()
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = read_json(path)
         entry = value["entries"][digest(identity)]
         if (entry["schema"] == SCHEMA and digest(entry["identity"]) == digest(identity)
                 and entry["checksum"] == digest([identity, entry["data"]])):

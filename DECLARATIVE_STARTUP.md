@@ -46,6 +46,35 @@ never authorizes skipping an action: the existing per-asset validators decide
 whether to load or rebuild. The prewarm variants describe control-flow choices,
 not user-supplied cold/hot labels.
 
+`prepare_startup_assets` runs after model-runner construction, before model
+initialization and weight loading. It keeps bounded JSON/CSV contents in the
+consuming worker: an exact KV-profile candidate, hotspot inputs and speculative
+input-metadata/best-config records. The limit is 32 files / 16 MiB, not a recursive
+read of the asset repository. A prepared read is not a cache hit. Consumers
+still check identity, checksum, graph/input contracts and current memory as
+before; file replacement or modification invalidates the prepared copy. JSON
+consumers receive separate copies. `ready` clears the worker's preparation store.
+Compiled binaries and Dynamo bytecode retain their existing late binding and
+validation; they are not deserialized speculatively before their keys exist.
+Cached Inductor graph import/binding is serialized across loader threads to
+protect shared Triton launcher-module initialization. Compilation in separate
+processes remains parallel.
+
+Optional node `routes` select an action, cost, resource demand and affinity using
+boolean `when` predicates on declared input state. All alternatives retain the
+same dependencies and outputs. The loader rejects missing actions, overlapping
+predicates and invalid resources before startup. Pending routes and downstream
+priorities are reconsidered on state/completion events; dispatch freezes the
+chosen route and its resource reservation. Running work is never restarted.
+Running-node cost uses estimated remaining time when an event wakes scheduling.
+This is a scheduling heuristic, not an optimal wall-time guarantee.
+
+After the fused weight/compile action joins, `compile_model` selects the
+zero-resource `already_compiled` marker. With overlap disabled it runs the usual
+compile action. KV readiness selects `try_cached_profile` only after loaded
+weights have been checked; the KV action revalidates free memory at consumption
+and can still fall back to profiling, so it retains the GPU resource reservation.
+
 Malformed/incompatible contracts fall back before any action. After an action
 starts, failures clean up the engine and propagate; initialization is not
 silently run twice. Adapter import and registry construction must be pure.
@@ -57,7 +86,7 @@ AST/use-def extraction, candidate adapters and opaque review. The portable
 `python -m igniteserve_startup.offline analyze` additionally exposes conservative
 source regions without importing an engine. Neither claims to infer arbitrary
 C++/allocator/alias semantics. This vLLM recipe uses reviewed deferred executor
-boundaries, not an assertion that all 25 boundaries were automatically inferred.
+boundaries, not an assertion that all boundaries were automatically inferred.
 
 To regenerate after source changes, run from the repository root:
 

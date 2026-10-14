@@ -20,7 +20,9 @@ from tools.startup_assets import export, import_archive, publish, verify
 def root(tmp_path, monkeypatch):
     monkeypatch.setenv("VLLM_STARTUP_RESOURCE_ROOT", str(tmp_path / "assets"))
     resources._configured_root.cache_clear()
+    assets.clear_prepared()
     yield tmp_path / "assets"
+    assets.clear_prepared()
     resources._configured_root.cache_clear()
 
 
@@ -57,6 +59,84 @@ def test_record_validation(root):
     assets.write_json(path, value)
     assert assets.load("kv_profile", identity) is None
     assert verify(root)["failures"]
+
+
+def test_prepared_records_reuse_without_bypassing_validation(root, monkeypatch):
+    key = {"model": "x"}
+    path = assets.save("kv_profile", key, {"peak": 42})
+    assert assets.prefetch([path])["files"] == 1
+    def forbid_read(*args, **kwargs):
+        raise AssertionError("prepared record was read again")
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "read_text", forbid_read)
+        value = assets.read_record(path, key)
+        assert value == {"peak": 42}
+        value["peak"] = 123
+        assert assets.read_record(path, key) == {"peak": 42}
+        assert assets.read_record(path, {"model": "wrong"}) is None
+    assets.write_json(path, assets.record(key, {"peak": 99}))
+    assert assets.read_record(path, key) == {"peak": 99}
+    path.unlink()
+    assert assets.read_record(path, key) is None
+
+
+def test_prefetch_corruption_bounds_and_release(root):
+    bad = root / "bad.json"
+    assets.atomic_write(bad, b"not-json")
+    path = assets.save("kv_profile", {}, {"peak": 42})
+    assert assets.prefetch([bad, path], max_bytes=1)["files"] == 0
+    assert assets.prefetch([bad, path])["files"] == 1
+    corrupted = assets.record({}, {"peak": 42})
+    corrupted["checksum"] = "invalid"
+    assets.write_json(path, corrupted)
+    assets.clear_prepared()
+    assert assets.prefetch([path])["files"] == 1
+    assert assets.read_record(path, {}) is None
+    summary = assets.clear_prepared()
+    assert summary["reused_reads"] == 1
+    assert assets.clear_prepared()["files"] == 0
+
+
+def test_prepared_legacy_override_without_json_suffix(root):
+    override = str(root / "legacy-cache")
+    path = assets.save("kv_profile", {"model": "x"}, {"peak": 42}, override)
+    assets.prefetch([path])
+    assert assets.load("kv_profile", {"model": "x"}, override) == {"peak": 42}
+
+
+def test_cached_graph_binding_is_serial_across_adaptors(monkeypatch):
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+    from contextlib import nullcontext
+    from torch._guards import TracingContext
+    from torch._inductor.codecache import FxGraphCache
+    from vllm.compilation.compiler_interface import ThreadSafeInductorAdaptor
+
+    active, peak = 0, 0
+    lock, barrier = threading.Lock(), threading.Barrier(4)
+    def lookup(*args, **kwargs):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        time.sleep(.02)
+        with lock:
+            active -= 1
+        return lambda args: tuple(args), None
+    monkeypatch.setattr(FxGraphCache, "_lookup_graph", lookup)
+    monkeypatch.setattr(TracingContext, "try_get", lambda: object())
+    monkeypatch.setattr(ThreadSafeInductorAdaptor, "metrics_context", lambda _: nullcontext())
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    graph.output((x,))
+    gm = torch.fx.GraphModule({}, graph)
+    def load(index):
+        barrier.wait()
+        return ThreadSafeInductorAdaptor().load((str(index), "file"), gm, [], index)(index)
+    with ThreadPoolExecutor(4) as pool:
+        assert list(pool.map(load, range(4))) == [(0,), (1,), (2,), (3,)]
+    assert peak == 1
 
 
 def test_identity_json_roundtrip(root):
@@ -242,13 +322,18 @@ def test_kv_budget_recomputed(root, monkeypatch):
     monkeypatch.setattr(torch.cuda, "memory_reserved", lambda *_: 100)
     monkeypatch.setattr(torch.cuda, "memory_allocated", lambda *_: 100)
     profile = SimpleNamespace(torch_peak_increase=200, non_torch_increase=50, non_kv_cache_memory=350)
-    kv.save(None, None, 999, profile_result=profile, weights_memory=100)
+    _, path = kv.save(None, None, 999, profile_result=profile, weights_memory=100)
+    assets.prefetch([path])
     value, *_ = kv.lookup(None, None, weights_memory=100, requested_memory=1000,
                           init_snapshot=SimpleNamespace(free_memory=2000))
     assert value == 650 and value != 999
     value, *_ = kv.lookup(None, None, weights_memory=101, requested_memory=1000,
                           init_snapshot=SimpleNamespace(free_memory=2000))
     assert value is None
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *_: (100, 2_000_000_000))
+    value, *_ = kv.lookup(None, None, weights_memory=100, requested_memory=1000,
+                          init_snapshot=SimpleNamespace(free_memory=2000))
+    assert value is None  # A prepared file cannot certify current GPU headroom.
 
 
 def test_frozen_hotspot_publish(root, tmp_path):

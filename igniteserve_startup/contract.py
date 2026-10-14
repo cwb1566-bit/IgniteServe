@@ -108,6 +108,39 @@ def _prepare(path, adapter_path, host, inputs, facts, root, recorder, candidate)
         cost = spec["estimated_cost_s"]
         if type(cost) not in (int, float) or not math.isfinite(cost) or cost < 0:
             raise ContractRejected("Invalid cost")
+        routes = spec.get("routes", [])
+        if not isinstance(routes, list):
+            raise ContractRejected("Routes must be a list")
+        route_names = set()
+        for route in routes:
+            if set(route) != {"name", "when", "action_id", "resources",
+                              "estimated_cost_s", "thread_affinity"}:
+                raise ContractRejected("Routes may not change dependencies or outputs")
+            if (not isinstance(route["name"], str) or not route["name"]
+                    or route["name"] in route_names):
+                raise ContractRejected("Invalid route name")
+            route_names.add(route["name"])
+            when = route["when"]
+            if (not isinstance(when, dict) or not when or not when.keys() <= required
+                    or any(type(v) is not bool for v in when.values())):
+                raise ContractRejected("Route predicates require declared boolean input state")
+            if not isinstance(route["action_id"], str) or not route["action_id"]:
+                raise ContractRejected("Invalid route action")
+            demand, seconds = route["resources"], route["estimated_cost_s"]
+            if (not isinstance(demand, dict) or any(
+                    type(v) is not int or v < 0 or k not in capacities or v > capacities[k]
+                    for k, v in demand.items())):
+                raise ContractRejected("Invalid route resources")
+            if type(seconds) not in (int, float) or not math.isfinite(seconds) or seconds < 0:
+                raise ContractRejected("Invalid route cost")
+            thread = route["thread_affinity"]
+            if thread is not None and (not isinstance(thread, str) or not thread):
+                raise ContractRejected("Invalid route affinity")
+        for i, route in enumerate(routes):
+            for other in routes[:i]:
+                if not any(key in other["when"] and value != other["when"][key]
+                           for key, value in route["when"].items()):
+                    raise ContractRejected("Overlapping route predicates")
         for key in produced:
             if key in producers or key in inputs:
                 raise ContractRejected(f"Ambiguous state producer: {key}")
@@ -117,6 +150,7 @@ def _prepare(path, adapter_path, host, inputs, facts, root, recorder, candidate)
             resources=resources, estimated_cost_s=cost,
             required_state=required,
             produced_state=produced,
+            routes=routes,
             details={"action_id": spec["action_id"],
                      "thread_affinity": spec.get("thread_affinity")},
         ))
@@ -139,6 +173,10 @@ def _prepare(path, adapter_path, host, inputs, facts, root, recorder, candidate)
         node.action = registry.get(node.details["action_id"])
         if not callable(node.action):
             raise ContractRejected(f"No action for {node.name}")
+        for route in node.routes:
+            route["action"] = registry.get(route["action_id"])
+            if not callable(route["action"]):
+                raise ContractRejected(f"No action for route {node.name}.{route['name']}")
     context = StartupContext(recorder=recorder)
     for key, value in inputs.items():
         context.put(key, value)

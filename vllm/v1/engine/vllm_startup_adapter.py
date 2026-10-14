@@ -53,6 +53,9 @@ def build_action_registry(host):
             "get_static_startup_resource_snapshot")
         return context.put("static_worker_states", snapshots)
 
+    def prepare_assets(context):
+        return context.put("assets.prepared", self.collective_rpc("prepare_startup_assets"))
+
     bootstrap_actions = {
         "engine_core_construct": timed("EngineCore Construct",
                                          construct_core),
@@ -68,6 +71,7 @@ def build_action_registry(host):
             lambda _: self.model_executor.construct_worker()),
         "static_resource_probe": timed(
             "Static Resource Probe", static_resource_probe),
+        "prepare_startup_assets": timed("Prepare Startup Assets", prepare_assets),
         "cuda_device": timed(
             "CUDA Device Initialization",
             lambda _: self.model_executor.initialize_cuda_device()),
@@ -98,13 +102,22 @@ def build_action_registry(host):
     def stop_weight_prewarm(_):
         stop_async_weight_prewarm_from_env("EngineCore.load_weights")
 
-    def load_weights(_):
+    def load_weights(ctx):
         if overlap_weight_compile:
             self.model_executor.load_weights_and_trigger_compile()
         else:
             self.model_executor.load_weights()
+        ctx.put("weights.compile_completed", overlap_weight_compile)
+        # Recheck after actual weights exist. KV consumption still checks the
+        # current memory budget; this signal selects a *try-cache* path only.
+        states = self.collective_rpc("get_startup_state_snapshot")
+        ctx.put("assets.kv_profile_usable", bool(states) and
+                all(state.get("kv_profile_hit", False) for state in states))
 
     def compile_model(_):
+        # With overlap enabled, load_weights has already completed both loading
+        # and compilation. Keep this node as a readiness marker for downstream
+        # stages; do not compile twice.
         if not overlap_weight_compile:
             self.model_executor.run_to_trigger_compile()
 
@@ -168,7 +181,7 @@ def build_action_registry(host):
         "mm_input_cache": timed("Others.MM Input Cache", mm_input_cache),
         "scheduler": timed("Others.Scheduler", create_scheduler),
         "batch_queue": timed("Others.Batch Queue", create_batch_queue),
-        "ready": lambda _: None,
+        "ready": lambda ctx: ctx.put("assets.released", self.collective_rpc("release_startup_assets")),
     }
 
     actions = {**bootstrap_actions, **runtime_actions}
@@ -178,5 +191,9 @@ def build_action_registry(host):
             context.put("ready." + name, True)
             return value
         return run
-    return {name: publish(name, action) for name, action in actions.items()}
+    registry = {name: publish(name, action) for name, action in actions.items()}
+    # The fused action already joined both operations. No worker RPC or
+    # compiler capacity is needed to publish this completion marker.
+    registry["compile_already_ready"] = publish("compile_model", lambda _: None)
+    return registry
 

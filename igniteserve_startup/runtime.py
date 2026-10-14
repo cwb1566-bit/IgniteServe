@@ -9,7 +9,7 @@ import threading
 import time
 from contextlib import ExitStack
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Mapping, Optional
 
 
@@ -113,6 +113,7 @@ class StageNode:
     details: Mapping[str, Any] = field(default_factory=dict)
     required_state: set[str] = field(default_factory=set)
     produced_state: set[str] = field(default_factory=set)
+    routes: list[dict[str, Any]] = field(default_factory=list)
 
     def serializable(self) -> dict[str, Any]:
         return {
@@ -125,7 +126,23 @@ class StageNode:
             "details": dict(self.details),
             "required_state": sorted(self.required_state),
             "produced_state": sorted(self.produced_state),
+            "routes": [{k: v for k, v in route.items() if k != "action"}
+                       for route in self.routes],
         }
+
+    def resolve(self, state: Mapping[str, Any]) -> "StageNode":
+        matches = [r for r in self.routes if all(
+            key in state and type(state[key]) is bool and state[key] == value
+            for key, value in r["when"].items())]
+        if len(matches) > 1:
+            raise ValueError(f"Ambiguous startup routes: {self.name}")
+        if not matches:
+            return self
+        route = matches[0]
+        return replace(self, action=route["action"], resources=route["resources"],
+                       estimated_cost_s=route["estimated_cost_s"],
+                       details={**self.details, "route": route["name"],
+                                "thread_affinity": route["thread_affinity"]})
 
 
 @dataclass
@@ -137,6 +154,7 @@ class StageResult:
     elapsed_s: float
     thread_name: str
     error: Optional[str] = None
+    route: str = "default"
 
 
 class StartupDAG:
@@ -221,7 +239,7 @@ class StartupDAG:
         path.reverse()
         return path, finish[path[-1]]
 
-    def downstream_costs(self, completed=()) -> dict[str, float]:
+    def downstream_costs(self, completed=(), estimates=None) -> dict[str, float]:
         order = self.topological_order()
         children: dict[str, list[str]] = {name: [] for name in self.nodes}
         for name, deps in self.ordering_dependencies().items():
@@ -229,7 +247,7 @@ class StartupDAG:
                 children[dep].append(name)
         costs: dict[str, float] = {}
         for name in reversed(order):
-            own = (self.nodes[name].estimated_cost_s
+            own = ((estimates or {}).get(name, self.nodes[name].estimated_cost_s)
                    if self.nodes[name].enabled and name not in completed else 0.0)
             costs[name] = own + max((costs[child] for child in children[name]),
                                     default=0.0)
@@ -325,7 +343,8 @@ class ResourceAwareDAGExecutor:
                     ended = time.perf_counter()
                     results[node.name] = StageResult(
                         node.name, "completed" if node.enabled else "skipped",
-                        started, ended, ended - started, thread_name)
+                        started, ended, ended - started, thread_name,
+                        route=node.details.get("route", "default"))
                     completed.add(node.name)
                     context.put(f"stage_result.{node.name}", value)
 
@@ -333,13 +352,23 @@ class ResourceAwareDAGExecutor:
                     for name, seconds in context.costs.items():
                         if name in pending:
                             dag.nodes[name].estimated_cost_s = seconds
-                priority = dag.downstream_costs(completed)
-                ready_state = context.snapshot().keys()
+                state = context.snapshot()
+                resolved = {}
+                for name in pending:
+                    try:
+                        resolved[name] = dag.nodes[name].resolve(state)
+                    except ValueError as exc:
+                        fail(dag.nodes[name], exc)
+                estimates = {name: node.estimated_cost_s for name, node in resolved.items()}
+                now = time.perf_counter()
+                for node, started, _ in running.values():
+                    estimates[node.name] = max(0., node.estimated_cost_s - (now - started))
+                priority = dag.downstream_costs(completed, estimates)
+                ready_state = state.keys()
                 ready = sorted(
-                    (dag.nodes[name] for name in pending
-                     if dag.nodes[name].dependencies <= completed
-                     and (not dag.nodes[name].enabled
-                          or dag.nodes[name].required_state <= ready_state)),
+                    (node for node in resolved.values()
+                     if node.dependencies <= completed
+                     and (not node.enabled or node.required_state <= ready_state)),
                     key=lambda node: (-priority[node.name], node.name))
                 for node in ready:
                     affinity = node.details.get("thread_affinity")

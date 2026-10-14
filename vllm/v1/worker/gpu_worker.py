@@ -1025,6 +1025,42 @@ class Worker(WorkerBase):
             "eligibility_reasons": [],
         }
 
+    def prepare_startup_assets(self) -> dict[str, object]:
+        """Prepare bounded metadata in its consuming worker before model loading.
+
+        Exact graph/operator keys are not known yet. Speculative family reads
+        remain untrusted until their existing consumers validate them.
+        """
+        from itertools import chain, islice
+        from vllm.compilation import startup_assets as assets
+        from vllm.compilation.startup_resources import resource_dir
+
+        assets.clear_prepared()
+        exact = []
+        if kv_profile_cache.enabled():
+            _, payload = kv_profile_cache.build_key(self.vllm_config, self.device)
+            override = os.getenv("VLLM_KV_PROFILE_CACHE_FILE")
+            exact.append(Path(override).expanduser() if override else
+                         assets.asset_path("kv_profile", payload))
+        hotspot_dir = Path(os.getenv("VLLM_CUDA_GRAPH_HOTSPOT_DIR",
+                                    str(self.model_runner.hotspot_profile_dir)))
+        exact.extend([hotspot_dir / "manifest.json",
+                      hotspot_dir / "cuda_graph_hits.csv"])
+        if os.getenv("VLLM_CUDA_GRAPH_HOTSPOT_CSV"):
+            exact.append(Path(os.environ["VLLM_CUDA_GRAPH_HOTSPOT_CSV"]))
+        # No recursive walk of large compiled bundles or executable payloads.
+        candidates = chain(exact, *(islice(resource_dir(kind).glob("*.json"), 16)
+                                   for kind in ("input_metadata", "best_config")))
+        summary = assets.prefetch(candidates)
+        logger.info("Startup assets prepared in worker: %s", summary)
+        return summary
+
+    def release_startup_assets(self) -> dict[str, object]:
+        from vllm.compilation import startup_assets as assets
+        summary = assets.clear_prepared()
+        logger.info("Startup prepared assets released: %s", summary)
+        return summary
+
     def get_startup_state_snapshot(self) -> dict[str, object]:
         """Return exact worker-local facts used to build the startup DAG."""
         static_state = self.get_static_startup_resource_snapshot()

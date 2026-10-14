@@ -29,8 +29,9 @@ def build(root, output):
         ("cuda_device", ["compile_worker_prewarm"], {"worker_rpc": 1, "gpu_runtime": 1}, .8),
         ("distributed_environment", ["cuda_device"], {"worker_rpc": 1, "gpu_runtime": 1}, .5),
         ("model_runner", ["compile_worker_prewarm", "distributed_environment"], {"worker_rpc": 1, "gpu_memory": 1}, .8),
+        ("prepare_startup_assets", ["model_runner"], {"worker_rpc": 1, "disk_io": 1}, .05),
         ("usage_reporting", ["model_runner"], {"worker_rpc": 1}, .01),
-        ("state_probe", ["usage_reporting", "static_resource_probe"], {"worker_rpc": 1}, .05),
+        ("state_probe", ["usage_reporting", "static_resource_probe", "prepare_startup_assets"], {"worker_rpc": 1}, .05),
         ("init_model", ["state_probe"], {"worker_rpc": 1}, 1.),
         ("stop_weight_prewarm", ["init_model"], {}, .01),
         ("load_weights", ["stop_weight_prewarm"], {"worker_rpc": 1, "disk_io": 1}, 10.),
@@ -42,7 +43,7 @@ def build(root, output):
         ("mm_input_cache", ["init_model"], {"cpu": 1}, .1),
         ("scheduler", ["structured_output", "kv_cache_allocate"], {"cpu": 1}, .2),
         ("batch_queue", ["scheduler"], {"cpu": 1}, .01),
-        ("ready", ["cuda_graph_precapture", "batch_queue", "mm_input_cache"], {}, 0.),
+        ("ready", ["cuda_graph_precapture", "batch_queue", "mm_input_cache"], {"worker_rpc": 1}, 0.),
     ]
     source_names = [
         "vllm/v1/engine/core.py", "vllm/v1/engine/declarative_startup.py",
@@ -50,6 +51,8 @@ def build(root, output):
         "vllm/v1/executor/abstract.py", "vllm/executor/uniproc_executor.py",
         "vllm/v1/executor/multiproc_executor.py", "vllm/worker/worker_base.py",
         "igniteserve_startup/runtime.py", "igniteserve_startup/contract.py",
+        "vllm/compilation/startup_assets.py", "vllm/v1/worker/kv_profile_cache.py",
+        "vllm/compilation/compiler_interface.py",
     ]
     variants = []
     for prewarm in (True, False):
@@ -61,6 +64,7 @@ def build(root, output):
             inputs = ["ready." + dep for dep in deps]
             outputs = ["ready." + name]
             if name == "static_resource_probe": outputs += ["static_worker_states"]
+            if name == "prepare_startup_assets": outputs += ["assets.prepared"]
             if name == "state_probe":
                 inputs += ["static_worker_states"]
                 outputs += ["startup_state"]
@@ -69,10 +73,23 @@ def build(root, output):
                 inputs += ["available_gpu_memory"]
                 outputs += ["kv_cache_config"]
             if name == "scheduler": inputs += ["kv_cache_config"]
+            if name == "load_weights":
+                outputs += ["weights.compile_completed", "assets.kv_profile_usable"]
+            if name == "compile_model": inputs += ["weights.compile_completed"]
+            if name == "kv_profile": inputs += ["assets.kv_profile_usable"]
+            if name == "ready": outputs += ["assets.released"]
             nodes.append(dict(name=name, action_id=name, dependencies=[],
                 required_state=inputs, produced_state=outputs, resources=resources,
                 estimated_cost_s=cost,
                 thread_affinity="worker-0" if "worker_rpc" in resources else None))
+            if name == "compile_model":
+                nodes[-1]["routes"] = [dict(name="already_compiled",
+                    when={"weights.compile_completed": True}, action_id="compile_already_ready",
+                    resources={}, estimated_cost_s=0., thread_affinity="main_thread")]
+            if name == "kv_profile":
+                nodes[-1]["routes"] = [dict(name="try_cached_profile",
+                    when={"assets.kv_profile_usable": True}, action_id="kv_profile",
+                    resources=resources, estimated_cost_s=.01, thread_affinity="worker-0")]
         variants.append(dict(name="prewarm" if prewarm else "standard",
                              match={"two_phase_prewarm": prewarm}, nodes=nodes))
     common = variants[0].pop("nodes")
