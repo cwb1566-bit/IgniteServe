@@ -157,6 +157,119 @@ processes, different launch paths and indices, and different parameter values.
 Startup acceptance also requires actual global hits from a new compilation
 directory while preserving greedy outputs and generated-DAG coverage.
 
+## Cost-Gated Graph Adaptation
+
+The adaptive matcher applies the padding ratio guard to native and sparse
+targets alike (default 0.2). A padded replay requires compatible measured costs.
+Exact matches retain the normal replay path. Device free memory is checked
+at most once per second; pressure reduces the ratio to 0.1 or zero with hysteresis.
+Unused graph-private pool memory is not treated as reclaimable. Allocation
+failure before any forward safely declines splitting; after KV writes there is
+no whole-batch retry.
+
+`VLLM_ENABLE_STARTUP_OPTIMIZATIONS=1` also enables cost-gated graph partitioning;
+`VLLM_ENABLE_CUDAGRAPH_SPLIT=0` disables only splitting. No qualified cost profile
+means no split. The initial implementation supports single-GPU piecewise graphs
+with ordinary FlashAttention metadata, including decode, prefill, and mixed
+batches. Cascade/local attention, full graphs, TP/PP/DP, LoRA, speculation, hybrid
+state, KV connectors, encoder-decoder, and multimodal paths decline splitting
+before any KV writes. These are capability checks, not model-name allowlists.
+
+Partitions contain whole contiguous requests. Each part preserves original KV
+slots, stages tokens into stable input buffers, replays on the foreground stream,
+and copies hidden states before another replay can overwrite them. One original
+logits/sampling path handles the assembled output, including prompt logprobs and
+partial-prefill handling. An execution error is propagated, never retried as an
+entire batch after partial KV writes. Contract fallback completes the affected
+part eagerly and disables future splitting for that runner; logs distinguish
+actual piece replays from mere split admission. Background capture remains
+independent; a split is not counted as warmup for a missing larger graph.
+Original-shape hits still authorize capture: the threshold-triggering request
+performs whole-shape eager warmup, overriding a split candidate. Requests below
+threshold or waiting for publication may reuse smaller graphs. Planning and
+execution check every piece and its publication gate; a lost/missing small graph
+declines before KV writes. Unknown costs or missing parts fall back to whole
+eager, not unpriced hybrid execution.
+The padding bound applies to the total tokens across all parts, not separately
+to a small tail: 7 tokens may use 4+4 (14.3% total padding) instead of 4+2+1.
+The padded tail still requires its own measured workload cost. Partial plans
+already exceeding the best cost or eager safety bound are pruned.
+
+Costs use exact query-length and context-bucket histograms, not token count alone.
+Qualified CSV rows include `workload`, `scope=forward`, `samples>=3`, and `parts`.
+The planner compares graph P90 plus measured preparation/merge overhead with
+0.9 times eager P50. Logits/sampling are unchanged on both paths and excluded
+from both sides. It uses bounded search (at most three parts, two above 40 layers)
+and rejects missing evidence. Search is limited to 1 ms or 5% of estimated eager
+time, whichever is smaller, and its measured CPU time is charged to the plan.
+Existing unqualified GPU CSVs remain readable for
+shadow analysis but cannot authorize runtime padding/splitting.
+
+Offline calibration, on an otherwise free GPU, can be run with:
+
+```bash
+PYTHONPATH="$PWD" python tools/profile_cudagraph_adaptation.py \
+  --model /data/wenbiao/models/Qwen3-4B --gpu 0
+```
+
+Use `--prompts` with a representative JSON string list and set `--max-model-len`,
+`--max-num-batched-tokens`, `--max-num-seqs`, and `--capture-sizes` to match the
+deployment. Defaults are a small correctness/calibration workload, not ShareGPT
+performance evidence. Separate processes measure eager, exercised splits, and
+padding, then test the unforced policy and compare greedy outputs. A separate
+equal-partition eager control isolates graph replay from batch-shape arithmetic.
+The FP16 calibration requires identical greedy tokens, selected-token logprob
+absolute error below `--max-logprob-error` (default 0.01) across shapes, and below
+1e-5 between split eager and split replay. Cross-shape FP16 arithmetic can exceed
+the strict default even for ordinary padding. Investigate the eager/padding
+controls before explicitly selecting another tolerance; the tool never relaxes
+it automatically. This is bounded numerical validation, not bitwise equivalence to
+the original batch or a proof for arbitrary models and inputs. Exercised
+plans use synthetic admission costs only to collect measurements; those costs
+are never exported. Only measured costs and their compatibility/checksum
+manifest survive under the hotspot asset directory; temporary engines/logs are
+cleaned up. Rejection of all measured split candidates is a valid outcome.
+The profile also retains directly measured `split_forward` elapsed time for
+diagnosis. CUDA-event elapsed time includes GPU idle gaps during CPU dispatch;
+it is not a measurement of SM occupancy.
+
+### Single-Launch Multi-Stream Composites
+
+With a qualified `composite` cost row, partitioning prefers a private full-forward
+fork/join graph. A single `replay()` submits independent sub-batch streams and
+their output copies, followed by the unchanged unified logits/sampling path.
+The cost is measured for the entire composite, including staging and merging;
+it is never approximated by the maximum or sum of isolated small-graph costs.
+The row includes each part's size and workload, and requires the same runtime
+manifest as other graph costs. Unknown costs retain eager/sequential fallback.
+
+This is additional formal recording of compiled sub-batch forwards (including
+attention), not free concatenation of existing graph handles. Only already
+compiled/published partition shapes qualify. The first request snapshots private
+inputs/metadata and queues recording on the existing capture worker, then runs
+whole eager. Recording does not replay or warm by repeating live KV writes.
+Other requests remain eager until atomic publication. Both below-threshold and
+whole-shape-capture-pending requests can replay a ready composite; the original
+shape's threshold-triggering eager warmup always takes precedence.
+
+Each composite owns input/output buffers, streams and a graph pool. Full
+attention metadata scalar/tensor contracts are checked, with bounded context
+length buckets and model/KV binding validation. At most four plans reside per
+runner; capacity exhaustion, capture failure or incompatibility declines before
+KV writes. No whole-batch retry is allowed after replay submission. Composite
+and ordinary background captures share one serial queue; neither invokes a
+device-wide synchronization. Background CPU recording still competes with eager
+submission: first-use latency can regress and is reported separately from warm
+replay performance. Steady-state cost qualification is not an amortization proof.
+
+`tools/verify_online_composite.py --model MODEL --gpu ID --batch 7 --publish`
+calibrates and checks distinct same-length requests, then publishes measured
+costs. `--batch 23` adds another partition workload to the compatible profile.
+`--policy-only --costs PATH` checks a fresh process without synthetic prices;
+`--profile-window` brackets that policy for Nsight. The tool reports cold-build,
+warm-forward and generation timings separately. `tools/verify_composite_phases.py`
+is forced-admission prefill/mixed correctness coverage, not a performance test.
+
 ## Porting
 
 Copy/install only `igniteserve_startup` for another engine; it imports neither

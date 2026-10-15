@@ -86,7 +86,8 @@ def test_backend_guard_disables_suffix_and_abort_clears_contract():
     entry.cudagraph = SimpleNamespace(reset=lambda: None)
     b.concrete_size_entries = {4: entry}
     b._run = lambda mode, runnable, args: runnable(*args)
-    ctx = SimpleNamespace(skip_cuda_graphs=False, concurrent_cudagraph_capture=False)
+    ctx = SimpleNamespace(skip_cuda_graphs=False, concurrent_cudagraph_capture=False,
+                          cudagraph_adaptation_stats=None)
     with patch.object(module, 'get_forward_context', return_value=ctx):
         assert b(4, x) is x
     assert ctx.skip_cuda_graphs

@@ -55,6 +55,12 @@ def build(root, output):
         "vllm/compilation/compiler_interface.py",
         "vllm/compilation/backends.py", "vllm/compilation/cache_reuse.py",
         "vllm/compilation/input_contract.py",
+        "vllm/forward_context.py", "vllm/compilation/cuda_piecewise_backend.py",
+        "vllm/v1/worker/GraphMatcher.py", "vllm/v1/worker/cudagraph_adaptation.py",
+        "vllm/v1/worker/cudagraph_profile.py", "vllm/v1/worker/adaptive_cudagraph.py",
+        "vllm/v1/worker/composite_cudagraph.py",
+        "vllm/v1/worker/concurrent_piecewise_cudagraph.py",
+        "vllm/v1/attention/backends/flash_attn.py",
     ]
     variants = []
     for prewarm in (True, False):

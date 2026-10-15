@@ -16,7 +16,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import torch
 
@@ -50,7 +50,7 @@ class ConcurrentPiecewiseCUDAGraphCaptureManager:
     def __init__(self, runner: "GPUModelRunner") -> None:
         self.runner = runner
         self.enabled, self.disabled_reason = self._check_support(runner)
-        self._queue: queue.Queue[Optional[_CaptureRequest]] = queue.Queue()
+        self._queue: queue.Queue[Optional[_CaptureRequest | Callable[[], None]]] = queue.Queue()
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
         self._stopping = False
@@ -109,16 +109,19 @@ class ConcurrentPiecewiseCUDAGraphCaptureManager:
                            + ", ".join(missing))
         return True, "supported"
 
-    def _ensure_thread(self) -> None:
+    def _ensure_thread(self) -> bool:
         with self._lock:
+            if self._stopping:
+                return False
             if self._thread is not None:
-                return
+                return True
             self._thread = threading.Thread(
                 target=self._worker_main,
                 name="vllm-concurrent-piecewise-cudagraph",
                 daemon=True,
             )
             self._thread.start()
+            return True
 
     def enqueue_after_warmup(self, phase: str, shape: int) -> bool:
         """Claim a queued adaptive shape and record its warmup completion."""
@@ -134,7 +137,8 @@ class ConcurrentPiecewiseCUDAGraphCaptureManager:
             self._scheduled_shapes.add(shape)
         warmup_ready = torch.cuda.Event()
         warmup_ready.record(torch.cuda.current_stream(self.runner.device))
-        self._ensure_thread()
+        if not self._ensure_thread():
+            return False
         self._queue.put(_CaptureRequest(phase, shape, warmup_ready,
                                         time.perf_counter()))
         logger.info(
@@ -150,6 +154,18 @@ class ConcurrentPiecewiseCUDAGraphCaptureManager:
         )
         return sorted(backends.values(),
                       key=lambda item: item.piecewise_compile_index)
+
+    def enqueue_auxiliary(self, capture) -> bool:
+        """Serialize private composite capture with ordinary shape capture."""
+        if not self.enabled:
+            return False
+        if not self._ensure_thread():
+            return False
+        with self._lock:
+            if self._stopping:
+                return False
+            self._queue.put(capture)
+        return True
 
     def _initialize_worker_runtime(self) -> None:
         """Create thread-local CUDA library state before formal capture.
@@ -299,9 +315,12 @@ class ConcurrentPiecewiseCUDAGraphCaptureManager:
             try:
                 if request is None:
                     return
-                self._capture_one(request)
+                if callable(request):
+                    request()
+                else:
+                    self._capture_one(request)
             finally:
-                if request is not None:
+                if isinstance(request, _CaptureRequest):
                     with self._lock:
                         self._scheduled_shapes.discard(request.shape)
                 self._queue.task_done()

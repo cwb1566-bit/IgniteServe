@@ -4,12 +4,12 @@ from pathlib import Path
 from vllm.v1.worker.GraphMatcher import GraphMatcher
 
 
-def test_native_registered_padding_is_preserved() -> None:
+def test_native_registered_padding_obeys_ratio() -> None:
     matcher = GraphMatcher([4, 8, 16])
     result = matcher.find_best_match(
         5, phase="decode", default_graph_size=8)
-    assert result.strategy == "native_pad"
-    assert result.execution_size == 8
+    assert result.strategy == "eager"
+    assert result.execution_size == 5
 
 
 def test_sparse_padding_obeys_ratio_guard() -> None:
@@ -89,12 +89,12 @@ def test_sparse_padding_requires_cost_evidence() -> None:
     assert result.reason == "cost-unavailable-for-sparse-pad"
 
 
-def test_native_padding_does_not_require_cost_table() -> None:
+def test_native_padding_requires_cost_table() -> None:
     matcher = GraphMatcher([48], max_pad_ratio=0.20)
     result = matcher.find_best_match(
         40, phase="decode", default_graph_size=48)
-    assert result.strategy == "native_pad"
-    assert result.execution_size == 48
+    assert result.strategy == "eager"
+    assert result.execution_size == 40
 
 
 def test_duplicate_cost_samples_are_averaged_by_shape() -> None:
@@ -239,13 +239,13 @@ def test_cost_table_does_not_extrapolate_unmeasured_shapes() -> None:
 
 
 if __name__ == "__main__":
-    test_native_registered_padding_is_preserved()
+    test_native_registered_padding_obeys_ratio()
     test_sparse_padding_obeys_ratio_guard()
     test_dynamic_decode_graph_is_not_used_for_mixed_batch()
     test_piecewise_dynamic_graph_can_be_reused_across_phase()
     test_cost_table_can_reject_padding()
     test_sparse_padding_requires_cost_evidence()
-    test_native_padding_does_not_require_cost_table()
+    test_native_padding_requires_cost_table()
     test_split_keeps_request_and_graph_sizes_distinct()
     test_realistic_sequential_split_is_rejected_but_parallel_bound_is_kept()
     test_calibrated_parallel_rejects_ideal_only_candidate()

@@ -106,6 +106,7 @@ from vllm.v1.worker.CudaGraphManager import DynamicGraphManager
 from vllm.v1.worker.GraphMatcher import GraphMatcher, MatchResult
 from vllm.v1.worker.HotspotAnalyzer import HotspotAnalyzer, BatchSizeStats
 from vllm.v1.worker.cudagraph_batch_partition import partition_mixed_batch
+from vllm.v1.worker.cudagraph_adaptation import GraphAdapter, workload_key
 from vllm.v1.worker.cudagraph_profile import (
     build_cudagraph_profile_manifest,
     ensure_cudagraph_profile_manifest,
@@ -426,6 +427,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             logger.info("CUDA graph runtime cost table loaded from %s",
                         cost_table_path)
         self.dynamic_cuda_graph_captured: set[int] = set()
+        self.graph_adapter = GraphAdapter(self)
         self.manager = LazyFreezeManager.get_instance()
         DynamicGraphManager.runner = self
         self.adaptive_cudagraph_controller = adaptive_cudagraph_controller
@@ -1493,6 +1495,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         adaptive_decision = None
         skip_adaptive_cuda_graphs = False
         phase = "unknown"
+        split_parts = ()
+        query_lens = num_scheduled_tokens_np.tolist()
+        seq_lens = self.seq_lens_np[:len(query_lens)].tolist()
+        prefill_mask = (self.input_batch.num_computed_tokens_cpu[:len(query_lens)]
+                        < self.input_batch.num_prompt_tokens[:len(query_lens)]).tolist()
+        adaptation_workload = workload_key(query_lens, seq_lens, prefill_mask)
         if operator_pipeline_trace_enabled():
             phase = self._classify_cudagraph_batch_phase(
                 num_scheduled_tokens_np)
@@ -1584,6 +1592,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     phase=phase,
                     default_graph_size=default_target_shape,
                     dynamic_sizes=self.dynamic_cuda_graph_captured,
+                    workload=adaptation_workload,
+                    max_pad_ratio=self.graph_adapter.pad_limit(),
                     # In piecewise mode attention remains eager. The captured
                     # compiled segments depend on total token shape, like the
                     # startup graphs captured from decode-style dummy inputs.
@@ -1597,6 +1607,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     # frequently used decode shape can still become eligible
                     # for dynamic capture.
                     target_shape = default_target_shape
+                    if not has_kv_transfer_group():
+                        split_parts = self.graph_adapter.plan(
+                            attn_metadata, query_lens, seq_lens, prefill_mask)
                 else:
                     target_shape = match_result.execution_size
                 adaptive_decision = (
@@ -1612,9 +1625,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                                 == default_target_shape
                                 and match_result.reason.startswith(
                                     "cost-reject"))),
-                        already_captured=(match_result.strategy != "eager"),
+                        # Cost rejection is not a graph miss. Do not recapture
+                        # an existing graph merely because padding is expensive.
+                        already_captured=(target_shape in self.cuda_graph_captured),
                         allow_replay=(match_result.strategy != "eager"),
+                        adapted=bool(split_parts),
                     ))
+                # Count the original shape even when smaller graphs are usable.
+                # A threshold-triggering batch must warm the whole target shape;
+                # subsequent batches may split while that graph is unpublished.
+                if (adaptive_decision.mark_runtime_warmup
+                        or not adaptive_decision.skip_cudagraph):
+                    split_parts = ()
                 num_input_tokens = adaptive_decision.execution_shape
                 skip_adaptive_cuda_graphs = (
                     adaptive_decision.skip_cudagraph)
@@ -1647,6 +1669,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             else:
                 num_input_tokens = num_scheduled_tokens
             HotspotAnalyzer.record_batch(num_input_tokens)
+
+        if (self.use_cuda_graph and self.enable_adaptive_cudagraph and not split_parts
+                and num_scheduled_tokens > self.cudagraph_batch_sizes[-1]
+                and not has_kv_transfer_group()):
+            split_parts = self.graph_adapter.plan(
+                attn_metadata, query_lens, seq_lens, prefill_mask)
+            if split_parts:
+                phase = self._classify_cudagraph_batch_phase(num_scheduled_tokens_np)
+                self.adaptive_cudagraph_controller.plan_runtime(
+                    phase, num_scheduled_tokens, num_scheduled_tokens,
+                    capturable=False, already_captured=False, adapted=True)
+        if split_parts:
+            num_input_tokens = num_scheduled_tokens
+            skip_adaptive_cuda_graphs = True
+            # Adaptation is not a warmup for the original missing graph.
+            adaptive_decision = None
 
         # Padding for DP
         num_pad, num_tokens_across_dp = self.get_dp_padding(num_input_tokens)
@@ -1716,7 +1754,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_scheduled_tokens,
                 num_input_tokens,
             )
-        execution_mode = "graph" if graph_execution else "eager"
+        execution_mode = "split" if split_parts else "graph" if graph_execution else "eager"
         if (self.enable_adaptive_cudagraph
                 and self.adaptive_cudagraph_controller.reserve_gpu_sample(
                     phase, execution_mode, num_input_tokens)):
@@ -1738,12 +1776,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             with operator_pipeline_range(
                     f"forward.{phase}.{execution_mode}.tokens={num_input_tokens}"):
-                model_output = self.model(
-                    input_ids=input_ids,
-                    positions=positions,
-                    intermediate_tensors=intermediate_tensors,
-                    inputs_embeds=inputs_embeds,
-                )
+                if split_parts:
+                    model_output = self.graph_adapter.execute(
+                        split_parts, attn_metadata, query_lens, seq_lens)
+                if not split_parts or model_output is None:
+                    if split_parts:
+                        execution_mode = "eager"
+                    model_output = self.model(
+                        input_ids=input_ids,
+                        positions=positions,
+                        intermediate_tensors=intermediate_tensors,
+                        inputs_embeds=inputs_embeds,
+                    )
             if gpu_timing is not None:
                 gpu_timing[1].record()
                 self.adaptive_cudagraph_controller.add_gpu_sample(

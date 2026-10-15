@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlashAttention."""
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
 import numpy as np
@@ -141,6 +141,25 @@ class FlashAttentionMetadata:
         local_scheduler_metadata: Optional[torch.Tensor]
 
     local_attn_metadata: Optional[LocalAttentionMetadata] = None
+
+    def split_for_graph(self, part, query_lens, seq_lens):
+        """Preserve KV ownership; attention itself remains outside piece graphs."""
+        if self.use_cascade or self.local_attn_metadata is not None:
+            raise ValueError("cascade/local attention requires its own split builder")
+        first, last = part.first_request, part.last_request
+        start, end = part.first_token, part.last_token
+        return replace(
+            self, num_actual_tokens=end - start,
+            max_query_len=max(query_lens[first:last]),
+            query_start_loc=self.query_start_loc[first:last + 1] - start,
+            max_seq_len=max(seq_lens[first:last]),
+            seq_lens=self.seq_lens[first:last],
+            block_table=self.block_table[first:last],
+            slot_mapping=self.slot_mapping[start:end],
+            # Scheduling metadata belongs to the original batch. FA computes
+            # its schedule for the new batch when this optional field is None.
+            scheduler_metadata=None, prefix_scheduler_metadata=None,
+            max_num_splits=0)
 
 
 def _get_sliding_window_configs(

@@ -265,6 +265,7 @@ class AdaptiveCUDAGraphController:
         capturable: bool,
         already_captured: bool,
         allow_replay: bool = True,
+        adapted: bool = False,
     ) -> RuntimeDecision:
         if not self.enabled:
             return RuntimeDecision(phase, raw_shape, target_shape, target_shape,
@@ -292,21 +293,21 @@ class AdaptiveCUDAGraphController:
                 else:
                     decision = RuntimeDecision(phase, raw_shape, target_shape,
                                                raw_shape, True, False,
-                                               "cost-policy-eager")
+                                               "split-reuse" if adapted else "cost-policy-eager")
                 self._record_decision_locked(decision)
                 return decision
 
             if not self._eligible_phase(phase):
                 decision = RuntimeDecision(phase, raw_shape, target_shape,
                                            raw_shape, True, False,
-                                           "phase-not-yet-supported")
+                                           "split-reuse" if adapted else "phase-not-yet-supported")
                 self._record_decision_locked(decision)
                 return decision
 
             if not capturable:
                 decision = RuntimeDecision(phase, raw_shape, target_shape,
                                            raw_shape, True, False,
-                                           "shape-not-capturable")
+                                           "split-reuse" if adapted else "shape-not-capturable")
                 self._record_decision_locked(decision)
                 return decision
 
@@ -325,9 +326,11 @@ class AdaptiveCUDAGraphController:
                 self._record_decision_locked(decision)
                 return decision
 
+            # Reusing smaller graphs must not starve the original shape of its
+            # one real warmup. It remains eligible before/while capture runs.
             decision = RuntimeDecision(phase, raw_shape, target_shape,
                                        raw_shape, True, False,
-                                       record.state.value)
+                                       "split-reuse" if adapted else record.state.value)
             self._record_decision_locked(decision)
             return decision
 

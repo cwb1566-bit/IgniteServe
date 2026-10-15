@@ -5,13 +5,14 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
 from typing import Any
 
 
 MANIFEST_FILENAME = "cuda_graph_profile_manifest.json"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def _normalize(value: Any) -> Any:
@@ -47,6 +48,9 @@ def build_cudagraph_profile_manifest(
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "model": {
+            "hf_config": {key: value for key, value in
+                          getattr(hf_config, "to_dict", lambda: {})().items()
+                          if key != "_name_or_path"},
             "architectures": list(architectures),
             "model_type": hf("model_type"),
             "hidden_size": hf("hidden_size"),
@@ -64,10 +68,13 @@ def build_cudagraph_profile_manifest(
             "max_num_batched_tokens": getattr(
                 scheduler_config, "max_num_batched_tokens", None),
             "max_num_seqs": getattr(scheduler_config, "max_num_seqs", None),
+            "chunked_prefill": getattr(scheduler_config, "enable_chunked_prefill", None),
+            "prefix_caching": getattr(cache_config, "enable_prefix_caching", None),
             "tensor_parallel_size": getattr(
                 parallel_config, "tensor_parallel_size", None),
             "pipeline_parallel_size": getattr(
                 parallel_config, "pipeline_parallel_size", None),
+            "data_parallel_size": getattr(parallel_config, "data_parallel_size", None),
             "full_cuda_graph": getattr(
                 compilation_config, "full_cuda_graph", None),
             "cudagraph_capture_sizes": list(
@@ -85,6 +92,17 @@ def build_cudagraph_profile_manifest(
         "software": {
             "torch": torch_version,
             "vllm": vllm_version,
+            "attention_backend": os.getenv("VLLM_ATTENTION_BACKEND", "auto"),
+            "flash_attn_version": os.getenv("VLLM_FLASH_ATTN_VERSION", "auto"),
+            "adaptation_source": hashlib.sha256(b"".join(
+                (Path(__file__).parent / name).read_bytes()
+                for name in ("GraphMatcher.py", "cudagraph_adaptation.py",
+                             "composite_cudagraph.py", "concurrent_piecewise_cudagraph.py",
+                             "gpu_model_runner.py")) + b"".join(
+                (Path(__file__).parents[2] / name).read_bytes()
+                for name in ("compilation/cuda_piecewise_backend.py",
+                             "v1/attention/backends/flash_attn.py"))).hexdigest(),
+            "compiler_config": getattr(compilation_config, "compute_hash", lambda: None)(),
         },
     }
     return _normalize(manifest)

@@ -183,6 +183,8 @@ class ForwardContext:
     # Optional budget used only by adaptive background capture. Startup
     # capture leaves this unset and retains the original all-pieces behavior.
     cudagraph_capture_budget: Optional[CUDAGraphCaptureBudget] = None
+    # Per-forward evidence: an admitted split may still encounter a graph miss.
+    cudagraph_adaptation_stats: Optional[dict[str, int]] = None
 
 
 _forward_context: ContextVar[Optional[ForwardContext]] = ContextVar(
@@ -209,6 +211,7 @@ def set_forward_context(
     cudagraph_runtime_warmup: bool = False,
     cudagraph_capture_budget: Optional[CUDAGraphCaptureBudget] = None,
     concurrent_cudagraph_capture: bool = False,
+    cudagraph_adaptation_stats: Optional[dict[str, int]] = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -235,6 +238,7 @@ def set_forward_context(
         cudagraph_runtime_warmup=cudagraph_runtime_warmup,
         cudagraph_capture_budget=cudagraph_capture_budget,
         concurrent_cudagraph_capture=concurrent_cudagraph_capture,
+        cudagraph_adaptation_stats=cudagraph_adaptation_stats,
     ))
 
     try:

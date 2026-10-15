@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import csv
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
@@ -39,13 +40,13 @@ class PhaseSeparationResult:
 class GraphCostTable:
     """Offline GPU-time samples used by the runtime matcher.
 
-    Expected CSV columns are ``phase``, ``mode``, ``execution_shape`` and
-    ``mean_gpu_ms``. Missing entries are interpolated from the nearest two
-    samples for the same phase and execution mode.
+    Qualified runtime costs match workload keys exactly. Legacy phase/shape
+    rows remain interpolatable for diagnostic plans, never runtime admission.
     """
 
     def __init__(self, csv_path: Optional[str] = None) -> None:
         self._samples: dict[tuple[str, str], list[tuple[int, float]]] = {}
+        self._workloads: dict[tuple, float] = {}
         if csv_path:
             self.load(csv_path)
 
@@ -56,14 +57,44 @@ class GraphCostTable:
         samples: dict[tuple[str, str], dict[int, list[float]]] = {}
         with path.open(newline="", encoding="utf-8") as stream:
             for row in csv.DictReader(stream):
-                key = (row["phase"], row["mode"])
-                shape = int(row["execution_shape"])
+                try:
+                    elapsed = float(row["mean_gpu_ms"])
+                    shape = int(row["execution_shape"])
+                    mode = row["mode"]
+                    count = int(row.get("samples") or 0)
+                    parts = int(row.get("parts") or 1)
+                    quantile = "p50_gpu_ms" if mode == "eager" else "p90_gpu_ms"
+                    qualified_elapsed = float(row.get(quantile) or elapsed)
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if shape <= 0 or parts <= 0:
+                    continue
+                if not math.isfinite(elapsed) or elapsed <= 0:
+                    continue
+                if row.get("workload"):
+                    # Qualified rows measure forward or preparation/merge only.
+                    # Logits and sampling remain identical on both paths.
+                    if row.get("scope") != "forward" or count < 3:
+                        continue
+                    elapsed = qualified_elapsed
+                    if not math.isfinite(elapsed) or elapsed <= 0:
+                        continue
+                    key = (mode, shape, row["workload"], parts)
+                    previous = self._workloads.get(key, elapsed)
+                    self._workloads[key] = (min(previous, elapsed) if mode == "eager"
+                                            else max(previous, elapsed))
+                    continue
+                key = (row.get("phase", "unknown"), mode)
                 samples.setdefault(key, {}).setdefault(shape, []).append(
-                    float(row["mean_gpu_ms"]))
+                    elapsed)
         for key, values_by_shape in samples.items():
             self._samples[key] = sorted(
                 (shape, sum(values) / len(values))
                 for shape, values in values_by_shape.items())
+
+    def estimate_workload(self, mode: str, shape: int, workload: str,
+                          parts: int = 1) -> Optional[float]:
+        return self._workloads.get((mode, shape, workload, parts))
 
     def estimate(self, phase: str, mode: str,
                  shape: int) -> Optional[float]:
@@ -93,9 +124,8 @@ class GraphCostTable:
 class GraphMatcher:
     """Select an already captured graph without changing request semantics.
 
-    This class is intentionally decision-only. Split plans are never executed
-    by the model runner until attention metadata slicing, KV-cache indexing and
-    unified sampling have independent correctness coverage.
+    This class is decision-only. Legacy split plans are diagnostic; the runner
+    executes only request-preserving plans from cudagraph_adaptation.
     """
 
     def __init__(
@@ -140,6 +170,8 @@ class GraphMatcher:
         default_graph_size: Optional[int] = None,
         dynamic_sizes: Iterable[int] = (),
         allow_dynamic_cross_phase: bool = False,
+        workload: Optional[str] = None,
+        max_pad_ratio: Optional[float] = None,
     ) -> MatchResult:
         del allow_split  # Split execution is deliberately not enabled yet.
         raw_size = int(num_tokens)
@@ -150,7 +182,11 @@ class GraphMatcher:
                 phase == "decode" or size not in dynamic
                 or allow_dynamic_cross_phase)
         ]
-        eager_ms = self.cost_table.estimate(phase, "eager", raw_size)
+        def estimate(mode, shape):
+            if workload is not None:
+                return self.cost_table.estimate_workload(mode, shape, workload)
+            return self.cost_table.estimate(phase, mode, shape)
+        eager_ms = estimate("eager", raw_size)
         if not eligible:
             return self._eager(raw_size, "no-captured-graph", eager_ms)
 
@@ -159,18 +195,16 @@ class GraphMatcher:
         native_candidate = (default_graph_size is not None
                             and candidate == int(default_graph_size))
 
-        # Preserve vLLM's native nearest registered graph choice. The ratio
-        # guard applies only when a sparse capture set requires padding beyond
-        # that native target.
-        if not native_candidate and padding_ratio > self.max_pad_ratio:
+        limit = self.max_pad_ratio if max_pad_ratio is None else max_pad_ratio
+        if padding_ratio > limit:
             return self._eager(
                 raw_size,
-                f"pad-ratio={padding_ratio:.4f}>max={self.max_pad_ratio:.4f}",
+                f"pad-ratio={padding_ratio:.4f}>max={limit:.4f}",
                 eager_ms,
             )
 
-        graph_ms = self.cost_table.estimate(phase, "graph", candidate)
-        if (not native_candidate and candidate != raw_size
+        graph_ms = estimate("graph", candidate)
+        if (candidate != raw_size
                 and (eager_ms is None or graph_ms is None)):
             return MatchResult(
                 strategy="eager",

@@ -251,8 +251,14 @@ class CUDAPiecewiseBackend:
             self.check_for_ending_compilation()
             return output
 
+        forward_context = get_forward_context()
+        adaptation_stats = forward_context.cudagraph_adaptation_stats
+        if adaptation_stats is not None:
+            adaptation_stats['pieces'] = adaptation_stats.get('pieces', 0) + 1
         runtime_shape = args[self.sym_shape_indices[0]]
         if runtime_shape not in self.concrete_size_entries:
+            if adaptation_stats is not None:
+                forward_context.skip_cuda_graphs = True
             # we don't need to do anything for this shape
             return self._run("general", self.compiled_graph_for_general_shape,
                              args)
@@ -281,7 +287,11 @@ class CUDAPiecewiseBackend:
 
         # Skip CUDA graphs if this entry doesn't use them OR
         # if we're supposed to skip them globally
-        forward_context = get_forward_context()
+        if adaptation_stats is not None:
+            if entry.cudagraph is None or entry.concurrent_capture_in_progress:
+                # A split must never initiate foreground capture or use partial
+                # output. Finish this part eagerly; do not retry prior KV writes.
+                forward_context.skip_cuda_graphs = True
         skip_cuda_graphs = forward_context.skip_cuda_graphs
         if not entry.use_cudagraph or skip_cuda_graphs:
             output = self._run("eager", entry.runnable, args)
@@ -453,4 +463,6 @@ class CUDAPiecewiseBackend:
         with operator_pipeline_range(
                 f"piece.{self.piecewise_compile_index}.replay"):
             entry.cudagraph.replay()
+        if adaptation_stats is not None:
+            adaptation_stats['replays'] = adaptation_stats.get('replays', 0) + 1
         return entry.output
