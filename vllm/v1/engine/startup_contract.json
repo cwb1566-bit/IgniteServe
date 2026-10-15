@@ -494,9 +494,14 @@
     "igniteserve_startup/contract.py": "7f1e318c9fd275602a1868ecbd52d3e3ec50cb6cbeee14acd125dcf9461424d2",
     "vllm/compilation/startup_assets.py": "edc04bf83298db248cec9c5e70479dec686955fbd2e37f2f0e3181d7c1e3544b",
     "vllm/v1/worker/kv_profile_cache.py": "fbfdc2ab39520801dcca57345cd3c92c0ff57959fb6d090b3500f1b3c4cc21a3",
-    "vllm/compilation/compiler_interface.py": "080bc4e8c0062d073cfc39b2e0b1aac1cfc83f3a8d7f87c0d9d95c77c0d9a0ff",
-    "vllm/compilation/backends.py": "81359f5d6d27a313aecbd1b7f1fa6359ee6a9876956bc2fe2f1832e40d9575ba",
+    "vllm/compilation/compiler_interface.py": "68ba35323f6fa9736c88d416fe844ab9134d2896f80611327b750c9a0a7e4688",
+    "vllm/compilation/backends.py": "527e758a0750b6d6f7d1aa8d21e712f734c4c3fdb417f10279a5b5b336ca044b",
     "vllm/compilation/cache_reuse.py": "2e1e7ccdd33ed1c81a1719a70dc4c7556cf05b5f1efd3a47389f3cd5b0ebd257",
+    "vllm/compilation/compile_manager.py": "3ddad0d208c39a07067d89e2e64d26fc9f5831ce669eda9d1dfe6f7594e348aa",
+    "vllm/compilation/parallel_compile.py": "047368d2a8828876d82a7d9b115dcfdedf4bc56a8f2d543483a7741a76771dee",
+    "vllm/compilation/input_metadata.py": "75fecd459b8c47217de0b35f40bda931552fefcd427ed8aa835f9fe5793d5609",
+    "vllm/compilation/piecewise_inputs.py": "f591ffad3c6ae7109ccce5b680898d9742827ffe96e212fc8e8fa72d397c4a91",
+    "vllm/compilation/fx_transport.py": "ece9d3d90879793f0caa23f91a0f0a7f576abd16fafae6fc170e0da854de139b",
     "vllm/compilation/input_contract.py": "444cad1ed397f960187b000f023bf001cf3823b00cbcabf158938c1eeee12856",
     "vllm/forward_context.py": "fa4182524eefe907102e85231505bbb6f150c9c2fadfcb0ecc9d80d70b01aebc",
     "vllm/compilation/cuda_piecewise_backend.py": "555ef6a3f442403c94dc3349589a824d28bbab0e6aadb8ca303011c72df392f0",
@@ -551,49 +556,43 @@
     }
   ],
   "validation": {
-    "identity": "7a2fcd25405260c86d8a0e799e43fdd71679a476a55b2faf3b85b825f4184d6c",
+    "identity": "8135f414dae16431940b4941daee840b8ac1e6d405a22de84ba6685d5b86d81d",
     "review": {
-      "identity": "7a2fcd25405260c86d8a0e799e43fdd71679a476a55b2faf3b85b825f4184d6c",
-      "reviewer": "Codex source review: unified CUDA graph management",
+      "identity": "8135f414dae16431940b4941daee840b8ac1e6d405a22de84ba6685d5b86d81d",
+      "reviewer": "Codex source review",
       "actions": {
-        "batch_queue": "approved",
-        "compile_model": "approved",
+        "engine_core_construct": "approved",
+        "plugins": "approved",
+        "executor_shell": "approved",
+        "worker_wrapper": "approved",
+        "worker_prepare": "approved",
+        "worker_construct": "approved",
+        "static_resource_probe": "approved",
         "compile_worker_prewarm": "approved",
         "cuda_device": "approved",
-        "cuda_graph_precapture": "approved",
         "distributed_environment": "approved",
-        "engine_core_construct": "approved",
-        "executor_shell": "approved",
-        "init_model": "approved",
-        "kv_cache_allocate": "approved",
-        "kv_profile": "approved",
-        "load_weights": "approved",
-        "mm_input_cache": "approved",
         "model_runner": "approved",
-        "plugins": "approved",
         "prepare_startup_assets": "approved",
-        "ready": "approved",
-        "scheduler": "approved",
-        "state_probe": "approved",
-        "static_resource_probe": "approved",
-        "stop_weight_prewarm": "approved",
-        "structured_output": "approved",
         "usage_reporting": "approved",
-        "worker_construct": "approved",
-        "worker_prepare": "approved",
-        "worker_wrapper": "approved"
+        "state_probe": "approved",
+        "init_model": "approved",
+        "stop_weight_prewarm": "approved",
+        "load_weights": "approved",
+        "compile_model": "approved",
+        "kv_profile": "approved",
+        "kv_cache_allocate": "approved",
+        "cuda_graph_precapture": "approved",
+        "structured_output": "approved",
+        "mm_input_cache": "approved",
+        "scheduler": "approved",
+        "batch_queue": "approved",
+        "ready": "approved"
       },
       "constraints": "approved",
-      "rationale": [
-        "Reviewed deferred bootstrap order, prewarm variants and worker affinity. The graph manager is constructed within model_runner; no independent capture worker starts until an inference warmup or composite request.",
-        "prepare_startup_assets now reads the manager-owned profile directory. Consumers retain manifest validation; observations cannot overwrite frozen inputs.",
-        "Weight/compile overlap remains internal to the joined load action. compile_already_ready preserves its readiness output without repeating compilation. KV allocation and graph precapture remain behind real compile and memory readiness.",
-        "Precapture delegates to one executor and registry. Runtime warmup precedes background capture; partial graphs stay private. GraphAdapter preserves cost guards, KV-safe fallbacks and unified sampling. Capture drains before model rebind.",
-        "Structured-output and scheduler state producers, final readiness and prepared asset release are unchanged. Reviewed within the existing single-GPU adapter scope."
-      ]
+      "rationale": "Compilation organization refactor only: reviewed deferred action bindings, state producers, dependency order, worker affinity and resources are unchanged. Input collection remains before materialization; native compiler Futures are submitted before waits; cache validation and parent binding lock remain intact. All extracted compiler modules are source-bound. Real acceptance covers both variants, single/multiple DAG workers, cold/warm assets, global reuse, and weight-overlap disabled. Qualification remains single GPU Qwen3-4B, not proof of arbitrary engine/distributed portability."
     },
     "verification": {
-      "identity": "7a2fcd25405260c86d8a0e799e43fdd71679a476a55b2faf3b85b825f4184d6c",
+      "identity": "8135f414dae16431940b4941daee840b8ac1e6d405a22de84ba6685d5b86d81d",
       "serial_equivalence": true,
       "scheduled_equivalence": true,
       "variants": [
@@ -613,12 +612,12 @@
           "prepared_assets": [
             {
               "files": 14,
-              "bytes": 550718
+              "bytes": 550716
             }
           ],
           "reused_reads": 5,
           "global_subgraph_hits": 0,
-          "elapsed": 12.610787310171872
+          "elapsed": 12.166036501061171
         },
         {
           "case": "prewarm-4",
@@ -630,12 +629,12 @@
           "prepared_assets": [
             {
               "files": 14,
-              "bytes": 550718
+              "bytes": 550716
             }
           ],
           "reused_reads": 5,
           "global_subgraph_hits": 0,
-          "elapsed": 12.787097027990967
+          "elapsed": 13.421766084153205
         },
         {
           "case": "standard-1",
@@ -647,12 +646,12 @@
           "prepared_assets": [
             {
               "files": 14,
-              "bytes": 550718
+              "bytes": 550716
             }
           ],
           "reused_reads": 5,
           "global_subgraph_hits": 0,
-          "elapsed": 14.75766912382096
+          "elapsed": 12.655045622959733
         },
         {
           "case": "standard-4",
@@ -664,12 +663,12 @@
           "prepared_assets": [
             {
               "files": 14,
-              "bytes": 550718
+              "bytes": 550716
             }
           ],
           "reused_reads": 5,
           "global_subgraph_hits": 0,
-          "elapsed": 14.670876257121563
+          "elapsed": 12.535733737051487
         },
         {
           "case": "cold",
@@ -686,7 +685,7 @@
           ],
           "reused_reads": 0,
           "global_subgraph_hits": 0,
-          "elapsed": 39.73650858178735
+          "elapsed": 37.73405670886859
         },
         {
           "case": "global-reuse",
@@ -698,12 +697,12 @@
           "prepared_assets": [
             {
               "files": 14,
-              "bytes": 550718
+              "bytes": 550716
             }
           ],
           "reused_reads": 17,
           "global_subgraph_hits": 3,
-          "elapsed": 15.390104040969163
+          "elapsed": 15.193213067017496
         },
         {
           "case": "no-weight-overlap",
@@ -715,12 +714,12 @@
           "prepared_assets": [
             {
               "files": 14,
-              "bytes": 550718
+              "bytes": 550716
             }
           ],
           "reused_reads": 5,
           "global_subgraph_hits": 0,
-          "elapsed": 15.012988921720535
+          "elapsed": 15.166061274707317
         }
       ]
     }

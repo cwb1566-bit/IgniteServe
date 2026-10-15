@@ -29,6 +29,52 @@ logger = init_logger(__name__)
 _cached_graph_load_lock = threading.RLock()
 
 
+class FullFxCompileBackend:
+    """Lazy boundary to the patched Torch pool; futures stay with the caller.
+
+    No additional executor, serialization pass, or wait is introduced here.
+    """
+
+    @staticmethod
+    def pool():
+        from torch._inductor.compile_fx_full_subproc import FullFxCompilePool
+        return FullFxCompilePool
+
+    @staticmethod
+    def configure(max_workers, *, prewarm_cuda=False):
+        os.environ.setdefault('TORCHINDUCTOR_FULL_FX_COMPILE_WORKERS', str(max_workers))
+        os.environ.setdefault('TORCHINDUCTOR_FX_COMPILE_INNER_THREADS', '1')
+        if prewarm_cuda:
+            os.environ.setdefault('TORCHINDUCTOR_FX_COMPILE_PREWARM_CUDA', '1')
+        imports = [name for name in os.environ.get(
+            'TORCHINDUCTOR_FX_COMPILE_WORKER_IMPORTS', '').split(',') if name]
+        for name in ('vllm._custom_ops', 'vllm.compilation.pass_manager'):
+            if name not in imports:
+                imports.append(name)
+        os.environ['TORCHINDUCTOR_FX_COMPILE_WORKER_IMPORTS'] = ','.join(imports)
+
+    @classmethod
+    def prewarm(cls):
+        return cls.pool().prewarm_workers()
+
+    @classmethod
+    def prewarm_futures(cls):
+        return cls.pool().all_prewarm_futures()
+
+    @classmethod
+    def submit(cls, graph, inputs, config, worker_contexts):
+        return cls.pool().submit(graph, inputs, config, unsafe_force_cache=True,
+                                 worker_context_factories=worker_contexts)
+
+    @classmethod
+    def begin_shutdown(cls):
+        return cls.pool().begin_shutdown_pool()
+
+    @classmethod
+    def shutdown(cls):
+        return cls.pool().shutdown_pool()
+
+
 class CompilerInterface:
     """
     The interface for a compiler that can be used by vLLM.

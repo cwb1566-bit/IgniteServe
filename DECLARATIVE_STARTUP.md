@@ -109,6 +109,45 @@ checks exactly-once node coverage and real overlap, and removes raw temporary
 traces/cache data automatically. This is empirical validation, not a proof for
 all model/configuration combinations.
 
+## Compilation Organization
+
+Compilation keeps two coordination levels, not another top-level manager:
+
+```text
+VllmBackend (backends.py): split FX graph, supply engine config, assemble callable
+  -> ParallelCompileManager (parallel_compile.py): coordinate a subgraph batch
+     -> PiecewiseCompileInterpreter (piecewise_inputs.py): collect/restore inputs
+        -> SubmoduleInputSerializer (input_metadata.py): validate/persist metadata
+     -> CompilerManager (compile_manager.py): validate/load/compile each artifact
+        -> CompilerInterface (compiler_interface.py): backend compile/load API
+     -> FullFxCompileBackend (compiler_interface.py): native Torch pool API
+     -> fx_transport.py: prepare graphs for process transport
+```
+
+The collector owns its metadata and canonical index map; it does not access or
+mutate a VllmBackend. The batch coordinator owns task classification, futures and
+fallback. CompilerManager owns per-artifact identity, cache validation, loading
+and registration; callers use its public reuse-key operation. FullFxCompileBackend
+only adapts the modified Torch pool API and returns its native Futures: it adds
+neither a queue nor another executor. Early worker prewarm and deferred shutdown
+remain connected to the existing worker lifecycle.
+
+This organization preserves the existing execution order: input collection first,
+then canonical materialization; cache loads overlap process compilation; all
+process jobs are submitted before awaiting their results. Parent artifact binding
+retains its lock. Cache schemas, guard checks, fallback paths, default switches,
+weight/compile overlap and frontend restoration are unchanged. Relocating source
+does change source-sensitive identities: old assets may miss and must be rebuilt,
+not relabeled. Startup contracts cover all extracted modules and require renewed
+acceptance after source changes.
+
+Old `backends.py` class/helper imports remain exports. The input collector's
+constructor is an internal API and now takes explicit serializer and policy
+inputs. Porting to another engine requires adapting FX entry/configuration,
+custom-op registration and backend loading; these components are still Torch/FX
+based, not a framework-independent compiler. Reuse keys must retain the new
+engine's operator dependencies and distributed semantics.
+
 ## Hierarchical compilation reuse
 
 With `VLLM_ENABLE_STARTUP_OPTIMIZATIONS=1`, the existing global-subgraph switch
