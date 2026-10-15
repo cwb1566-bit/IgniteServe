@@ -482,10 +482,10 @@
   "initial_state": [],
   "adapter_sha256": "662c1aa865d3c12336e0277bd53546cc6ae6fe8af8d3288e9108e2ec59be7cbd",
   "sources": {
-    "vllm/v1/engine/core.py": "638d329b86f330e94bf73a523cc2cf9cdf212e71a56e66dd3db73b272b95de40",
+    "vllm/v1/engine/core.py": "69eb360c3e210cb909da916aa28d8f8e9fa87c147f0c922502e95bb49d7b0d88",
     "vllm/v1/engine/declarative_startup.py": "72efae437e2cb7d4ded115683d7d1a9bb7fe5f0230bdd5195238a6283644a823",
-    "vllm/v1/worker/gpu_worker.py": "195a0631a08b4cae9832f2248c5bbb730bb1ffb07d65c15247b5d31a3bc35605",
-    "vllm/v1/worker/gpu_model_runner.py": "5f5928db77bcb71948bc9e88f5990946397f250c829733f9ced9e35a1e5b19bd",
+    "vllm/v1/worker/gpu_worker.py": "4f9c0d9266952df33b91041e44d02a4219d8712f80eaf3aaa689386f9b4ed2c0",
+    "vllm/v1/worker/gpu_model_runner.py": "81bd8348a24055e299708e689789224cee9e818ac21e56a467a302921fe95bda",
     "vllm/v1/executor/abstract.py": "0d9c9e3d4e0f3f3bf4538f6f1b67225a8b68696229e5912ab2876f35676fef46",
     "vllm/executor/uniproc_executor.py": "ee4ba1e6cc3e762eb1373c19bb46a9462787ec6687cc017586177eadec657701",
     "vllm/v1/executor/multiproc_executor.py": "27cadf6950fb8f722b117415844264a6e3932d6e916885b742839859495c5665",
@@ -500,12 +500,13 @@
     "vllm/compilation/input_contract.py": "444cad1ed397f960187b000f023bf001cf3823b00cbcabf158938c1eeee12856",
     "vllm/forward_context.py": "fa4182524eefe907102e85231505bbb6f150c9c2fadfcb0ecc9d80d70b01aebc",
     "vllm/compilation/cuda_piecewise_backend.py": "555ef6a3f442403c94dc3349589a824d28bbab0e6aadb8ca303011c72df392f0",
-    "vllm/v1/worker/GraphMatcher.py": "28e49c0144a37b70a51fe6e4baaa765f6c4d34284b2ae6df5a01ced47bf021d9",
-    "vllm/v1/worker/cudagraph_adaptation.py": "7eeb3bff73d529386fa0e745095f8a8db8134e4345012ead1dfd58ce15199a5f",
-    "vllm/v1/worker/cudagraph_profile.py": "b4e5afd84449743b18bef3e986f48ab51f0e8c691b3a59c969e234c0410fd2d1",
-    "vllm/v1/worker/adaptive_cudagraph.py": "2fc8d3ef8b4fe76226d890e4fbd4df66fe5b55d89d96654c9af9db4654f1d389",
-    "vllm/v1/worker/composite_cudagraph.py": "56104a75de60637b3a9d9aa4e78a0dcbfaa9f5b8cf58fd8b06d26de0dbab6edd",
-    "vllm/v1/worker/concurrent_piecewise_cudagraph.py": "6128a6246d0cab9454312c541519a98a5a85c59b87b34645e79e5a2382878892",
+    "vllm/v1/worker/cudagraph_adaptation.py": "71f7942d9e9fbb9893cb2700cc32eaf58d37e03afacba32eb0adb7747d866017",
+    "vllm/v1/worker/cudagraph_profile.py": "6f91ca15f9a65d5741acc97391ab51626f7b2be0edae7ac579f557ea75292d74",
+    "vllm/v1/worker/CudaGraphManager.py": "ad8d0b3806f59244a0e9f25e1b26bcfd2deb709a18741aadd2f416e5325cb7d3",
+    "vllm/v1/worker/HotspotAnalyzer.py": "cebef2980bdee8cdc412d2cb0d42493d0749e62007f946db76d61dbeb3750d15",
+    "vllm/v1/worker/piecewise_graph_registry.py": "953111152705ea5fdb4e3860b6219b1c514bd6378bdf7595c1a067acdacda944",
+    "vllm/v1/worker/composite_cudagraph.py": "a97f716bba792fc69a3b8cc73f80b465acd4d8a4e958af170c4852a35e648ca9",
+    "vllm/v1/worker/concurrent_piecewise_cudagraph.py": "a3ed7c95cb3eb82eb165c1cddb40c262155c59d799ee52f6039b77a111ae355c",
     "vllm/v1/attention/backends/flash_attn.py": "feadd18b454ee762a38179b8cf0aefe8dbeacc3c6d5ae92ef41a63bad199bc3c"
   },
   "resource_capacities": {
@@ -519,7 +520,7 @@
   },
   "discovery": {
     "entry": "EngineCore._initialize_engine_core",
-    "source_sha256": "638d329b86f330e94bf73a523cc2cf9cdf212e71a56e66dd3db73b272b95de40",
+    "source_sha256": "69eb360c3e210cb909da916aa28d8f8e9fa87c147f0c922502e95bb49d7b0d88",
     "regions": 69,
     "boundary_policy": "reviewed deferred API; conservative opaque manager actions"
   },
@@ -550,42 +551,49 @@
     }
   ],
   "validation": {
-    "identity": "513b09c5b0acf1a38f3a7b81df486c13d76f71a401409475abaac47e52647b40",
+    "identity": "7a2fcd25405260c86d8a0e799e43fdd71679a476a55b2faf3b85b825f4184d6c",
     "review": {
-      "identity": "513b09c5b0acf1a38f3a7b81df486c13d76f71a401409475abaac47e52647b40",
-      "constraints": "approved",
+      "identity": "7a2fcd25405260c86d8a0e799e43fdd71679a476a55b2faf3b85b825f4184d6c",
+      "reviewer": "Codex source review: unified CUDA graph management",
       "actions": {
-        "engine_core_construct": "approved",
-        "plugins": "approved",
-        "executor_shell": "approved",
-        "worker_wrapper": "approved",
-        "worker_prepare": "approved",
-        "worker_construct": "approved",
-        "static_resource_probe": "approved",
+        "batch_queue": "approved",
+        "compile_model": "approved",
         "compile_worker_prewarm": "approved",
         "cuda_device": "approved",
-        "distributed_environment": "approved",
-        "model_runner": "approved",
-        "prepare_startup_assets": "approved",
-        "usage_reporting": "approved",
-        "state_probe": "approved",
-        "init_model": "approved",
-        "stop_weight_prewarm": "approved",
-        "load_weights": "approved",
-        "compile_model": "approved",
-        "kv_profile": "approved",
-        "kv_cache_allocate": "approved",
         "cuda_graph_precapture": "approved",
-        "structured_output": "approved",
+        "distributed_environment": "approved",
+        "engine_core_construct": "approved",
+        "executor_shell": "approved",
+        "init_model": "approved",
+        "kv_cache_allocate": "approved",
+        "kv_profile": "approved",
+        "load_weights": "approved",
         "mm_input_cache": "approved",
+        "model_runner": "approved",
+        "plugins": "approved",
+        "prepare_startup_assets": "approved",
+        "ready": "approved",
         "scheduler": "approved",
-        "batch_queue": "approved",
-        "ready": "approved"
+        "state_probe": "approved",
+        "static_resource_probe": "approved",
+        "stop_weight_prewarm": "approved",
+        "structured_output": "approved",
+        "usage_reporting": "approved",
+        "worker_construct": "approved",
+        "worker_prepare": "approved",
+        "worker_wrapper": "approved"
       },
-      "rationale": "Reviewed unchanged startup action boundaries, readiness and resource constraints. Graph adaptation is runtime-only, cost-gated and restricted to supported single-GPU piecewise attention. Whole-request partitions retain KV slots, stable input staging and owned hidden-state outputs; sampling remains unified. No whole-batch retry occurs after partial KV writes. Unknown/missing cost evidence declines adaptation. Original-shape warmup takes precedence over splitting; every reused piece must be fully published, with readiness rechecked before KV writes. Batch-wide padding is bounded across all partitions and padded tails require exact measured costs. Private multi-stream composites use qualified whole-forward costs, isolated buffers and pools, serialized background recording, and atomic publication. Recording never repeats live KV writes; original-shape warmup overrides adaptation. Model/KV rebind and metadata changes cannot reuse stale composites. Validation covers both startup variants, serial/scheduled outputs, cold assets and global subgraph loading. Separate calibration exercises decode/prefill/mixed splits and unforced cost decisions; this is not TP/PP or arbitrary-backend certification."
+      "constraints": "approved",
+      "rationale": [
+        "Reviewed deferred bootstrap order, prewarm variants and worker affinity. The graph manager is constructed within model_runner; no independent capture worker starts until an inference warmup or composite request.",
+        "prepare_startup_assets now reads the manager-owned profile directory. Consumers retain manifest validation; observations cannot overwrite frozen inputs.",
+        "Weight/compile overlap remains internal to the joined load action. compile_already_ready preserves its readiness output without repeating compilation. KV allocation and graph precapture remain behind real compile and memory readiness.",
+        "Precapture delegates to one executor and registry. Runtime warmup precedes background capture; partial graphs stay private. GraphAdapter preserves cost guards, KV-safe fallbacks and unified sampling. Capture drains before model rebind.",
+        "Structured-output and scheduler state producers, final readiness and prepared asset release are unchanged. Reviewed within the existing single-GPU adapter scope."
+      ]
     },
     "verification": {
-      "identity": "513b09c5b0acf1a38f3a7b81df486c13d76f71a401409475abaac47e52647b40",
+      "identity": "7a2fcd25405260c86d8a0e799e43fdd71679a476a55b2faf3b85b825f4184d6c",
       "serial_equivalence": true,
       "scheduled_equivalence": true,
       "variants": [
@@ -610,7 +618,7 @@
           ],
           "reused_reads": 5,
           "global_subgraph_hits": 0,
-          "elapsed": 12.050822997000068
+          "elapsed": 12.610787310171872
         },
         {
           "case": "prewarm-4",
@@ -627,7 +635,7 @@
           ],
           "reused_reads": 5,
           "global_subgraph_hits": 0,
-          "elapsed": 12.586549681145698
+          "elapsed": 12.787097027990967
         },
         {
           "case": "standard-1",
@@ -644,7 +652,7 @@
           ],
           "reused_reads": 5,
           "global_subgraph_hits": 0,
-          "elapsed": 12.95981556084007
+          "elapsed": 14.75766912382096
         },
         {
           "case": "standard-4",
@@ -661,7 +669,7 @@
           ],
           "reused_reads": 5,
           "global_subgraph_hits": 0,
-          "elapsed": 12.475411295890808
+          "elapsed": 14.670876257121563
         },
         {
           "case": "cold",
@@ -678,7 +686,7 @@
           ],
           "reused_reads": 0,
           "global_subgraph_hits": 0,
-          "elapsed": 37.215350032784045
+          "elapsed": 39.73650858178735
         },
         {
           "case": "global-reuse",
@@ -695,7 +703,7 @@
           ],
           "reused_reads": 17,
           "global_subgraph_hits": 3,
-          "elapsed": 13.801392644178122
+          "elapsed": 15.390104040969163
         },
         {
           "case": "no-weight-overlap",
@@ -712,7 +720,7 @@
           ],
           "reused_reads": 5,
           "global_subgraph_hits": 0,
-          "elapsed": 14.299366414081305
+          "elapsed": 15.012988921720535
         }
       ]
     }

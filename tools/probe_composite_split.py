@@ -95,7 +95,7 @@ def split(self, parts, metadata, q, s, *, profile=None):
     r = self.runner
     if mode in ('eager', 'padding'):
         size = (batch_size if mode == 'eager' else
-                next(n for n in r.graphMatcher.captured_sizes if n >= batch_size))
+                next(n for n in r.cuda_graph_manager.adapter.captured_sizes if n >= batch_size))
         r.input_ids[batch_size:size].zero_()
         r.positions[batch_size:size].zero_()
         stats = {}

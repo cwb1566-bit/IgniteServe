@@ -33,9 +33,7 @@ from vllm.utils import GiB_bytes, MemorySnapshot, memory_profiling
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.utils import report_usage_stats
-from vllm.v1.worker.CudaGraphManager import DynamicGraphManager
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-from vllm.v1.worker.HotspotAnalyzer import HotspotAnalyzer
 from vllm.v1.worker.LazyFreezeManager import LazyFreezeManager
 from vllm.v1.worker import kv_profile_cache
 from vllm.v1.worker.startup_compile import (
@@ -251,7 +249,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
 from vllm.distributed.parallel_state import (
-    get_pp_group, get_tp_group, get_world_group, graph_capture,
+    get_world_group, graph_capture,
     is_global_first_rank,
     prepare_communication_buffer_for_model)
 from vllm.utils import DeviceMemoryProfiler
@@ -525,17 +523,18 @@ class Worker(WorkerBase):
             raise RuntimeError("Failed to clear worker input batch for rebind")
         runner.encoder_cache.clear()
         runner.requests.clear()
+        runner.cuda_graph_manager.before_rebind()
         load_result = runner.rebind_weights_in_place(vllm_config)
+        runner.cuda_graph_manager.after_rebind()
         vllm_config.parallel_config.rank = self.rank
         self.bind_vllm_config(vllm_config)
-        DynamicGraphManager.runner = runner
         result = {
             **eligibility,
             **load_result,
             "elapsed_s": time.perf_counter() - started,
             "kv_cache_tensors_retained": len(runner.kv_caches),
             "cuda_graph_shapes_retained": len(
-                getattr(runner, "cuda_graph_captured", ())),
+                runner.cuda_graph_manager.registry.published if runner is not None else ()),
         }
         logger.info("In-place weight rebind finished: %s", result)
         return result
@@ -584,7 +583,7 @@ class Worker(WorkerBase):
                 if isinstance(tensor, torch.Tensor)
             ],
             "cuda_graph_shapes": list(
-                getattr(runner, "cuda_graph_captured", ())),
+                runner.cuda_graph_manager.registry.published if runner is not None else ()),
         }
         gc_was_unfrozen = False
         compilation_state_release = {
@@ -602,30 +601,11 @@ class Worker(WorkerBase):
             "errors": [],
         }
         if runner is not None:
-            concurrent_capture_manager = getattr(
-                runner, "concurrent_piecewise_cudagraph_manager", None)
-            if concurrent_capture_manager is not None:
-                concurrent_capture_manager.shutdown()
+            runner.cuda_graph_manager.shutdown()
             gc_was_unfrozen = (
                 LazyFreezeManager.get_instance().release_for_model_rebind())
-            try:
-                HotspotAnalyzer.check_and_export(True)
-            except Exception:
-                logger.exception("Failed to export hotspot data before rebind")
             if runtime_env is not None:
                 apply_rebind_runtime_env(runtime_env)
-            hotspot_dir = os.environ.get("VLLM_CUDA_GRAPH_HOTSPOT_DIR")
-            if hotspot_dir:
-                HotspotAnalyzer.output_dir = Path(hotspot_dir)
-                HotspotAnalyzer.output_dir.mkdir(parents=True, exist_ok=True)
-            HotspotAnalyzer.stats.clear()
-            HotspotAnalyzer.recent_sizes.clear()
-            HotspotAnalyzer.total_requests = 0
-            HotspotAnalyzer.triggered_thresholds.clear()
-            HotspotAnalyzer.pending_captures.clear()
-            HotspotAnalyzer.has_exported_final = False
-            DynamicGraphManager.runner = None
-            DynamicGraphManager.capture_queue.clear()
             getattr(runner, "kv_caches", []).clear()
             getattr(runner, "encoder_cache", {}).clear()
             getattr(runner, "requests", {}).clear()
@@ -854,7 +834,6 @@ class Worker(WorkerBase):
             self, "_persistent_rebind_epoch", 0) + 1
         self.model_runner._persistent_rebind_epoch = (
             self._persistent_rebind_epoch)
-        DynamicGraphManager.runner = self.model_runner
         elapsed = time.perf_counter() - started
         released = max(0, free_after_release - free_before)
         logger.info(
@@ -899,7 +878,7 @@ class Worker(WorkerBase):
             "kv_cache_tensors": len(getattr(runner, "kv_caches", ())),
             "kv_cache_ptrs": kv_ptrs,
             "cuda_graph_shapes": list(
-                getattr(runner, "cuda_graph_captured", ())),
+                runner.cuda_graph_manager.registry.published if runner is not None else ()),
             "static_forward_context_entries": len(
                 runner.compilation_config.static_forward_context),
         }
@@ -1042,8 +1021,7 @@ class Worker(WorkerBase):
             override = os.getenv("VLLM_KV_PROFILE_CACHE_FILE")
             exact.append(Path(override).expanduser() if override else
                          assets.asset_path("kv_profile", payload))
-        hotspot_dir = Path(os.getenv("VLLM_CUDA_GRAPH_HOTSPOT_DIR",
-                                    str(self.model_runner.hotspot_profile_dir)))
+        hotspot_dir = self.model_runner.cuda_graph_manager.profile_dir
         exact.extend([hotspot_dir / "manifest.json",
                       hotspot_dir / "cuda_graph_hits.csv"])
         if os.getenv("VLLM_CUDA_GRAPH_HOTSPOT_CSV"):
@@ -1379,15 +1357,14 @@ class Worker(WorkerBase):
         deadline_ms: Optional[float] = None,
         selected_shape: Optional[int] = None,
     ) -> int:
-        if not self.model_runner.enable_adaptive_cudagraph:
+        if not self.model_runner.cuda_graph_manager.enabled:
             return 0
-        controller = self.model_runner.adaptive_cudagraph_controller
+        controller = self.model_runner.cuda_graph_manager
         distributed = self.vllm_config.parallel_config.world_size > 1
         if distributed:
             torch.distributed.barrier(group=get_world_group().cpu_group)
         try:
             captured = controller.capture_pending(
-                self.model_runner,
                 max_pieces_per_shape=max_pieces_per_shape,
                 deadline_ms=deadline_ms,
                 selected_shape=selected_shape,
@@ -1401,9 +1378,9 @@ class Worker(WorkerBase):
         return captured
 
     def get_pending_cudagraph_shapes(self) -> list[int]:
-        if not self.model_runner.enable_adaptive_cudagraph:
+        if not self.model_runner.cuda_graph_manager.enabled:
             return []
-        return self.model_runner.adaptive_cudagraph_controller.pending_shapes()
+        return self.model_runner.cuda_graph_manager.pending_shapes()
 
     def plan_pending_cudagraph_capture(
         self,
@@ -1413,9 +1390,9 @@ class Worker(WorkerBase):
         default_piece_ms: float,
         safety_factor: float,
     ) -> Optional[dict[str, object]]:
-        if not self.model_runner.enable_adaptive_cudagraph:
+        if not self.model_runner.cuda_graph_manager.enabled:
             return None
-        controller = self.model_runner.adaptive_cudagraph_controller
+        controller = self.model_runner.cuda_graph_manager
         plan = controller.plan_capture_maintenance(
             slack_ms=slack_ms,
             max_pieces=max_pieces,
@@ -1426,16 +1403,19 @@ class Worker(WorkerBase):
         return None if plan is None else dict(vars(plan))
 
     def export_adaptive_cudagraph_telemetry(self) -> None:
-        if not self.model_runner.enable_adaptive_cudagraph:
+        if not self.model_runner.cuda_graph_manager.enabled:
             return
-        controller = self.model_runner.adaptive_cudagraph_controller
+        controller = self.model_runner.cuda_graph_manager
         controller.flush_gpu_samples()
         controller.export_telemetry()
 
     def export_cudagraph_hotspot_profile(self) -> None:
         """Persist one logical workload profile from distributed rank zero."""
         if self.rank == 0:
-            HotspotAnalyzer.check_and_export(True)
+            self.model_runner.cuda_graph_manager.hotspots.check_and_export(True)
+
+    def shutdown_cudagraphs(self) -> None:
+        self.model_runner.cuda_graph_manager.shutdown()
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_runner.add_lora(lora_request)

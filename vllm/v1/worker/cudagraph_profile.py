@@ -96,7 +96,7 @@ def build_cudagraph_profile_manifest(
             "flash_attn_version": os.getenv("VLLM_FLASH_ATTN_VERSION", "auto"),
             "adaptation_source": hashlib.sha256(b"".join(
                 (Path(__file__).parent / name).read_bytes()
-                for name in ("GraphMatcher.py", "cudagraph_adaptation.py",
+                for name in ("CudaGraphManager.py", "HotspotAnalyzer.py", "piecewise_graph_registry.py", "cudagraph_adaptation.py",
                              "composite_cudagraph.py", "concurrent_piecewise_cudagraph.py",
                              "gpu_model_runner.py")) + b"".join(
                 (Path(__file__).parents[2] / name).read_bytes()

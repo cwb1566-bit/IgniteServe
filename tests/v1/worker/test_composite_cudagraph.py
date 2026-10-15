@@ -7,13 +7,13 @@ import pytest
 import torch
 
 from vllm.v1.worker import composite_cudagraph as module
-from vllm.v1.worker.GraphMatcher import GraphMatcher
+from vllm.v1.worker.cudagraph_adaptation import GraphAdapter
 from vllm.v1.worker.cudagraph_adaptation import (
     GraphPartition, composite_workload, plan_partitions, workload_key)
 
 
 def test_composite_cost_is_measured_whole_execution_not_sum_or_max():
-    matcher = GraphMatcher([1, 2, 4])
+    matcher = GraphAdapter(captured_sizes=[1, 2, 4])
     q, s, f = [1]*7, [12]*7, [False]*7
     parts = (GraphPartition(0,4,0,4,4), GraphPartition(4,7,4,7,4))
     prices = matcher.cost_table._workloads
@@ -50,8 +50,8 @@ def setup_registry(monkeypatch):
     jobs = []
     r = NS(device='cpu', model_config=NS(max_model_len=128), model=object(),
            input_ids=torch.zeros(4), positions=torch.zeros(4), kv_caches=[torch.zeros(4)],
-           concurrent_piecewise_cudagraph_manager=NS(enabled=True,
-               enqueue_auxiliary=lambda job: jobs.append(job) or True))
+           cuda_graph_manager=NS(capture=NS(enabled=True,
+               enqueue_auxiliary=lambda job: jobs.append(job) or True)))
     class FakeGraph:
         def __init__(self, runner, parts, metadata):
             self.ready = threading.Event()
@@ -67,7 +67,7 @@ def setup_registry(monkeypatch):
             return 'output'
     monkeypatch.setattr(module, 'CompositeGraph', FakeGraph)
     monkeypatch.setattr(torch.cuda, 'current_stream', lambda _: None)
-    return module.CompositeGraphs(r), jobs
+    return module.CompositeGraphStore(r), jobs
 
 
 def test_pending_snapshot_is_immutable_and_publication_is_required(monkeypatch):
@@ -94,7 +94,7 @@ def test_failed_or_disabled_builds_do_not_retry_or_launch(monkeypatch):
     plan.failed = True
     assert registry.execute(parts, metadata, [1,1], [7,7]) is None
     assert len(jobs) == 1 and registry.replays == 0
-    registry.runner.concurrent_piecewise_cudagraph_manager.enabled = False
+    registry.runner.cuda_graph_manager.capture.enabled = False
     assert registry.execute(parts, metadata, [1,1], [9,9]) is None
     assert len(jobs) == 1
 
@@ -135,7 +135,7 @@ def test_model_or_kv_rebind_declines_before_replay(monkeypatch):
 
 def test_auxiliary_and_whole_capture_share_serial_worker(monkeypatch):
     from vllm.v1.worker.concurrent_piecewise_cudagraph import (
-        ConcurrentPiecewiseCUDAGraphCaptureManager as Manager, _CaptureRequest)
+        CaptureExecutor as Manager, _CaptureRequest)
     manager = object.__new__(Manager)
     manager.runner = NS(device='cpu')
     manager._queue = queue.Queue()
@@ -152,11 +152,46 @@ def test_auxiliary_and_whole_capture_share_serial_worker(monkeypatch):
 
 
 def test_shutdown_prevents_new_capture_thread():
-    from vllm.v1.worker.concurrent_piecewise_cudagraph import ConcurrentPiecewiseCUDAGraphCaptureManager
-    manager = object.__new__(ConcurrentPiecewiseCUDAGraphCaptureManager)
+    from vllm.v1.worker.concurrent_piecewise_cudagraph import CaptureExecutor
+    manager = object.__new__(CaptureExecutor)
     manager._stopping = True
     manager._lock = threading.Lock()
     manager._thread = None
     manager.enabled = True
     assert not manager.enqueue_auxiliary(lambda: None)
     assert manager._thread is None
+
+
+def test_shutdown_between_worker_start_and_enqueue_does_not_claim(monkeypatch):
+    from unittest.mock import Mock
+    from vllm.v1.worker.concurrent_piecewise_cudagraph import CaptureExecutor
+    executor = object.__new__(CaptureExecutor)
+    executor.enabled = True
+    executor._lock = threading.Lock()
+    executor._scheduled_shapes = set()
+    executor.manager = NS(take_queued_shapes=Mock())
+    def start_then_stop():
+        executor._stopping = True
+        return True
+    executor._ensure_thread = start_then_stop
+    assert not executor.enqueue_after_warmup('decode', 8)
+    executor.manager.take_queued_shapes.assert_not_called()
+
+
+def test_capture_queue_publication_holds_shutdown_lock(monkeypatch):
+    from unittest.mock import Mock
+    from vllm.v1.worker.concurrent_piecewise_cudagraph import CaptureExecutor
+    executor = object.__new__(CaptureExecutor)
+    executor.enabled, executor._stopping = True, False
+    executor._lock = threading.Lock()
+    executor._scheduled_shapes = set()
+    executor.manager = NS(take_queued_shapes=Mock(return_value=[8]))
+    executor.runner = NS(device='cpu')
+    executor._ensure_thread = lambda: True
+    def publish(request):
+        assert executor._lock.locked()
+        assert request.shape == 8
+    executor._queue = NS(put=publish)
+    monkeypatch.setattr(torch.cuda, 'Event', lambda: NS(record=lambda stream: None))
+    monkeypatch.setattr(torch.cuda, 'current_stream', lambda device: None)
+    assert executor.enqueue_after_warmup('decode', 8)

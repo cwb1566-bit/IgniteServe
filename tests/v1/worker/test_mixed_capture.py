@@ -4,31 +4,31 @@ from pathlib import Path
 import torch
 from types import SimpleNamespace
 from unittest.mock import patch
-from vllm.v1.worker.adaptive_cudagraph import AdaptiveCUDAGraphController, GraphState
+from vllm.v1.worker.CudaGraphManager import CUDAGraphManager, GraphState
 
 
 def test_branch_defaults_and_explicit_opt_out():
     from vllm.v1.worker.concurrent_piecewise_cudagraph import (
-        ConcurrentPiecewiseCUDAGraphCaptureManager as Manager)
+        CaptureExecutor as Manager)
     runner = SimpleNamespace(enable_adaptive_cudagraph=False)
     with patch.dict(os.environ, {}, clear=True):
-        c = AdaptiveCUDAGraphController()
+        c = CUDAGraphManager()
         assert c.enabled and c.min_hits == 1
-        assert Manager._check_support(runner) == (
+        assert Manager._check_support(runner, adaptive=False) == (
             False, 'adaptive CUDA graph controller is disabled')
     with patch.dict(os.environ, {
         'VLLM_ENABLE_ADAPTIVE_CUDAGRAPH': '0',
         'VLLM_ADAPTIVE_CUDAGRAPH_MIN_HITS': '5',
         'VLLM_ENABLE_CONCURRENT_PIECEWISE_CUDAGRAPH_CAPTURE': '0',
     }, clear=True):
-        c = AdaptiveCUDAGraphController()
+        c = CUDAGraphManager()
         assert not c.enabled and c.min_hits == 5
         assert Manager._check_support(runner) == (False, 'feature flag is off')
 
 
 def test_mixed_and_prefill_lifecycle():
     for phase in ['mixed', 'prefill']:
-        c = AdaptiveCUDAGraphController(enabled=True, min_hits=2)
+        c = CUDAGraphManager(enabled=True, min_hits=2)
         c.capture_phases = frozenset({'decode', 'mixed', 'prefill'})
         assert not c.plan_runtime(phase, 31, 32, True, False).mark_runtime_warmup
         assert c.plan_runtime(phase, 31, 32, True, False).mark_runtime_warmup
@@ -42,7 +42,7 @@ def test_mixed_and_prefill_lifecycle():
 
 def test_deduplicated_completion_and_failure():
     for fail in [False, True]:
-        c = AdaptiveCUDAGraphController(enabled=True, min_hits=1)
+        c = CUDAGraphManager(enabled=True, min_hits=1)
         c.capture_phases = frozenset({'decode', 'mixed', 'prefill'})
         for phase in c.capture_phases:
             c.plan_runtime(phase, 31, 32, True, False)

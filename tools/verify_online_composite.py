@@ -95,7 +95,7 @@ def execute(self, selected, metadata, q, s, **kw):
                           intermediate_tensors=None, inputs_embeds=None)
     elif mode == 'split_reference':
         lanes = partition_metadata(metadata, selected, q, s, r.model_config.max_model_len)
-        p = self.composite.plans[contract(selected, lanes)]
+        p = self.runner.cuda_graph_manager.composites.plans[contract(selected, lanes)]
         assert p.ready.is_set() and not p.failed
         p.stage(lanes)
         for part, lane in zip(selected, p.lanes):
@@ -106,7 +106,7 @@ def execute(self, selected, metadata, q, s, **kw):
                 p.output[part.first_token:part.last_token].copy_(value[:part.last_token-part.first_token])
         out = p.output
     else:
-        before = self.composite.replays if self.composite else 0
+        before = self.runner.cuda_graph_manager.composites.replays if self.runner.cuda_graph_manager.composites else 0
         out = original_execute(self, selected, metadata, q, s, **kw)
         if out is None:
             used = 'pending_eager'
@@ -114,10 +114,10 @@ def execute(self, selected, metadata, q, s, **kw):
                 out = r.model(input_ids=r.input_ids[:B], positions=r.positions[:B],
                               intermediate_tensors=None, inputs_embeds=None)
         else:
-            assert self.composite.replays == before + 1
+            assert self.runner.cuda_graph_manager.composites.replays == before + 1
             if mode == 'policy':
                 target = next(n for n in r.cudagraph_batch_sizes if n >= B)
-                state = next(x.state.value for x in r.adaptive_cudagraph_controller.snapshot()
+                state = next(x.state.value for x in r.cuda_graph_manager.snapshot()
                              if x.phase == 'decode' and x.shape == target)
                 states.append(state)
     submit_ms = (time.perf_counter() - started) * 1000
@@ -137,7 +137,7 @@ try:
         enable_prefix_caching=False, seed=123,
         compilation_config={'cudagraph_capture_sizes':[1,2,4,8,16,32,64,128,256]})
     r = runners[0]
-    assert r.concurrent_piecewise_cudagraph_manager.enabled
+    assert r.cuda_graph_manager.capture.enabled
     variants = ['The capital of France is', 'The capital of China is',
                 'The capital of Japan is', 'The capital of Italy is']
     lengths = [len(llm.get_tokenizer().encode(text)) for text in variants]
@@ -146,9 +146,9 @@ try:
     params = SamplingParams(temperature=0, max_tokens=48, ignore_eos=True, logprobs=1)
     if args.policy_only:
         from vllm.v1.worker.cudagraph_profile import validate_cudagraph_profile_manifest
-        valid, reason = validate_cudagraph_profile_manifest(Path(args.costs).parent, r.cudagraph_profile_manifest)
+        valid, reason = validate_cudagraph_profile_manifest(Path(args.costs).parent, r.cuda_graph_manager.profile_manifest)
         assert valid, reason
-        assert r.graphMatcher.cost_table._workloads
+        assert r.cuda_graph_manager.adapter.cost_table._workloads
     for cycle in range(1 if args.policy_only else args.cycles):
         for mode in (('eager',) if args.policy_only else ('eager', 'composite', 'split_reference')):
             start = time.perf_counter()
@@ -159,7 +159,7 @@ try:
     for c, name, eager_key, composite_key, start, end, submit in records:
         if c > 0 and name in ('eager', 'composite'):
             grouped[name, eager_key if name == 'eager' else composite_key].append(start.elapsed_time(end))
-    table = r.graphMatcher.cost_table
+    table = r.cuda_graph_manager.adapter.cost_table
     if not args.policy_only:
         table._workloads.clear()
     rows = []
@@ -174,12 +174,12 @@ try:
                          samples=len(values), scope='forward', mean_gpu_ms=statistics.mean(values),
                          p50_gpu_ms=p50, p90_gpu_ms=p90))
     if not args.policy_only:
-        assert rows and r.graph_adapter.composite.replays > 0
+        assert rows and r.cuda_graph_manager.composites.replays > 0
     # An already available composite spans both requested online states. The
     # controller is reset, not delayed; ordinary whole-shape capture runs normally.
-    r.adaptive_cudagraph_controller.reset()
-    r.adaptive_cudagraph_controller.min_hits = 24
-    r.adaptive_cudagraph_controller.capture_phases = frozenset({'decode'})
+    r.cuda_graph_manager.reset()
+    r.cuda_graph_manager.min_hits = 24
+    r.cuda_graph_manager.capture_phases = frozenset({'decode'})
     mode = 'policy'
     if args.profile_window:
         original_replay = CompositeGraph.replay
@@ -211,7 +211,7 @@ try:
         same_error = max(abs(a-b) for out in warmed_composite for a,b in zip(equal_reference,probs(out)))
         assert same_error < 1e-5, same_error
     target = next(n for n in r.cudagraph_batch_sizes if n >= B)
-    assert target in r.cuda_graph_captured
+    assert target in r.cuda_graph_manager.registry.published
     timings = {}
     for name in ('eager', 'composite', 'split_reference', 'policy', 'pending_eager'):
         values = [a.elapsed_time(b) for c,n,_,_,a,b,_ in records if n == name and (c > 0 or args.policy_only or name == 'pending_eager')]
@@ -220,8 +220,8 @@ try:
                                 p99_ms=sorted(values)[math.ceil(.99*len(values))-1])
     result = dict(batch=B, timings=timings, states=states, tokens_equal=True,
                   cross_shape_logprob_error=cross_error, same_shape_logprob_error=same_error,
-                  builds=[p.build_seconds for p in r.graph_adapter.composite.plans.values()],
-                  replays=r.graph_adapter.composite.replays,
+                  builds=[p.build_seconds for p in r.cuda_graph_manager.composites.plans.values()],
+                  replays=r.cuda_graph_manager.composites.replays,
                   generation_seconds=[(name, seconds) for name,_,seconds in generations],
                   scope='forward incl staging/merge; excluding logits/sampling',
                   one_native_launch=True)
@@ -233,7 +233,7 @@ try:
         from vllm.compilation.startup_resources import resource_dir
         from vllm.v1.worker.cudagraph_profile import MANIFEST_FILENAME
         import io
-        manifest = r.cudagraph_profile_manifest
+        manifest = r.cuda_graph_manager.profile_manifest
         target_dir = resource_dir('hotspots') / digest(manifest)
         if (target_dir / 'cuda_graph_cost_table.csv').exists():
             from vllm.v1.worker.cudagraph_profile import validate_cudagraph_profile_manifest

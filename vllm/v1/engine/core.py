@@ -56,7 +56,6 @@ _R = TypeVar('_R')  # Return type for collective_rpc
 import threading
 from vllm.v1.phase_profiler import timer
 from vllm.v1.metrics_recorder import recorder
-from vllm.v1.worker.HotspotAnalyzer import HotspotAnalyzer
 from vllm.v1.engine.weight_pagecache import (
     apply_rebind_runtime_env,
     ensure_async_weight_prewarm,
@@ -944,9 +943,12 @@ class EngineCore:
         return engine_core_outputs, scheduled_batch
 
     def shutdown(self):
-        HotspotAnalyzer.check_and_export(True)
         self.structured_output_manager.clear_backend()
         if self.model_executor:
+            try:
+                self.model_executor.collective_rpc("shutdown_cudagraphs")
+            except Exception:
+                logger.exception("Failed to drain CUDA graph capture worker")
             try:
                 self.model_executor.collective_rpc(
                     "export_cudagraph_hotspot_profile")
@@ -1015,16 +1017,6 @@ class EngineCore:
         self.scheduler.shutdown()
         self.batch_queue = None
         self.mm_input_cache_server.reset()
-        try:
-            HotspotAnalyzer.check_and_export(True)
-            HotspotAnalyzer.stats.clear()
-            HotspotAnalyzer.recent_sizes.clear()
-            HotspotAnalyzer.total_requests = 0
-            HotspotAnalyzer.triggered_thresholds.clear()
-            HotspotAnalyzer.pending_captures.clear()
-            HotspotAnalyzer.has_exported_final = False
-        except Exception:
-            logger.exception("Failed to reset EngineCore hotspot state")
 
         load_started = time.perf_counter()
         worker_results = self.model_executor.rebind_weights_in_place(
@@ -1142,16 +1134,6 @@ class EngineCore:
         self.scheduler.shutdown()
         self.batch_queue = None
         self.mm_input_cache_server.reset()
-        try:
-            HotspotAnalyzer.check_and_export(True)
-            HotspotAnalyzer.stats.clear()
-            HotspotAnalyzer.recent_sizes.clear()
-            HotspotAnalyzer.total_requests = 0
-            HotspotAnalyzer.triggered_thresholds.clear()
-            HotspotAnalyzer.pending_captures.clear()
-            HotspotAnalyzer.has_exported_final = False
-        except Exception:
-            logger.exception("Failed to reset EngineCore hotspot state")
 
         try:
             reset_started = time.perf_counter()

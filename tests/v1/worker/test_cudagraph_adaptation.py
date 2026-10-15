@@ -4,7 +4,7 @@ from types import SimpleNamespace as NS
 import pytest
 import torch
 
-from vllm.v1.worker.GraphMatcher import GraphMatcher, GraphCostTable
+from vllm.v1.worker.cudagraph_adaptation import GraphAdapter, GraphCostTable
 from vllm.v1.worker.cudagraph_adaptation import (
     GraphAdapter, GraphPartition, plan_partitions, workload_key)
 
@@ -14,14 +14,14 @@ def put(table, mode, shape, query, seq, flags, ms, parts=1):
 
 
 def ready_registry(*sizes):
-    return NS(cuda_piecewise_backends_list={0: NS(total_piecewise_compiles=1,
+    return NS(cuda_piecewise_backends_list={0: NS(piecewise_compile_index=0, total_piecewise_compiles=1,
         concrete_size_entries={size: NS(use_cudagraph=True, cudagraph=object(),
             concurrent_capture_in_progress=False, concurrent_capture_gate=None)
             for size in sizes})})
 
 
 def test_costs_request_boundaries_and_overhead():
-    m = GraphMatcher([2, 4])
+    m = GraphAdapter(captured_sizes=[2, 4])
     q, s, f = [1] * 6, [128] * 6, [False] * 6
     put(m.cost_table, "eager", 6, q, s, f, 10)
     for n in (2, 4):
@@ -36,7 +36,7 @@ def test_costs_request_boundaries_and_overhead():
 
 
 def test_mixed_requests_not_tokens_and_no_extrapolation():
-    m = GraphMatcher([2, 4])
+    m = GraphAdapter(captured_sizes=[2, 4])
     q, s, f = [3, 1, 1], [8, 128, 128], [True, False, False]
     put(m.cost_table, "eager", 5, q, s, f, 10)
     put(m.cost_table, "graph", 4, q[:2], s[:2], f[:2], 2)
@@ -45,7 +45,7 @@ def test_mixed_requests_not_tokens_and_no_extrapolation():
     parts = plan_partitions(m, q, s, f)
     assert [p.graph_size for p in parts] == [4, 2]  # One padded token in five.
     assert not plan_partitions(m, q, s, f, max_pad_ratio=.1)
-    m.update_captured_sizes([1, 2, 4])
+    m.registry.publish(1)
     put(m.cost_table, "graph", 1, q[2:], s[2:], f[2:], 1)
     parts = plan_partitions(m, q, s, f)
     assert parts[0].last_token == 4 and parts[0].last_request == 2
@@ -54,7 +54,7 @@ def test_mixed_requests_not_tokens_and_no_extrapolation():
 
 
 def test_batch_padding_avoids_an_extra_forward_but_requires_tail_cost():
-    m = GraphMatcher([1, 2, 4])
+    m = GraphAdapter(captured_sizes=[1, 2, 4])
     q, s, f = [1] * 7, [128] * 7, [False] * 7
     put(m.cost_table, 'eager', 7, q, s, f, 20)
     for n in (1, 2, 4):
@@ -70,7 +70,7 @@ def test_batch_padding_avoids_an_extra_forward_but_requires_tail_cost():
 
 
 def test_padding_budget_is_shared_across_all_parts():
-    m = GraphMatcher([4])
+    m = GraphAdapter(captured_sizes=[4])
     q, s, f = [3, 3], [128, 128], [True, True]
     put(m.cost_table, 'eager', 6, q, s, f, 20)
     put(m.cost_table, 'graph', 4, q[:1], s[:1], f[:1], 2)
@@ -110,10 +110,10 @@ def test_sequential_copy_preserves_outputs_and_restores_inputs(monkeypatch):
     class Meta:
         def split_for_graph(self, part, *args):
             return self
-    r = NS(graphMatcher=GraphMatcher([2]), input_ids=torch.arange(4),
+    r = NS(input_ids=torch.arange(4),
            positions=torch.arange(4), hidden_size=2, dtype=torch.float32,
            device='cpu', vllm_config=None, model=model, compilation_config=ready_registry(2))
-    adapter = GraphAdapter(r)
+    adapter = GraphAdapter(r, captured_sizes=[2])
     parts = (GraphPartition(0, 2, 0, 2, 2), GraphPartition(2, 4, 2, 4, 2))
     result = adapter.execute(parts, {'x': Meta()}, [1] * 4, [8] * 4)
     torch.testing.assert_close(result[:, 0], torch.arange(4).float())
@@ -122,7 +122,8 @@ def test_sequential_copy_preserves_outputs_and_restores_inputs(monkeypatch):
     assert adapter.fallbacks == 0
 
 
-def test_flash_metadata_partition_preserves_kv_slots():
+def test_flash_metadata_partition_preserves_kv_slots(monkeypatch):
+    monkeypatch.setattr('vllm.attention.utils.fa_utils.get_flash_attn_version', lambda: 2)
     from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
     m = FlashAttentionMetadata(6, 3, torch.tensor([0, 3, 4, 6]), 128,
         torch.tensor([8, 128, 30]), torch.arange(12).view(3, 4),
@@ -141,8 +142,8 @@ def test_flash_metadata_partition_preserves_kv_slots():
 
 def test_pressure_limit_has_hysteresis(monkeypatch):
     from vllm.v1.worker import cudagraph_adaptation as module
-    r = NS(graphMatcher=GraphMatcher([2]), device='cpu')
-    a = GraphAdapter(r)
+    r = NS(device='cpu')
+    a = GraphAdapter(r, captured_sizes=[2])
     total = 100 << 30
     free = [20 << 30]
     monkeypatch.setattr(torch.cuda, 'mem_get_info', lambda device: (free[0], total))
@@ -155,8 +156,8 @@ def test_pressure_limit_has_hysteresis(monkeypatch):
 
 
 def test_split_observation_is_not_capture_warmup():
-    from vllm.v1.worker.adaptive_cudagraph import AdaptiveCUDAGraphController
-    c = AdaptiveCUDAGraphController(enabled=True, min_hits=2)
+    from vllm.v1.worker.CudaGraphManager import CUDAGraphManager
+    c = CUDAGraphManager(enabled=True, min_hits=2)
     c.capture_phases = frozenset({'decode', 'prefill', 'mixed'})
     decision = c.plan_runtime('mixed', 6, 8, True, False, adapted=True)
     assert decision.reason == 'split-reuse'
@@ -175,8 +176,8 @@ def test_split_observation_is_not_capture_warmup():
 
 @pytest.mark.parametrize('phase', ['decode', 'prefill', 'mixed'])
 def test_split_during_capture_then_whole_ready(phase):
-    from vllm.v1.worker.adaptive_cudagraph import AdaptiveCUDAGraphController
-    c = AdaptiveCUDAGraphController(enabled=True, min_hits=1)
+    from vllm.v1.worker.CudaGraphManager import CUDAGraphManager
+    c = CUDAGraphManager(enabled=True, min_hits=1)
     c.capture_phases = frozenset({'decode', 'prefill', 'mixed'})
     assert c.plan_runtime(phase, 64, 64, True, False, adapted=True).mark_runtime_warmup
     c.finish_runtime_warmup(phase, 64)
@@ -193,7 +194,7 @@ def test_split_during_capture_then_whole_ready(phase):
 def test_split_requires_complete_published_chains():
     from threading import Event
     registry = ready_registry(2, 4)
-    a = GraphAdapter(NS(compilation_config=registry, graphMatcher=GraphMatcher([2, 4])))
+    a = GraphAdapter(NS(compilation_config=registry), captured_sizes=[2, 4])
     assert a.ready_sizes() == (2, 4)
     entry = registry.cuda_piecewise_backends_list[0].concrete_size_entries[4]
     entry.concurrent_capture_gate = Event()
@@ -208,8 +209,8 @@ def test_split_requires_complete_published_chains():
 
 
 def test_lost_graph_declines_before_any_tensor_access():
-    r = NS(compilation_config=ready_registry(2), graphMatcher=GraphMatcher([2]))
-    a = GraphAdapter(r)
+    r = NS(compilation_config=ready_registry(2))
+    a = GraphAdapter(r, captured_sizes=[2])
     r.compilation_config.cuda_piecewise_backends_list[0].concrete_size_entries.clear()
     parts = (GraphPartition(0, 2, 0, 2, 2), GraphPartition(2, 4, 2, 4, 2))
     assert a.execute(parts, {}, [1] * 4, [4] * 4) is None
@@ -217,7 +218,7 @@ def test_lost_graph_declines_before_any_tensor_access():
 
 
 def test_filtered_graphs_cannot_use_stale_cost_evidence():
-    m = GraphMatcher([2, 4])
+    m = GraphAdapter(captured_sizes=[2, 4])
     q, s, f = [1] * 6, [128] * 6, [False] * 6
     put(m.cost_table, 'eager', 6, q, s, f, 10)
     for n in (2, 4):
@@ -241,10 +242,10 @@ def test_no_retry_after_partial_execution(monkeypatch):
         if len(calls) == 2:
             raise RuntimeError('device failure')
         return input_ids[:, None].float()
-    r = NS(graphMatcher=GraphMatcher([2]), input_ids=torch.arange(4),
+    r = NS(input_ids=torch.arange(4),
            positions=torch.arange(4), hidden_size=1, dtype=torch.float32,
            device='cpu', vllm_config=None, model=model, compilation_config=ready_registry(2))
-    a = GraphAdapter(r)
+    a = GraphAdapter(r, captured_sizes=[2])
     parts = (GraphPartition(0, 2, 0, 2, 2), GraphPartition(2, 4, 2, 4, 2))
     with pytest.raises(RuntimeError, match='device failure'):
         a.execute(parts, {'x': Meta()}, [1] * 4, [4] * 4)
@@ -258,13 +259,13 @@ def test_allocation_failure_declines_before_kv_write(monkeypatch):
             return self
     def must_not_run(**kw):
         raise AssertionError('model ran before allocation completed')
-    r = NS(graphMatcher=GraphMatcher([2]), input_ids=torch.arange(4),
+    r = NS(input_ids=torch.arange(4),
            positions=torch.arange(4), hidden_size=1, dtype=torch.float32,
            device='cpu', vllm_config=None, model=must_not_run, compilation_config=ready_registry(2))
     def oom(*a, **kw):
         raise torch.OutOfMemoryError('synthetic allocation failure')
     monkeypatch.setattr(torch, 'empty', oom)
-    a = GraphAdapter(r)
+    a = GraphAdapter(r, captured_sizes=[2])
     parts = (GraphPartition(0, 2, 0, 2, 2), GraphPartition(2, 4, 2, 4, 2))
     assert a.execute(parts, {'x': Meta()}, [1] * 4, [4] * 4) is None
     assert a.fallbacks == 1

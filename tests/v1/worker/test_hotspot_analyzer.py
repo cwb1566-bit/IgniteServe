@@ -6,14 +6,6 @@ from vllm.v1.worker.HotspotAnalyzer import BatchSizeStats, HotspotAnalyzer
 from vllm.v1.worker.cudagraph_profile import ensure_cudagraph_profile_manifest
 
 
-@pytest.fixture(autouse=True)
-def _isolate_analyzer(monkeypatch):
-    for name in ['output_dir', 'exporter_id', 'total_requests', 'stats',
-                 'profile_manifest']:
-        monkeypatch.setattr(HotspotAnalyzer, name, getattr(HotspotAnalyzer, name))
-    HotspotAnalyzer.profile_manifest = None
-
-
 def _read_counts(path):
     with open(path, newline="", encoding="utf-8") as file:
         return {
@@ -23,7 +15,7 @@ def _read_counts(path):
 
 
 def test_export_merges_engine_generations_without_double_counting(tmp_path):
-    analyzer = HotspotAnalyzer
+    analyzer = HotspotAnalyzer()
     analyzer.output_dir = tmp_path
 
     analyzer.exporter_id = "engine-a"
@@ -49,7 +41,7 @@ def test_export_preserves_incompatible_profile(tmp_path):
     old = {'schema_version': 1, 'software': {'vllm': 'old'}}
     new = {'schema_version': 1, 'software': {'vllm': 'new'}}
     ensure_cudagraph_profile_manifest(tmp_path, old)
-    analyzer = HotspotAnalyzer
+    analyzer = HotspotAnalyzer()
     analyzer.output_dir = tmp_path
     analyzer.profile_manifest = old
     analyzer.exporter_id = 'old-engine'
@@ -67,7 +59,7 @@ def test_export_preserves_incompatible_profile(tmp_path):
 
 
 def test_export_rejects_missing_manifest(tmp_path):
-    analyzer = HotspotAnalyzer
+    analyzer = HotspotAnalyzer()
     analyzer.output_dir = tmp_path
     analyzer.profile_manifest = {'schema_version': 1}
     analyzer.total_requests = 2

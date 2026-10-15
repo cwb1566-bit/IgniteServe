@@ -22,7 +22,6 @@ os.environ.update(CUDA_VISIBLE_DEVICES=str(a.gpu), VLLM_ENABLE_STARTUP_OPTIMIZAT
 import torch
 from vllm import LLM, SamplingParams
 from vllm.v1.worker.cudagraph_adaptation import GraphAdapter, plan_partitions, workload_key
-from vllm.v1.worker.GraphMatcher import GraphMatcher
 
 base_execute = GraphAdapter.execute
 selected_phase = None
@@ -37,7 +36,7 @@ def plan(self, meta, q, s, f):
         runners.append(self.runner)
     if phase(f) != selected_phase or not self.supported(meta):
         return ()
-    table = self.runner.graphMatcher.cost_table
+    table = self.runner.cuda_graph_manager.adapter.cost_table
     table._workloads['eager',sum(q),workload_key(q,s,f),1] = 1000.
     for n in (2,3):
         table._workloads['split_overhead',sum(q),workload_key(q,s,f),n] = 1.
@@ -47,7 +46,7 @@ def plan(self, meta, q, s, f):
             for size in self.ready_sizes():
                 if size >= sum(q[lo:hi]):
                     table._workloads['graph',size,key,1] = 1.
-    result = plan_partitions(self.runner.graphMatcher,q,s,f,captured_sizes=self.ready_sizes())
+    result = plan_partitions(self.runner.cuda_graph_manager.adapter,q,s,f,captured_sizes=self.ready_sizes())
     self._composite_parts = result
     return result
 
@@ -59,7 +58,7 @@ def execute(self, parts, meta, q, s, **kw):
 
 GraphAdapter.plan = plan
 GraphAdapter.execute = execute
-GraphMatcher.find_best_match = lambda self,n,*args,**kw: self._eager(n,'phase-validation')
+GraphAdapter.find_best_match = lambda self,n,*args,**kw: self._eager(n,'phase-validation')
 llm = None
 try:
     llm = LLM(model=a.model,dtype='float16',max_model_len=512,max_num_seqs=8,
@@ -82,16 +81,16 @@ try:
     maximum = 0.
     for selected_phase in ('prefill','mixed'):
         r = runners[0]
-        r.concurrent_piecewise_cudagraph_manager._queue.join()
+        r.cuda_graph_manager.capture._queue.join()
         torch.cuda.synchronize()
-        r.graph_adapter.composite = None
+        r.cuda_graph_manager.composites = None
         for _ in range(8):
             out = llm.generate(prompts,params,use_tqdm=False)
             assert tokens(out) == tokens(reference), selected_phase
             maximum = max(maximum,max(abs(x-y) for x,y in zip(probs(out),probs(reference))))
-        r.concurrent_piecewise_cudagraph_manager._queue.join()
+        r.cuda_graph_manager.capture._queue.join()
         assert counts[selected_phase] > 0, counts
-        assert not any(p.failed for p in r.graph_adapter.composite.plans.values())
+        assert not any(p.failed for p in r.cuda_graph_manager.composites.plans.values())
     assert maximum < .05, maximum
     print('COMPOSITE_PHASES_VERIFIED',dict(counts), 'max_logprob_error',maximum,flush=True)
 finally:

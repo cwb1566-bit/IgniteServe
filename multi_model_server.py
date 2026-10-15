@@ -46,15 +46,6 @@ def hotspot_root_dir() -> Path:
     return resource_dir("cuda_graph_hotspots")
 
 
-def reset_hotspot_analyzer_state(analyzer) -> None:
-    analyzer.stats.clear()
-    analyzer.recent_sizes.clear()
-    analyzer.total_requests = 0
-    analyzer.triggered_thresholds.clear()
-    analyzer.pending_captures.clear()
-    analyzer.has_exported_final = False
-
-
 class TemplateManager:
     @staticmethod
     def get_prompt_and_stop(model_name: str, messages: list):
@@ -166,15 +157,7 @@ class MultiModelManager:
                 os.environ["VLLM_CUDA_GRAPH_HOTSPOT_DIR"] = str(hotspot_dir)
                 return normalized_key
 
-            try:
-                from vllm.v1.worker.HotspotAnalyzer import HotspotAnalyzer
-                if self.current_hotspot_key is not None:
-                    HotspotAnalyzer.check_and_export(True)
-                HotspotAnalyzer.output_dir = hotspot_dir
-                reset_hotspot_analyzer_state(HotspotAnalyzer)
-            except Exception as exc:
-                print(f"[CUDA Graph Hotspot] Failed to rebind analyzer: {exc}")
-
+            # Each worker's manager exports and resets observations at rebind.
             os.environ["VLLM_CUDA_GRAPH_HOTSPOT_DIR"] = str(hotspot_dir)
             self.current_hotspot_key = normalized_key
             self.current_hotspot_dir = hotspot_dir

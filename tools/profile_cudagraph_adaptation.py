@@ -146,8 +146,7 @@ def main():
     os.environ['VLLM_ENABLE_V1_MULTIPROCESSING'] = '0'
     import torch
     from vllm import LLM, SamplingParams
-    from vllm.v1.worker.GraphMatcher import GraphMatcher, MatchResult
-    from vllm.v1.worker.cudagraph_adaptation import GraphAdapter, workload_key
+    from vllm.v1.worker.cudagraph_adaptation import GraphAdapter, MatchResult, workload_key
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
     from vllm.forward_context import get_forward_context
     if args.mode == 'split-reference':
@@ -165,7 +164,7 @@ def main():
     original_execute = GPUModelRunner.execute_model
     original_plan = GraphAdapter.plan
     original_split = GraphAdapter.execute
-    original_match = GraphMatcher.find_best_match
+    original_match = GraphAdapter.find_best_match
     events, counts = [], defaultdict(int)
     manifest = None
 
@@ -176,12 +175,12 @@ def main():
 
     def instrument(self, scheduler_output, *a, **kw):
         nonlocal manifest
-        manifest = self.cudagraph_profile_manifest
+        manifest = self.cuda_graph_manager.profile_manifest
         if args.mode == 'policy' and not getattr(self, '_profile_loaded', False):
             from vllm.v1.worker.cudagraph_profile import validate_cudagraph_profile_manifest
             valid, reason = validate_cudagraph_profile_manifest(Path(args.costs).parent, manifest)
             assert valid, reason
-            assert self.graphMatcher.cost_table._workloads, 'runtime did not load qualified profile'
+            assert self.cuda_graph_manager.adapter.cost_table._workloads, 'runtime did not load qualified profile'
             self._profile_loaded = True
         model = self.model
         runner = self
@@ -235,14 +234,14 @@ def main():
         if args.mode in ('split-reference', 'collect'):
             # Deliberately admit plans for coverage/calibration; measurements,
             # not these synthetic admission costs, are exported below.
-            table = self.runner.graphMatcher.cost_table
+            table = self.runner.cuda_graph_manager.adapter.cost_table
             table._workloads[('eager', sum(q), workload_key(q, s, f), 1)] = 100.
             for count in (2, 3):
                 table._workloads[('split_overhead', sum(q), workload_key(q, s, f), count)] = 1.
             for i in range(len(q)):
                 for j in range(i + 1, len(q) + 1):
                     key = workload_key(q[i:j], s[i:j], f[i:j])
-                    for shape in self.runner.graphMatcher.captured_sizes:
+                    for shape in self.runner.cuda_graph_manager.adapter.captured_sizes:
                         if shape >= sum(q[i:j]):
                             table._workloads[('graph', shape, key, 1)] = 1.
         return original_plan(self, metadata, q, s, f)
@@ -281,7 +280,7 @@ def main():
         return out
 
     GPUModelRunner.execute_model = instrument
-    GraphMatcher.find_best_match = match
+    GraphAdapter.find_best_match = match
     GraphAdapter.plan = plan
     GraphAdapter.execute = split
     engine = None

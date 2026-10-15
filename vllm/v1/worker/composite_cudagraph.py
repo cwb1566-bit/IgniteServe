@@ -121,7 +121,7 @@ class CompositeGraph:
         r = self.runner
         started = time.perf_counter()
         try:
-            manager = r.concurrent_piecewise_cudagraph_manager
+            manager = r.cuda_graph_manager.capture
             manager._initialize_worker_runtime()
             # Only wait for this immutable snapshot, never the whole device.
             self.staged.synchronize()
@@ -168,7 +168,7 @@ class CompositeGraph:
         return self.output
 
 
-class CompositeGraphs:
+class CompositeGraphStore:
     def __init__(self, runner):
         self.runner = runner
         self.binding = runtime_binding(runner)
@@ -177,7 +177,7 @@ class CompositeGraphs:
 
     def execute(self, parts, metadata, query_lens, seq_lens):
         r = self.runner
-        manager = r.concurrent_piecewise_cudagraph_manager
+        manager = r.cuda_graph_manager.capture
         # Model/KV rebind invalidates captured addresses, just as a new engine
         # does. Never replay a previous model's full-forward graph.
         if not manager.enabled or runtime_binding(r) != self.binding:

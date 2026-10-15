@@ -157,6 +157,51 @@ processes, different launch paths and indices, and different parameter values.
 Startup acceptance also requires actual global hits from a new compilation
 directory while preserving greedy outputs and generated-DAG coverage.
 
+## Unified CUDA Graph Management
+
+Each `GPUModelRunner` owns one `CUDAGraphManager`; engines no longer share a
+hotspot/controller singleton. The runner supplies real model execution,
+attention metadata and sampling. The manager owns these components:
+
+* `HotspotAnalyzer`: records original/target token shapes, checks hit thresholds,
+  and selects precapture shapes. The default is the cumulative 99% prefix,
+  then at least 10 hits, then mandatory shapes 1 and 2 (when registered).
+* `GraphAdapter`: exact matching, cost-gated padding and bounded splitting;
+  matching is no longer a separate `GraphMatcher` component.
+* `PiecewiseGraphRegistry`: one published-shape index over compiler-owned
+  graph handles. Partial chains are never advertised as ready.
+* `CaptureExecutor`: records startup graphs and owns the serial background
+  queue shared by shape and composite capture. Without concurrent support,
+  EngineCore may admit bounded capture at a coordinated safe point.
+* `CompositeGraphStore`: owns private multi-stream composite plans, buffers,
+  publication and replay; it is allocated only when splitting needs it.
+
+The request path is `manager.select()` -> runner forward ->
+`manager.after_warmup()` when requested. A threshold-triggering whole-shape
+eager warmup overrides splitting. Below-threshold or capture-pending requests
+can use cost-qualified adaptation; only completed graphs become selectable.
+The manager drains capture before model rebind/shutdown, invalidates composite
+plans, and refreshes per-model observations. Multi-rank idle capture still
+requires EngineCore's common-shape coordination, not independent rank decisions.
+
+`VLLM_ENABLE_ADAPTIVE_CUDAGRAPH=0` means static precapture/replay only; it no
+longer activates a hidden legacy capture implementation. The retired
+`VLLM_DISABLE_DYNAMIC_CUDA_GRAPH_CAPTURE`,
+`VLLM_DYNAMIC_CUDA_GRAPH_CAPTURE_NO_REPLAY` and `VLLM_CUDAGRAPH_SPLIT_SHADOW`
+flags are ignored with an explicit log. Existing active threshold, concurrent
+capture, cross-phase, cost and split switches keep their meanings.
+
+Frozen input profiles remain under `hotspots/<profile-identity>/` (or the
+explicit profile path). Observations are written separately under
+`runs/<run>/hotspots/<profile-identity>/`, so in-place model rebind cannot mix
+incompatible profiles. Source-sensitive old cost profiles require recalibration;
+their manifests must not be relabeled to bypass validation.
+
+`tools/verify_cudagraph_manager.py --model MODEL --gpu ID --phase mixed`
+checks real threshold warmup, background publication and actual dynamic replay
+against separate eager requests. Repeat with `prefill` and `decode`. It counts
+real first-piece graph launches, not just decisions, and checks worker shutdown.
+
 ## Cost-Gated Graph Adaptation
 
 The adaptive matcher applies the padding ratio guard to native and sparse
@@ -202,8 +247,8 @@ The planner compares graph P90 plus measured preparation/merge overhead with
 from both sides. It uses bounded search (at most three parts, two above 40 layers)
 and rejects missing evidence. Search is limited to 1 ms or 5% of estimated eager
 time, whichever is smaller, and its measured CPU time is charged to the plan.
-Existing unqualified GPU CSVs remain readable for
-shadow analysis but cannot authorize runtime padding/splitting.
+Existing unqualified GPU CSVs remain readable for offline diagnostics but cannot
+authorize runtime padding/splitting.
 
 Offline calibration, on an otherwise free GPU, can be run with:
 
