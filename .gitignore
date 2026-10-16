@@ -195,6 +195,7 @@ hip_compat.h
 
 # Benchmark dataset
 benchmarks/**/*.json
+!benchmarks/igniteserve/ShareGPT_validated_2000.json
 
 # Linting
 actionlint
@@ -214,8 +215,8 @@ csrc/moe/marlin_moe_wna16/kernel_*
 /=*
 
 # Large local ShareGPT copies. The small validated benchmark subset is kept.
-/benchmarks_custom/ShareGPT_V3_robust.json
-/benchmarks_custom/ShareGPT_V3_unfiltered_cleaned_split.json
+/benchmarks/igniteserve/ShareGPT_V3_robust.json
+/benchmarks/igniteserve/ShareGPT_V3_unfiltered_cleaned_split.json
 
 # Local exploratory launchers and source snapshots
 /cold_test*.py

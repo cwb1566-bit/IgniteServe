@@ -11,8 +11,8 @@ Usage:
   python tools/build_validated_dataset.py \
     --base-url http://127.0.0.1:8089/v1 \
     --models /models/Qwen3-4B /models/Llama2-7B \
-    --sharegpt benchmarks_custom/ShareGPT_V3_unfiltered_cleaned_split.json \
-    --target 2000 --out benchmarks_custom/ShareGPT_validated_2000.json
+    --sharegpt benchmarks/igniteserve/ShareGPT_V3_unfiltered_cleaned_split.json \
+    --target 2000 --out benchmarks/igniteserve/ShareGPT_validated_2000.json
 """
 from __future__ import annotations
 
@@ -148,6 +148,7 @@ async def main_async(args) -> int:
         report["models"][Path(m).name] = {"ok": n_ok, "fail": len(res) - n_ok,
                                            "fail_reasons": fails}
     if args.report:
+        Path(args.report).parent.mkdir(parents=True, exist_ok=True)
         Path(args.report).write_text(
             json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -165,14 +166,14 @@ def main() -> int:
     ap.add_argument("--base-url", default="http://127.0.0.1:8089/v1")
     ap.add_argument("--models", nargs="+", required=True)
     ap.add_argument("--sharegpt", default=(
-        "benchmarks_custom/ShareGPT_V3_unfiltered_cleaned_split.json"))
+        "benchmarks/igniteserve/ShareGPT_V3_unfiltered_cleaned_split.json"))
     ap.add_argument("--max-candidates", type=int, default=3500)
     ap.add_argument("--target", type=int, default=2000)
     ap.add_argument("--max-workers", type=int, default=16)
     ap.add_argument("--max-tokens", type=int, default=256)
-    ap.add_argument("--out", default="benchmarks_custom/ShareGPT_validated_2000.json")
+    ap.add_argument("--out", default="benchmarks/igniteserve/ShareGPT_validated_2000.json")
     ap.add_argument("--report", default=(
-        "benchmarks_custom/ShareGPT_validated_2000_report.json"))
+        "benchmark_results/ShareGPT_validated_2000_report.json"))
     args = ap.parse_args()
     return asyncio.run(main_async(args))
 
