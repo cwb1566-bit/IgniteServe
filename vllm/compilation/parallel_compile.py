@@ -5,9 +5,6 @@
 import functools
 import json
 import os
-import pickle
-import subprocess
-import sys
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
@@ -21,11 +18,8 @@ from .compiler_interface import FullFxCompileBackend
 from .counter import compilation_counter
 from .fx_transport import (
     _deserialize_graph_module_for_subprocess,
-    _runtime_shape_label,
-    _save_graph_module_for_subprocess,
     _serialize_graph_module_for_subprocess,
 )
-from .startup_resources import enabled_by_master, parallel_compile_metadata_dir
 
 logger = init_logger(__name__)
 
@@ -51,7 +45,7 @@ class ParallelCompileManager:
         collector = collector_factory()
         collector.run(*example_inputs)
         timer.end("get meta_data")
-        logger.info(
+        logger.debug(
             "Piecewise metadata restore time: %.6f s", time.perf_counter() - started
         )
         started = time.perf_counter()
@@ -64,7 +58,7 @@ class ParallelCompileManager:
             reuse_index_map=collector.reuse_index_map,
             runtime_shape=None,
         )
-        logger.info(
+        logger.debug(
             "Piecewise cache materialization time: %.6f s",
             time.perf_counter() - started,
         )
@@ -213,7 +207,7 @@ class ParallelCompileManager:
             track_metrics=False,
             count_backend_compilations=False,
         )
-        logger.info(
+        logger.debug(
             "Parallel compile timing graph_%s parent_artifact_load_s=%.6f",
             graph_index,
             time.perf_counter() - started,
@@ -223,8 +217,7 @@ class ParallelCompileManager:
     def _can_use_subprocess_compile(
         self, compiler_manager: CompilerManager, compilation_config: CompilationConfig
     ) -> bool:
-        # Keep subprocess compile opt-in only. The current subprocess path is
-        # experimental and can regress startup latency when it fails.
+        # Submit only when the backend can return reloadable artifact handles.
         if not getattr(compilation_config, "use_subprocess_compile", False):
             return False
         if not compiler_manager.supports_external_compile_handles():
@@ -234,107 +227,6 @@ class ParallelCompileManager:
         if not getattr(compilation_config, "local_cache_dir", None):
             return False
         return True
-
-    def _prepare_subprocess_compile_assets(
-        self,
-        source_indices: List[int],
-        metadata_by_index: Dict[int, Dict[str, Any]],
-        compiler_manager: CompilerManager,
-        compilation_config: CompilationConfig,
-        vllm_config: VllmConfig,
-        runtime_shape: Optional[int],
-    ) -> Dict[int, Dict[str, str]]:
-        cache_dir = compiler_manager.cache_dir
-        prefix = os.path.basename(cache_dir)
-        job_dir = os.path.join(cache_dir, "subprocess_compile_jobs")
-        os.makedirs(job_dir, exist_ok=True)
-
-        config_path = os.path.join(job_dir, "inductor_compile_config.pkl")
-        with open(config_path, "wb") as f:
-            pickle.dump(compilation_config.inductor_compile_config, f)
-
-        rank = vllm_config.parallel_config.rank
-        dp_rank = vllm_config.parallel_config.data_parallel_rank
-        if enabled_by_master("VLLM_ENABLE_PARALLEL_COMPILE_METADATA"):
-            metadata_cache_dir = str(
-                parallel_compile_metadata_dir(
-                    compilation_config.cache_dir, rank, dp_rank, prefix, vllm_config
-                )
-            )
-        else:
-            metadata_cache_dir = os.path.join(
-                compilation_config.local_cache_dir, "submodule_inputs_metadata"
-            )
-        model_name = vllm_config.model_config.model.split("/")[-1]
-        compiler_class = compiler_manager.compiler.__class__.__name__
-        runtime_label = _runtime_shape_label(runtime_shape)
-
-        descriptors: Dict[int, Dict[str, str]] = {}
-        for source_index in source_indices:
-            meta = metadata_by_index[source_index]
-            graph_path = os.path.join(job_dir, f"graph_{source_index}")
-            result_path = os.path.join(
-                job_dir, f"result_{runtime_label}_graph_{source_index}.pkl"
-            )
-            _save_graph_module_for_subprocess(meta["submod"], graph_path)
-            if os.path.exists(result_path):
-                os.remove(result_path)
-            descriptors[source_index] = {
-                "graph_path": graph_path,
-                "result_path": result_path,
-                "config_path": config_path,
-                "metadata_cache_dir": metadata_cache_dir,
-                "model_name": model_name,
-                "submod_name": meta["submod"]._get_name()
-                if hasattr(meta["submod"], "_get_name")
-                else "",
-                "compiler_class": compiler_class,
-                "cache_dir": cache_dir,
-                "prefix": prefix,
-            }
-
-        return descriptors
-
-    def _launch_compile_worker(
-        self,
-        graph_index: int,
-        descriptor: Dict[str, str],
-        compiler_manager: CompilerManager,
-        runtime_shape: Optional[int],
-    ) -> subprocess.Popen:
-        command = [
-            sys.executable,
-            "-m",
-            "vllm.compilation.subprocess_compile_worker",
-            "--graph-path",
-            descriptor["graph_path"],
-            "--result-path",
-            descriptor["result_path"],
-            "--config-path",
-            descriptor["config_path"],
-            "--metadata-cache-dir",
-            descriptor["metadata_cache_dir"],
-            "--model-name",
-            descriptor["model_name"],
-            "--graph-index",
-            str(graph_index),
-            "--compiler-class",
-            descriptor["compiler_class"],
-            "--cache-dir",
-            descriptor["cache_dir"],
-            "--prefix",
-            descriptor["prefix"],
-        ]
-        if compiler_manager.disable_cache:
-            command.append("--disable-cache")
-        if runtime_shape is not None:
-            command.extend(["--runtime-shape", str(runtime_shape)])
-
-        return subprocess.Popen(
-            command,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
 
     def _compile_sources_in_subprocesses(
         self,
@@ -359,7 +251,7 @@ class ParallelCompileManager:
         prewarm_results = [
             future.result() for future in FullFxCompileBackend.prewarm_futures()
         ]
-        logger.info(
+        logger.debug(
             "Parallel compile timing worker_prewarm wait_s=%.6f results=%s",
             time.perf_counter() - prewarm_wait_started,
             [
@@ -411,7 +303,7 @@ class ParallelCompileManager:
                     )
                 )
                 jobs[graph_index] = (future, submit_finished)
-                logger.info(
+                logger.debug(
                     "Parallel compile timing graph_%s "
                     "transport_prepare_s=%.6f submit_serialize_send_s=%.6f",
                     graph_index,
@@ -422,7 +314,7 @@ class ParallelCompileManager:
                 failed_graphs[graph_index] = repr(exc)
 
         all_submitted_at = time.perf_counter()
-        logger.info(
+        logger.debug(
             "Parallel compile timing submit_summary graphs=%s "
             "transport_prepare_total_s=%.6f submit_total_s=%.6f "
             "submit_phase_wall_s=%.6f",
@@ -456,7 +348,7 @@ class ParallelCompileManager:
                     compilation_counter, "num_inductor_compiles"
                 ):
                     compilation_counter.num_inductor_compiles += 1
-                logger.info(
+                logger.debug(
                     "Full-FX worker compiled graph_%s in %.2f s with key %s "
                     "worker_pid=%s serialized_input_nbytes=%s timings=%s "
                     "parent_submit_to_done_s=%.6f "
@@ -490,7 +382,7 @@ class ParallelCompileManager:
             False if keep_compile_pool else FullFxCompileBackend.begin_shutdown()
         )
         shutdown_dispatch_s = time.perf_counter() - shutdown_started
-        logger.info(
+        logger.debug(
             "Parallel compile timing batch_summary submit_phase_wall_s=%.6f "
             "wait_after_submit_s=%.6f shutdown_started_async=%s "
             "shutdown_dispatch_s=%.6f "
@@ -772,7 +664,7 @@ class ParallelCompileManager:
                 "VLLM_ENABLE_PERSISTENT_ENGINE_SHELL", "0"
             ).lower() not in {"1", "true", "yes", "on"}:
                 FullFxCompileBackend.begin_shutdown()
-        logger.info(
+        logger.debug(
             "Parallel compile timing parent_load_and_alias_resolve_s=%.6f",
             time.perf_counter() - resolve_started,
         )

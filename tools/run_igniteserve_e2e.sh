@@ -157,7 +157,7 @@ start_server() {
   local keepalive="$1" server_log="$2" placeholder_model="$3"
   local stage_env=()
   if [[ "$STAGE" == "material" ]]; then
-    stage_env=(VLLM_DISABLE_DYNAMIC_CUDA_GRAPH_CAPTURE=1)
+    stage_env=(VLLM_ENABLE_ADAPTIVE_CUDAGRAPH=0)
   fi
   kill_port
   : >"$server_log"

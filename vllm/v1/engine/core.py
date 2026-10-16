@@ -196,90 +196,10 @@ class EngineCore:
         from vllm.plugins import load_general_plugins
         load_general_plugins()
 
-        self.vllm_config = vllm_config
-        self._adaptive_cudagraph_enabled = os.environ.get(
-            "VLLM_ENABLE_ADAPTIVE_CUDAGRAPH", "").lower() in (
-                "1", "true", "yes", "on")
-        self._adaptive_cudagraph_idle_grace_s = max(
-            0.0,
-            float(
-                os.environ.get("VLLM_ADAPTIVE_CUDAGRAPH_IDLE_GRACE_MS", "10"))
-            / 1000.0)
-        self._adaptive_cudagraph_slo_capture_enabled = (
-            self._adaptive_cudagraph_enabled and os.environ.get(
-                "VLLM_ADAPTIVE_CUDAGRAPH_ENABLE_SLO_CAPTURE",
-                "1").lower() in ("1", "true", "yes", "on"))
-        self._adaptive_cudagraph_tpot_slo_ms = max(
-            0.0,
-            float(
-                os.environ.get("VLLM_ADAPTIVE_CUDAGRAPH_TPOT_SLO_MS",
-                               "100")))
-        self._adaptive_cudagraph_ttft_slo_ms = max(
-            0.0,
-            float(
-                os.environ.get("VLLM_ADAPTIVE_CUDAGRAPH_TTFT_SLO_MS",
-                               "2000")))
-        self._adaptive_cudagraph_prefill_step_estimate_ms = max(
-            0.1,
-            float(
-                os.environ.get(
-                    "VLLM_ADAPTIVE_CUDAGRAPH_PREFILL_STEP_ESTIMATE_MS",
-                    "30")))
-        self._adaptive_cudagraph_allow_waiting = os.environ.get(
-            "VLLM_ADAPTIVE_CUDAGRAPH_ALLOW_WAITING_REQUESTS",
-            "1").lower() in ("1", "true", "yes", "on")
-        self._adaptive_cudagraph_slo_guard_ms = max(
-            0.0,
-            float(
-                os.environ.get("VLLM_ADAPTIVE_CUDAGRAPH_SLO_GUARD_MS", "5")))
-        self._adaptive_cudagraph_capture_estimate_ms = max(
-            0.1,
-            float(
-                os.environ.get(
-                    "VLLM_ADAPTIVE_CUDAGRAPH_CAPTURE_CHUNK_ESTIMATE_MS",
-                    "30")))
-        self._adaptive_cudagraph_slo_interval_steps = max(
-            1,
-            int(
-                os.environ.get(
-                    "VLLM_ADAPTIVE_CUDAGRAPH_SLO_CAPTURE_INTERVAL_STEPS",
-                    "8")))
-        # Zero selects a slack-driven piece budget. A positive value keeps the
-        # fixed-budget mode used by controlled experiments.
-        self._adaptive_cudagraph_slo_pieces = max(
-            0,
-            int(
-                os.environ.get(
-                    "VLLM_ADAPTIVE_CUDAGRAPH_SLO_PIECES_PER_STEP", "0")))
-        self._adaptive_cudagraph_slo_max_pieces = max(
-            1,
-            int(
-                os.environ.get(
-                    "VLLM_ADAPTIVE_CUDAGRAPH_SLO_MAX_PIECES_PER_STEP", "64")))
-        self._adaptive_cudagraph_capture_fixed_estimate_ms = max(
-            0.1,
-            float(
-                os.environ.get(
-                    "VLLM_ADAPTIVE_CUDAGRAPH_CAPTURE_FIXED_ESTIMATE_MS",
-                    "20")))
-        self._adaptive_cudagraph_capture_safety_factor = max(
-            1.0,
-            float(
-                os.environ.get(
-                    "VLLM_ADAPTIVE_CUDAGRAPH_CAPTURE_SAFETY_FACTOR",
-                    "1.05")))
-        self._adaptive_cudagraph_recent_step_ms: deque[float] = deque(
-            maxlen=64)
-        self._adaptive_cudagraph_recent_capture_ms: deque[float] = deque(
-            maxlen=32)
-        self._adaptive_cudagraph_capture_samples: deque[
-            tuple[int, float]] = deque(maxlen=32)
-        self._adaptive_cudagraph_model_steps = 0
-        self._adaptive_cudagraph_last_slo_capture_step = 0
+        self._initialize_engine_core_fields(vllm_config, log_stats)
         logger.info("Initializing a V1 LLM engine (v%s) with config: %s",
                     VLLM_VERSION, vllm_config)
 
-        self.log_stats = log_stats
         self.model_executor = executor_class(vllm_config)
         if executor_fail_callback is not None:
             self.model_executor.register_failure_callback(
@@ -613,106 +533,9 @@ class EngineCore:
         history_path, plan_path = self._startup_orchestration_paths()
         history = StartupCostHistory(history_path)
 
-        def timed(stage_name, action):
-            def invoke(context):
-                timer.start(stage_name)
-                try:
-                    return action(context)
-                finally:
-                    timer.end(stage_name)
-            return invoke
-
-        def init_model(_):
-            self.model_executor.init_model()
-
-        def stop_weight_prewarm(_):
-            stop_async_weight_prewarm_from_env("EngineCore.load_weights")
-
-        def load_weights(context):
-            if overlap_weight_compile:
-                worker_results = (
-                    self.model_executor.load_weights_and_trigger_compile())
-                context.put("weight_compile_worker_results", worker_results)
-                return worker_results
-            else:
-                self.model_executor.load_weights()
-
-        def compile_model(_):
-            if not overlap_weight_compile:
-                self.model_executor.run_to_trigger_compile()
-
-        def kv_profile(context):
-            return context.put(
-                "available_gpu_memory",
-                self.model_executor.determine_available_memory())
-
-        def kv_cache_allocate(context):
-            available_gpu_memory = context.require("available_gpu_memory")
-            num_gpu_blocks, num_cpu_blocks, kv_cache_config = (
-                self._initialize_kv_caches(
-                    self.vllm_config, available_gpu_memory))
-            self.vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks
-            self.vllm_config.cache_config.num_cpu_blocks = num_cpu_blocks
-            self.collective_rpc("initialize_cache",
-                                args=(num_gpu_blocks, num_cpu_blocks))
-            return context.put("kv_cache_config", kv_cache_config)
-
-        def cuda_graph_precapture(_):
-            self.model_executor.compile_or_warm_up_model()
-
-        def structured_output(_):
-            self.structured_output_manager = StructuredOutputManager(
-                self.vllm_config)
-
-        def mm_input_cache(_):
-            self.mm_input_cache_server = MirroredProcessingCache(
-                self.vllm_config.model_config)
-
-        def create_scheduler(context):
-            scheduler_cls = self.vllm_config.scheduler_config.scheduler_cls
-            Scheduler = (resolve_obj_by_qualname(scheduler_cls)
-                         if isinstance(scheduler_cls, str) else scheduler_cls)
-            if Scheduler is not V1Scheduler:
-                logger.warning(
-                    "Using configured V1 scheduler class %s. This scheduler "
-                    "interface is not public and compatibility may not be "
-                    "maintained.", scheduler_cls)
-            self.scheduler = Scheduler(
-                vllm_config=self.vllm_config,
-                kv_cache_config=context.require("kv_cache_config"),
-                structured_output_manager=self.structured_output_manager,
-                include_finished_set=(
-                    self.vllm_config.parallel_config.data_parallel_size > 1),
-                log_stats=self.log_stats,
-            )
-
-        def create_batch_queue(_):
-            self.batch_queue_size = self.model_executor.max_concurrent_batches
-            self.batch_queue = None
-            if self.batch_queue_size > 1:
-                logger.info("Batch queue is enabled with size %d",
-                            self.batch_queue_size)
-                self.batch_queue = queue.Queue(self.batch_queue_size)
-
-        actions = {
-            "init_model": timed("Init Model", init_model),
-            "stop_weight_prewarm": stop_weight_prewarm,
-            "load_weights": timed(
-                "Weight-Compile Overlap" if overlap_weight_compile else
-                "Loading Weights", load_weights),
-            "compile_model": timed("Model Compilation", compile_model),
-            "kv_profile": timed("KV Profile", kv_profile),
-            "kv_cache_allocate": timed("KV Cache Allocation",
-                                        kv_cache_allocate),
-            "cuda_graph_precapture": timed("CUDA Graph Pre-capture",
-                                            cuda_graph_precapture),
-            "structured_output": timed("Others.Structured Output",
-                                       structured_output),
-            "mm_input_cache": timed("Others.MM Input Cache", mm_input_cache),
-            "scheduler": timed("Others.Scheduler", create_scheduler),
-            "batch_queue": timed("Others.Batch Queue", create_batch_queue),
-            "ready": lambda _: None,
-        }
+        from vllm.v1.engine.vllm_startup_adapter import build_runtime_actions
+        actions = build_runtime_actions(
+            self, overlap_weight_compile=overlap_weight_compile)
         initial_dag = build_engine_startup_dag(state, actions)
         defaults = {
             name: node.estimated_cost_s
@@ -722,7 +545,7 @@ class EngineCore:
         dag = build_engine_startup_dag(state, actions, costs)
         write_plan(plan_path, state, dag)
         predicted_path, predicted_s = dag.critical_path()
-        logger.info(
+        logger.debug(
             "Startup DAG execution started: state=%s kv_profile_hit=%s "
             "critical_path=%s predicted_s=%.6f plan=%s",
             state.signature()[:16], state.kv_profile_hit,
@@ -751,7 +574,7 @@ class EngineCore:
 
         actual_path = sorted(
             results.values(), key=lambda result: result.started_at)
-        logger.info(
+        logger.debug(
             "Startup DAG execution finished: plan=%s stages=%s",
             plan_path,
             ", ".join(
@@ -1826,7 +1649,7 @@ class EngineCoreProc(EngineCore):
                 capture_elapsed_ms)
             self._adaptive_cudagraph_capture_samples.append(
                 (piece_budget, capture_elapsed_ms))
-            logger.info(
+            logger.debug(
                 "Adaptive CUDA graph SLO capture progressed: workers=%d "
                 "piece_budget=%d predicted_ms=%.3f elapsed_ms=%.3f "
                 "admitted_slack_ms=%.3f "

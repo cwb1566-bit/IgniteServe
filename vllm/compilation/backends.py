@@ -190,7 +190,6 @@ def split_graph(graph: fx.GraphModule, ops: list[str]) -> tuple[fx.GraphModule, 
 # we share the global graph pool among all the backends
 global_graph_pool = None
 
-compilation_start_time = 0.0
 
 
 
@@ -247,7 +246,7 @@ class VllmBackend:
             vllm_config: VllmConfig,
             prefix: str = "",
     ):
-        logger.info("Call VllmBackend.__init__()...")
+        logger.debug("Call VllmBackend.__init__()...")
         # if the model is initialized with a non-empty prefix,
         # then usually it's enough to use that prefix,
         # e.g. launguage_model, vision_model, etc.
@@ -255,7 +254,7 @@ class VllmBackend:
         # models, we need to use the model_tag to distinguish
         # them, e.g. backbone (default), eagle_head, etc.
         self.prefix = prefix or model_tag
-        logger.info("VllmBackend's prefix:%s", self.prefix)
+        logger.debug("VllmBackend's prefix:%s", self.prefix)
         global global_graph_pool
         if global_graph_pool is None:
             global_graph_pool = current_platform.graph_pool_handle()
@@ -357,7 +356,7 @@ class VllmBackend:
                 output_dir=getattr(self, "_frontend_cache_dir", None))
         from .monitor import torch_compile_start_time
         dynamo_frontend_time = time.time() - torch_compile_start_time
-        logger.info("Dynamo frontend before backend entry: %.6f s",
+        logger.debug("Dynamo frontend before backend entry: %.6f s",
                     dynamo_frontend_time)
         cache_analysis_started = time.perf_counter()
         timer.start("analyzing cache_dir and files")
@@ -431,14 +430,14 @@ class VllmBackend:
         self.compiler_manager.initialize_cache(local_cache_dir, disable_cache, self.prefix,
                                                self.dynamo_frontend_runtime_identity())
         timer.end("analyzing cache_dir and files")
-        logger.info("Compilation cache analysis time: %.6f s",
+        logger.debug("Compilation cache analysis time: %.6f s",
                     time.perf_counter() - cache_analysis_started)
 
         # when dynamo calls the backend, it means the bytecode
         # transform and analysis are done
         compilation_counter.num_graphs_seen += 1
         dynamo_time = time.time() - torch_compile_start_time
-        logger.info("Tracing operational time including cache analysis: %.6f s",
+        logger.debug("Tracing operational time including cache analysis: %.6f s",
                     dynamo_time)
         timer.end("Tracing")
         # self.compilation_config.compilation_time += dynamo_time
@@ -470,11 +469,10 @@ class VllmBackend:
             if not item.is_splitting_graph
         ]
         timer.end("split graph")
-        logger.info("FX graph split time: %.6f s",
+        logger.debug("FX graph split time: %.6f s",
                     time.perf_counter() - split_started)
-        # logger.info("split graph takes:%.3f", time.perf_counter() - start_time)
         # propagate the split graph to the piecewise backend, compile submodules with symbolic shapes
-        logger.info("start compile submodules with symbolic shapes")
+        logger.debug("start compile submodules with symbolic shapes")
         start_time = time.perf_counter()
         if enabled_by_master("VLLM_ENABLE_PARALLEL_COMPILE_METADATA"):
             submodule_inputs_metadata_cache_dir = str(
@@ -508,18 +506,10 @@ class VllmBackend:
 
         assembly_started = time.perf_counter()
         piecewise_backend = resolve_obj_by_qualname(current_platform.get_piecewise_backend_cls())
-        '''
-        Original self.split_gm.__dict__.keys():dict_keys(['_modules', '_parameters', '_buffers', ...])
-        The self.split_gm._modules includes submodules.
-        In fact, self.split_gm.__dict__[name] = piecewise_backend() is to add key name to self.split_gm.__dict__.keys()
-        So, the self.split_gm include orignal submodules of Fx graph ,also includes the compiled_graph.
-        why the last code can correctly access and work the compiled_graph is duo to PyTorch Module's find:
-        1.to first find __dict__, then _modules, so the compiled_graph can be found firstly.
-        '''
+        # Shadow FX submodules with callable backends without changing the IR.
         for i, name in enumerate(submod_names_to_compile):
             meta = self.meta_data[name]
             compiled_graph = compiled_graphs[name]
-            # logger.info("original self.split_gm.__dict__[%s]: %s",name, self.split_gm._modules[name])
             self.split_gm.__dict__[name] = piecewise_backend(
                 meta['submod'],
                 self.vllm_config,
@@ -531,13 +521,12 @@ class VllmBackend:
                 self
             )
             self.vllm_config.compilation_config.cuda_piecewise_backends_list[name] = self.split_gm.__dict__[name]
-            # logger.info("new self.split_gm.__dict__[%s]: %s", name, self.split_gm.__dict__[name])
             # 记录被编译的被识别并已处理的分段图数量
             compilation_counter.num_piecewise_capturable_graphs_seen += 1
 
-        logger.info("Piecewise backend assembly time: %.6f s",
+        logger.debug("Piecewise backend assembly time: %.6f s",
                     time.perf_counter() - assembly_started)
-        logger.info("end compile submodules with symbolic shapes, takes:%.3f", time.perf_counter() - start_time)
+        logger.debug("end compile submodules with symbolic shapes, takes:%.3f", time.perf_counter() - start_time)
         graph_path = os.path.join(local_cache_dir, "computation_graph.py")
         if not os.path.exists(graph_path):
             # code adapted from https://github.com/thuml/depyf/blob/dab831108a752d1facc00acdd6d4243891845c37/depyf/explain/patched_lazy_format_graph_code.py#L30 # noqa
@@ -552,7 +541,7 @@ class VllmBackend:
 
         self._called = True
 
-        logger.info("VllmBackend total time: %.6f s",
+        logger.debug("VllmBackend total time: %.6f s",
                     time.perf_counter() - backend_started)
         if not self.compilation_config.use_cudagraph or not self.compilation_config.cudagraph_copy_inputs:
             logger.debug("Not use cudagraph_copy_inputs...")
@@ -586,11 +575,10 @@ class VllmBackend:
         self.input_buffers = [
             example_inputs[x].clone() for x in self.sym_tensor_indices
         ]
-        logger.info("Use cudagraph_copy_inputs and Return a function: copy_and_call()...")
+        logger.debug("Use cudagraph_copy_inputs and Return a function: copy_and_call()...")
 
         # this is the callable we return to Dynamo to run
         def copy_and_call(*args):
-            logger.info("Call copy_and_call()...")
             list_args = list(args)
             for i, index in enumerate(self.sym_tensor_indices):
                 runtime_tensor = list_args[index]

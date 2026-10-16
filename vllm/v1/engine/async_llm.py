@@ -134,7 +134,7 @@ class AsyncLLM(EngineClient):
             except BaseException as exc:  # noqa: BLE001
                 tokenizer_error["error"] = exc
             finally:
-                logger.info(
+                logger.debug(
                     "[TIMER] Tokenizer bg-load took %.4f s (overlapped with "
                     "EngineCore init)", _time.perf_counter() - _t0)
 

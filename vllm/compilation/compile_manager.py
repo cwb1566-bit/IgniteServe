@@ -77,6 +77,7 @@ class CompilerManager:
         self.semantic_graphs = {}
         self.global_entries = {}
         self.pending_artifacts = {}
+        self._compilation_started: dict[Optional[int], float] = {}
 
     def _cache_key(
         self, runtime_shape: Optional[int], graph_index: int
@@ -88,10 +89,11 @@ class CompilerManager:
     ) -> tuple[Optional[int], int]:
         return runtime_shape, graph_index
 
-    def _maybe_start_timer(self, graph_index: int, track_metrics: bool) -> None:
+    def _maybe_start_timer(
+        self, graph_index: int, track_metrics: bool, runtime_shape: Optional[int]
+    ) -> None:
         if graph_index == 0 and track_metrics:
-            global compilation_start_time
-            compilation_start_time = time.time()
+            self._compilation_started[runtime_shape] = time.perf_counter()
 
     def _maybe_finish_timer(
         self,
@@ -103,12 +105,15 @@ class CompilerManager:
     ) -> None:
         if not track_metrics or graph_index != num_graphs - 1:
             return
-        elapsed = time.time() - compilation_start_time
+        started = self._compilation_started.pop(runtime_shape, None)
+        if started is None:
+            return  # A partial compile does not have a whole-batch start time.
+        elapsed = time.perf_counter() - started
         self.compilation_config.compilation_time += elapsed
         if runtime_shape is None:
-            logger.info("%s a graph for general shape takes %.2f s", action, elapsed)
+            logger.debug("%s a graph for general shape takes %.2f s", action, elapsed)
         else:
-            logger.info(
+            logger.debug(
                 "%s a graph for shape %s takes %.2f s", action, runtime_shape, elapsed
             )
 
@@ -169,9 +174,6 @@ class CompilerManager:
         self.compiler.initialize_cache(
             cache_dir=cache_dir, disable_cache=disable_cache, prefix=prefix
         )
-
-    def initialize_cache_model_meta(self, model_name: str):
-        del model_name
 
     def _disk_handle(self, handle, restore=False):
         from .startup_resources import resource_root
@@ -445,7 +447,7 @@ class CompilerManager:
         track_metrics: bool = True,
         count_backend_compilations: bool = True,
     ) -> Optional[Callable]:
-        self._maybe_start_timer(graph_index, track_metrics)
+        self._maybe_start_timer(graph_index, track_metrics, runtime_shape)
 
         identity = self.semantic_identity(graph, example_inputs, runtime_shape)
         reusable = (
@@ -575,7 +577,7 @@ class CompilerManager:
         track_metrics: bool = True,
     ) -> Any:
         del compilation_config
-        self._maybe_start_timer(graph_index, track_metrics)
+        self._maybe_start_timer(graph_index, track_metrics, runtime_shape)
         compilation_counter.num_backend_compilations += 1
 
         compiled_graph = self.load(
@@ -629,7 +631,7 @@ class CompilerManager:
         )
         if handle is not None:
             if graph_index == 0:
-                logger.info(
+                logger.debug(
                     "Cache the graph of shape %s for later use", str(runtime_shape)
                 )
             logger.debug(

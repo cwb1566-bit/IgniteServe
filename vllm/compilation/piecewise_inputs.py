@@ -118,7 +118,7 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
         except Exception as exc:
             logger.warning("Failed to load cached metadata: %s", exc)
         finally:
-            logger.info(
+            logger.debug(
                 "Offline metadata timing load_s=%.6f loaded=%s path=%s",
                 time.perf_counter() - started,
                 loaded_count,
@@ -150,7 +150,7 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
             restore_started = time.perf_counter()
             self.serializer.seed_symbol_table_from_args(tuple(fake_args))
             restored = self._restore_from_cache()
-            logger.info(
+            logger.debug(
                 "Offline metadata timing restore_s=%.6f restored=%s",
                 time.perf_counter() - restore_started,
                 len(self.metadata),
@@ -162,7 +162,7 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
         fake_started = time.perf_counter()
         with self.fake_mode, enable_python_dispatcher():
             result = super().run(*fake_args)
-        logger.info(
+        logger.debug(
             "Offline metadata timing fake_inference_s=%.6f captured=%s",
             time.perf_counter() - fake_started,
             len(self.metadata),
@@ -171,7 +171,7 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
         save_started = time.perf_counter()
         self._save_metadata()
         self._validate_reuse_inputs()
-        logger.info(
+        logger.debug(
             "Offline metadata timing save_s=%.6f path=%s",
             time.perf_counter() - save_started,
             self.serializer.metadata_file,

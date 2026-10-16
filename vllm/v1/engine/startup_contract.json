@@ -480,11 +480,11 @@
     "engine": "vllm-v1-deferred"
   },
   "initial_state": [],
-  "adapter_sha256": "662c1aa865d3c12336e0277bd53546cc6ae6fe8af8d3288e9108e2ec59be7cbd",
+  "adapter_sha256": "268e17e4cf857cdcc77a870ebe5d4d9754809e4d354ac13c687af8d08d4832b8",
   "sources": {
-    "vllm/v1/engine/core.py": "69eb360c3e210cb909da916aa28d8f8e9fa87c147f0c922502e95bb49d7b0d88",
+    "vllm/v1/engine/core.py": "35d528d470dc47841d3757abbff3bde63446f57e16f2fe0f2fe259ba3cbd4421",
     "vllm/v1/engine/declarative_startup.py": "72efae437e2cb7d4ded115683d7d1a9bb7fe5f0230bdd5195238a6283644a823",
-    "vllm/v1/worker/gpu_worker.py": "4f9c0d9266952df33b91041e44d02a4219d8712f80eaf3aaa689386f9b4ed2c0",
+    "vllm/v1/worker/gpu_worker.py": "afdcb7acc32feedfaffd5fef014d66067d6cd556cdb4174f947349e0b2ea92eb",
     "vllm/v1/worker/gpu_model_runner.py": "81bd8348a24055e299708e689789224cee9e818ac21e56a467a302921fe95bda",
     "vllm/v1/executor/abstract.py": "0d9c9e3d4e0f3f3bf4538f6f1b67225a8b68696229e5912ab2876f35676fef46",
     "vllm/executor/uniproc_executor.py": "ee4ba1e6cc3e762eb1373c19bb46a9462787ec6687cc017586177eadec657701",
@@ -495,23 +495,23 @@
     "vllm/compilation/startup_assets.py": "edc04bf83298db248cec9c5e70479dec686955fbd2e37f2f0e3181d7c1e3544b",
     "vllm/v1/worker/kv_profile_cache.py": "fbfdc2ab39520801dcca57345cd3c92c0ff57959fb6d090b3500f1b3c4cc21a3",
     "vllm/compilation/compiler_interface.py": "68ba35323f6fa9736c88d416fe844ab9134d2896f80611327b750c9a0a7e4688",
-    "vllm/compilation/backends.py": "527e758a0750b6d6f7d1aa8d21e712f734c4c3fdb417f10279a5b5b336ca044b",
+    "vllm/compilation/backends.py": "98c3572faf1f8618bbf6a81818084af5255be435a7a9161de17f4c02b8b5517f",
     "vllm/compilation/cache_reuse.py": "2e1e7ccdd33ed1c81a1719a70dc4c7556cf05b5f1efd3a47389f3cd5b0ebd257",
-    "vllm/compilation/compile_manager.py": "3ddad0d208c39a07067d89e2e64d26fc9f5831ce669eda9d1dfe6f7594e348aa",
-    "vllm/compilation/parallel_compile.py": "047368d2a8828876d82a7d9b115dcfdedf4bc56a8f2d543483a7741a76771dee",
+    "vllm/compilation/compile_manager.py": "9ce86dfe4a9d4ca087a581da95c0e589b59badf0a040ba23af8ddda875c6af1f",
+    "vllm/compilation/parallel_compile.py": "814c31861d69e690c3a1a7167399c08b6302f4d8a78c0bae41468411c4c62a8f",
     "vllm/compilation/input_metadata.py": "75fecd459b8c47217de0b35f40bda931552fefcd427ed8aa835f9fe5793d5609",
-    "vllm/compilation/piecewise_inputs.py": "f591ffad3c6ae7109ccce5b680898d9742827ffe96e212fc8e8fa72d397c4a91",
-    "vllm/compilation/fx_transport.py": "ece9d3d90879793f0caa23f91a0f0a7f576abd16fafae6fc170e0da854de139b",
+    "vllm/compilation/piecewise_inputs.py": "dd0f315358b1822ad1020e195d0a2c8da0897c3e71b310bc138d78363e0313ab",
+    "vllm/compilation/fx_transport.py": "644af4ca1f2bb85865440fad1f8b58daadf0c4f62a347e91bffa4f8e971126c5",
     "vllm/compilation/input_contract.py": "444cad1ed397f960187b000f023bf001cf3823b00cbcabf158938c1eeee12856",
     "vllm/forward_context.py": "fa4182524eefe907102e85231505bbb6f150c9c2fadfcb0ecc9d80d70b01aebc",
     "vllm/compilation/cuda_piecewise_backend.py": "555ef6a3f442403c94dc3349589a824d28bbab0e6aadb8ca303011c72df392f0",
     "vllm/v1/worker/cudagraph_adaptation.py": "71f7942d9e9fbb9893cb2700cc32eaf58d37e03afacba32eb0adb7747d866017",
     "vllm/v1/worker/cudagraph_profile.py": "6f91ca15f9a65d5741acc97391ab51626f7b2be0edae7ac579f557ea75292d74",
     "vllm/v1/worker/CudaGraphManager.py": "ad8d0b3806f59244a0e9f25e1b26bcfd2deb709a18741aadd2f416e5325cb7d3",
-    "vllm/v1/worker/HotspotAnalyzer.py": "cebef2980bdee8cdc412d2cb0d42493d0749e62007f946db76d61dbeb3750d15",
+    "vllm/v1/worker/HotspotAnalyzer.py": "e5ae79aa7d84a9e8910210f34961f8bafd3c51d25369489d6e1fed40084208e9",
     "vllm/v1/worker/piecewise_graph_registry.py": "953111152705ea5fdb4e3860b6219b1c514bd6378bdf7595c1a067acdacda944",
     "vllm/v1/worker/composite_cudagraph.py": "a97f716bba792fc69a3b8cc73f80b465acd4d8a4e958af170c4852a35e648ca9",
-    "vllm/v1/worker/concurrent_piecewise_cudagraph.py": "a3ed7c95cb3eb82eb165c1cddb40c262155c59d799ee52f6039b77a111ae355c",
+    "vllm/v1/worker/concurrent_piecewise_cudagraph.py": "1a68b6a7fe55990c13c79b47aa07297ecfb53f3f60dfe69b7735dac77b80834e",
     "vllm/v1/attention/backends/flash_attn.py": "feadd18b454ee762a38179b8cf0aefe8dbeacc3c6d5ae92ef41a63bad199bc3c"
   },
   "resource_capacities": {
@@ -525,8 +525,8 @@
   },
   "discovery": {
     "entry": "EngineCore._initialize_engine_core",
-    "source_sha256": "69eb360c3e210cb909da916aa28d8f8e9fa87c147f0c922502e95bb49d7b0d88",
-    "regions": 69,
+    "source_sha256": "35d528d470dc47841d3757abbff3bde63446f57e16f2fe0f2fe259ba3cbd4421",
+    "regions": 49,
     "boundary_policy": "reviewed deferred API; conservative opaque manager actions"
   },
   "variants": [
@@ -556,9 +556,9 @@
     }
   ],
   "validation": {
-    "identity": "8135f414dae16431940b4941daee840b8ac1e6d405a22de84ba6685d5b86d81d",
+    "identity": "d24501d1617e46e8037b933e7d60d9d481dbcdee3a8201424919dba9f3ec45ac",
     "review": {
-      "identity": "8135f414dae16431940b4941daee840b8ac1e6d405a22de84ba6685d5b86d81d",
+      "identity": "d24501d1617e46e8037b933e7d60d9d481dbcdee3a8201424919dba9f3ec45ac",
       "reviewer": "Codex source review",
       "actions": {
         "engine_core_construct": "approved",
@@ -589,10 +589,10 @@
         "ready": "approved"
       },
       "constraints": "approved",
-      "rationale": "Compilation organization refactor only: reviewed deferred action bindings, state producers, dependency order, worker affinity and resources are unchanged. Input collection remains before materialization; native compiler Futures are submitted before waits; cache validation and parent binding lock remain intact. All extracted compiler modules are source-bound. Real acceptance covers both variants, single/multiple DAG workers, cold/warm assets, global reuse, and weight-overlap disabled. Qualification remains single GPU Qwen3-4B, not proof of arbitrary engine/distributed portability."
+      "rationale": "Readability cleanup preserves the reviewed deferred engine interfaces. Cold startup and persistent rebind share runtime action implementations; only cold startup probes and releases prepared assets. The fused weight/compile call joins before publishing readiness; the compile marker does not compile again. State producers, dependencies, resource reservations and worker affinity are unchanged. Removed private bootstrap builders and file-based process launch helpers have no internal callers. Active Torch pool submission, FX transport constants, validated reuse and serial fallback are retained. Compiler timings are isolated by manager and shape. Real Qwen3-4B single-GPU validation covers both variants, serial/scheduled execution, cold/warm assets, global reuse and disabled weight overlap. This is not a new performance comparison or arbitrary/distributed-model proof. Logging-only review: timer measurements, exported fields, dependencies, routes, affinity, resource capacities and capture synchronization are unchanged. Main completions remain INFO, internal timings use DEBUG; the fused compile readiness marker is not reported as compilation work. Fresh serial/scheduled generated-adapter evidence is required."
     },
     "verification": {
-      "identity": "8135f414dae16431940b4941daee840b8ac1e6d405a22de84ba6685d5b86d81d",
+      "identity": "d24501d1617e46e8037b933e7d60d9d481dbcdee3a8201424919dba9f3ec45ac",
       "serial_equivalence": true,
       "scheduled_equivalence": true,
       "variants": [
@@ -612,12 +612,12 @@
           "prepared_assets": [
             {
               "files": 14,
-              "bytes": 550716
+              "bytes": 550717
             }
           ],
           "reused_reads": 5,
           "global_subgraph_hits": 0,
-          "elapsed": 12.166036501061171
+          "elapsed": 13.04367814026773
         },
         {
           "case": "prewarm-4",
@@ -629,12 +629,12 @@
           "prepared_assets": [
             {
               "files": 14,
-              "bytes": 550716
+              "bytes": 550717
             }
           ],
           "reused_reads": 5,
           "global_subgraph_hits": 0,
-          "elapsed": 13.421766084153205
+          "elapsed": 12.679332718253136
         },
         {
           "case": "standard-1",
@@ -646,12 +646,12 @@
           "prepared_assets": [
             {
               "files": 14,
-              "bytes": 550716
+              "bytes": 550717
             }
           ],
           "reused_reads": 5,
           "global_subgraph_hits": 0,
-          "elapsed": 12.655045622959733
+          "elapsed": 13.247992468066514
         },
         {
           "case": "standard-4",
@@ -663,12 +663,12 @@
           "prepared_assets": [
             {
               "files": 14,
-              "bytes": 550716
+              "bytes": 550717
             }
           ],
           "reused_reads": 5,
           "global_subgraph_hits": 0,
-          "elapsed": 12.535733737051487
+          "elapsed": 12.568047907203436
         },
         {
           "case": "cold",
@@ -685,7 +685,7 @@
           ],
           "reused_reads": 0,
           "global_subgraph_hits": 0,
-          "elapsed": 37.73405670886859
+          "elapsed": 38.604703564196825
         },
         {
           "case": "global-reuse",
@@ -697,12 +697,12 @@
           "prepared_assets": [
             {
               "files": 14,
-              "bytes": 550716
+              "bytes": 550717
             }
           ],
           "reused_reads": 17,
           "global_subgraph_hits": 3,
-          "elapsed": 15.193213067017496
+          "elapsed": 14.437709511257708
         },
         {
           "case": "no-weight-overlap",
@@ -714,12 +714,12 @@
           "prepared_assets": [
             {
               "files": 14,
-              "bytes": 550716
+              "bytes": 550717
             }
           ],
           "reused_reads": 5,
           "global_subgraph_hits": 0,
-          "elapsed": 15.166061274707317
+          "elapsed": 15.461212008725852
         }
       ]
     }

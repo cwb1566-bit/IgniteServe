@@ -43,7 +43,7 @@ def wait_for_weights_ready(reason: str = "Online autotune") -> float:
     elapsed = time.perf_counter() - started
     with _lock:
         error = _weights_error
-    logger.info("%s waited %.3f seconds for finalized weights", reason,
+    logger.debug("%s waited %.3f seconds for finalized weights", reason,
                 elapsed)
     if error is not None:
         raise RuntimeError(

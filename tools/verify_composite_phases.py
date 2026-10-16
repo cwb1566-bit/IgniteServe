@@ -18,7 +18,7 @@ os.environ.update(CUDA_VISIBLE_DEVICES=str(a.gpu), VLLM_ENABLE_STARTUP_OPTIMIZAT
     VLLM_STARTUP_DAG_MODE='off', VLLM_ENABLE_V1_MULTIPROCESSING='0',
     VLLM_FORCE_FULL_CUDAGRAPH_PRECAPTURE='1', VLLM_ADAPTIVE_CUDAGRAPH_MIN_HITS='1000000',
     VLLM_ENABLE_CONCURRENT_PIECEWISE_CUDAGRAPH_CAPTURE='1',
-    VLLM_DISABLE_DYNAMIC_CUDA_GRAPH_CAPTURE='1')
+)
 import torch
 from vllm import LLM, SamplingParams
 from vllm.v1.worker.cudagraph_adaptation import GraphAdapter, plan_partitions, workload_key

@@ -5,7 +5,6 @@ import csv
 import threading
 import uuid
 from pathlib import Path
-from collections import deque
 from typing import List, Dict
 from dataclasses import dataclass, field
 from vllm.logger import init_logger
@@ -41,30 +40,6 @@ class BatchSizeStats:
         return math.exp(-0.001 * elapsed)
 
 
-@dataclass
-class AnalysisReport:
-    """精简版分析报告"""
-
-    timestamp: float
-    total_requests: int
-    unique_sizes: int
-    top_k_stats: List[tuple[int, BatchSizeStats]]
-
-    def __str__(self) -> str:
-        res = (
-            f"\n{'=' * 60}\n"
-            f" CUDA Graph 热点批次报告 | 总请求: {self.total_requests} | 唯一批次: {self.unique_sizes}\n"
-            f"{'-' * 60}\n"
-            f"{'排名':<6}{'批次大小':<12}{'命中次数':<12}{'频率':<12}\n"
-            f"{'-' * 60}\n"
-        )
-        for i, (size, stat) in enumerate(self.top_k_stats[:10]):
-            freq = stat.hit_count / max(self.total_requests, 1)
-            res += f"{i + 1:<6}{size:<12}{stat.hit_count:<12}{freq:<12.4f}\n"
-        res += f"{'=' * 60}\n"
-        return res
-
-
 class HotspotAnalyzer:
     """Per-engine observations and capture eligibility; never submits work."""
 
@@ -75,13 +50,11 @@ class HotspotAnalyzer:
         output_dir=None,
         auto_plot=False,
         analysis_thresholds=None,
-        window_size=10000,
     ):
         self.min_hits = max(1, int(min_hits))
         self._lock = threading.Lock()
         self.stats = {}
         self.actual_stats = {}
-        self.recent_sizes = deque(maxlen=window_size)
         self.total_requests = 0
         self.analysis_thresholds = analysis_thresholds or [1000, 5000, 10000]
         self.triggered_thresholds = set()
@@ -205,7 +178,6 @@ class HotspotAnalyzer:
         """仅负责记录批次 (供 ModelRunner 调用)"""
         with self._lock:  # 如果有多个 GPU worker 并发，加上锁更安全
             self.total_requests += 1
-            self.recent_sizes.append(num_tokens)
 
             # 压测重启时，重置落盘状态
             self.has_exported_final = False
@@ -225,7 +197,8 @@ class HotspotAnalyzer:
                 * stat.recency_score
             )
 
-            self._check_analysis_trigger()
+            if self.auto_plot:
+                self._check_analysis_trigger()
 
     def check_and_export(self, is_queue_empty: bool):
         """监控队列状态并决定是否落盘 (供 Scheduler 或 Engine 调用)"""
@@ -237,9 +210,8 @@ class HotspotAnalyzer:
         ):
             with self._lock:
                 if not self.has_exported_final:  # Double check
-                    print(
-                        f"\n[+] 推理任务队列已清空，累计捕获 {self.total_requests} 个请求，开始生成全量分析数据..."
-                    )
+                    logger.debug("Exporting hotspot observations for %d batches",
+                                 self.total_requests)
                     self.export_to_csv()
                     if self.auto_plot:
                         self.plot_hit_statistics(suffix="_final")
@@ -253,20 +225,8 @@ class HotspotAnalyzer:
                 and threshold not in self.triggered_thresholds
             ):
                 self.triggered_thresholds.add(threshold)
-                # print(self.analyze_and_report())
                 if self.auto_plot:
                     self.plot_hit_statistics(suffix=f"_at_{threshold}")
-
-    def analyze_and_report(self, top_k: int = 10) -> AnalysisReport:
-        top_k_stats = sorted(
-            self.stats.items(), key=lambda x: x[1].hit_count, reverse=True
-        )[:top_k]
-        return AnalysisReport(
-            timestamp=time.time(),
-            total_requests=self.total_requests,
-            unique_sizes=len(self.stats),
-            top_k_stats=top_k_stats,
-        )
 
     def export_to_csv(
         self, filename: str = "cuda_graph_hits.csv", top_percent: float = 0.99

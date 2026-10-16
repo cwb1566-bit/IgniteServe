@@ -972,7 +972,7 @@ class Worker(WorkerBase):
                 on_worker_device(self.load_weights)
                 sync_started = time.perf_counter()
                 torch.cuda.synchronize(self.device)
-                logger.info("Weight/compile overlap finalized CUDA copies in "
+                logger.debug("Weight/compile overlap finalized CUDA copies in "
                             "%.3f seconds", time.perf_counter() - sync_started)
                 return time.perf_counter() - load_started
             finally:
@@ -993,7 +993,7 @@ class Worker(WorkerBase):
                 compile_s = compile_future.result()
         finally:
             weight_compile_overlap.end()
-        logger.info("Weight/compile overlap finished in %.3f seconds",
+        logger.debug("Weight/compile overlap finished in %.3f seconds",
                     time.perf_counter() - started)
         return {
             "rank": self.rank,

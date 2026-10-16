@@ -151,127 +151,12 @@ def build_engine_startup_dag(
     return dag
 
 
-def build_bootstrap_startup_dag(
-    actions: Mapping[str, StageAction],
-    costs: Optional[Mapping[str, float]] = None,
-) -> StartupDAG:
-    """Build the executable DAG from EngineCore semantic construction.
-
-    This graph deliberately ends at ``state_probe``. The model/KV/graph
-    portion cannot be specialized until the worker has selected its CUDA
-    device and can validate device-dependent persistent resources.
-    """
-    estimate = {
-        "engine_core_construct": 0.01,
-        "plugins": 0.1,
-        "executor_shell": 0.01,
-        "worker_wrapper": 0.05,
-        "worker_prepare": 0.1,
-        "worker_construct": 0.2,
-        "static_resource_probe": 0.05,
-        "cuda_device": 0.8,
-        "distributed_environment": 0.5,
-        "compile_worker_prewarm": 0.2,
-        "model_runner": 0.8,
-        "usage_reporting": 0.01,
-        "state_probe": 0.05,
-    }
-    estimate.update(costs or {})
-    dag = StartupDAG()
-
-    def add(name: str, deps: set[str], resources: Mapping[str, int],
-            category: str, thread_affinity: Optional[str] = None) -> None:
-        details = ({"thread_affinity": thread_affinity}
-                   if thread_affinity else {})
-        dag.add_node(StageNode(
-            name=name,
-            action=actions.get(name),
-            dependencies=deps,
-            estimated_cost_s=estimate[name],
-            resources=resources,
-            category=category,
-            details=details,
-        ))
-
-    add("engine_core_construct", set(), {"cpu": 1}, "engine_core")
-    add("plugins", {"engine_core_construct"}, {"cpu": 1}, "environment")
-    add("executor_shell", {"engine_core_construct"}, {"cpu": 1},
-        "executor")
-    add("worker_wrapper", {"executor_shell"}, {"cpu": 1}, "executor")
-    add("worker_prepare", {"worker_wrapper", "plugins"}, {"cpu": 1},
-        "worker")
-    add("worker_construct", {"worker_prepare"}, {"cpu": 1}, "worker")
-    add("static_resource_probe", {"worker_construct"}, {"disk_io": 1},
-        "startup_manager")
-    two_phase_compile_prewarm = os.environ.get(
-        "VLLM_ENABLE_TWO_PHASE_FULL_FX_PREWARM", "0") == "1"
-    if two_phase_compile_prewarm:
-        compile_prewarm_dependencies = {"worker_construct"}
-        cuda_dependencies = {"compile_worker_prewarm"}
-        distributed_dependencies = {"cuda_device"}
-    else:
-        compile_prewarm_dependencies = {"distributed_environment"}
-        cuda_dependencies = {"worker_construct"}
-        distributed_dependencies = {"cuda_device"}
-    add("cuda_device", cuda_dependencies,
-        {"worker_rpc": 1, "gpu_runtime": 1}, "worker", "worker-0")
-    add("compile_worker_prewarm", compile_prewarm_dependencies,
-        {"worker_rpc": 1, "compiler_cpu": 1}, "compilation", "worker-0")
-    add("distributed_environment", distributed_dependencies,
-        {"worker_rpc": 1, "gpu_runtime": 1}, "worker", "worker-0")
-    # The helper warms asynchronously while distributed setup and the runner
-    # allocate their persistent state.
-    add("model_runner", {"compile_worker_prewarm", "distributed_environment"},
-        {"worker_rpc": 1, "gpu_memory": 1}, "model", "worker-0")
-    add("usage_reporting", {"model_runner"}, {"worker_rpc": 1}, "runtime",
-        "worker-0")
-    add("state_probe", {"usage_reporting", "compile_worker_prewarm",
-                        "static_resource_probe"},
-        {"worker_rpc": 1, "cpu": 1}, "startup_manager", "worker-0")
-    _apply_configured_contract(dag)
-    return dag
-
-
 def _apply_configured_contract(dag: StartupDAG) -> None:
     contract = os.environ.get("VLLM_STARTUP_CONTRACT_PATH")
     if not contract:
         return
     from vllm.v1.engine.startup_analysis.contract import apply_startup_contract
     apply_startup_contract(dag, Path(contract), strict=False)
-
-
-def combine_startup_dags(bootstrap: StartupDAG,
-                         runtime: StartupDAG) -> StartupDAG:
-    """Return the expanded full DAG without mutating executable sub-DAGs."""
-    combined = StartupDAG()
-    for source in (bootstrap, runtime):
-        for node in source.nodes.values():
-            combined.add_node(StageNode(
-                name=node.name,
-                action=None,
-                dependencies=set(node.dependencies),
-                estimated_cost_s=node.estimated_cost_s,
-                resources=dict(node.resources),
-                enabled=node.enabled,
-                category=node.category,
-                details=dict(node.details),
-            ))
-    combined.add_dependency("init_model", "state_probe")
-    return combined
-
-
-def write_bootstrap_plan(path: Path, dag: StartupDAG) -> None:
-    """Persist the pre-state plan before device-dependent expansion."""
-    payload = {
-        "schema": "vllm-startup-dag-v2",
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "planning_state": "awaiting_worker_state",
-        "expansion_point": "state_probe",
-        "plan": dag.serializable(),
-    }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True),
-                    encoding="utf-8")
 
 
 def build_logical_startup_dag(state: StartupState) -> StartupDAG:

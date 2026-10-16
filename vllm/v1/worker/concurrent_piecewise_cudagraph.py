@@ -165,7 +165,7 @@ class CaptureExecutor:
                 self.manager.mark_capture_failed(phase, shape, error)
                 self.manager.settle_shared_capture(phase, shape, error)
                 raise
-        logger.info(
+        logger.debug(
             "Concurrent piecewise CUDA graph capture queued after real "
             "warmup: phase=%s shape=%d",
             phase,
@@ -298,6 +298,10 @@ class CaptureExecutor:
                 finished - body_finished,
             )
             logger.info(
+                "Concurrent CUDA graph ready: phase=%s shape=%d capture_seconds=%.6f",
+                request.phase, shape, finished - started,
+            )
+            logger.debug(
                 "[TIMER] Concurrent Piecewise CUDA Graph Capture: "
                 "phase=%s shape=%d total=%.6fs queue_delay=%.6fs "
                 "runtime_init=%.6fs warmup_wait=%.6fs "
@@ -424,7 +428,7 @@ class CaptureExecutor:
             CUDAGraphCaptureStop,
         )
 
-        logger.info("Adaptive CUDA graph capture started: shapes=%s", shapes)
+        logger.debug("Adaptive CUDA graph capture started: shapes=%s", shapes)
         progressed = 0
         with manager.gc_scope.fast_capture_scope():
             for shape in shapes:
@@ -577,6 +581,10 @@ class CaptureExecutor:
                             ),
                         )
                         logger.info(
+                            "Adaptive CUDA graph ready: shape=%d capture_seconds=%.6f",
+                            shape, elapsed,
+                        )
+                        logger.debug(
                             "Adaptive CUDA graph became ready: shape=%d "
                             "capture_seconds=%.6f enter=%.6f body=%.6f "
                             "exit=%.6f",
@@ -602,7 +610,7 @@ class CaptureExecutor:
                             body_seconds=body_finished - context_entered,
                             context_exit_seconds=finished - body_finished,
                         )
-                        logger.info(
+                        logger.debug(
                             "Adaptive CUDA graph capture progressed: "
                             "shape=%d captured_pieces=%d remaining_pieces=%d "
                             "chunk_seconds=%.6f",

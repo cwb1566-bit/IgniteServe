@@ -155,3 +155,32 @@ def test_runtime_adapter_returns_original_future(monkeypatch):
         unsafe_force_cache=True,
         worker_context_factories=contexts,
     )
+
+
+def test_compile_timers_are_isolated_by_manager_and_shape(monkeypatch):
+    from vllm.compilation import compile_manager as module
+
+    monkeypatch.setattr(module, "make_compiler", lambda _: object())
+    first = CompilerManager(NS(compilation_time=0.0))
+    second = CompilerManager(NS(compilation_time=0.0))
+    ticks = iter([10.0, 20.0, 30.0, 40.0, 50.0, 60.0])
+    monkeypatch.setattr(module.time, "perf_counter", lambda: next(ticks))
+    first._maybe_start_timer(0, True, None)
+    second._maybe_start_timer(0, True, None)
+    first._maybe_start_timer(0, True, 8)
+    first._maybe_finish_timer(1, 2, None, True, "compile")
+    second._maybe_finish_timer(1, 2, None, True, "load")
+    first._maybe_finish_timer(1, 2, 8, True, "compile")
+    assert first.compilation_config.compilation_time == 60.0
+    assert second.compilation_config.compilation_time == 30.0
+    assert not first._compilation_started and not second._compilation_started
+
+
+def test_partial_compile_does_not_report_a_fabricated_batch_time(monkeypatch):
+    from vllm.compilation import compile_manager as module
+
+    monkeypatch.setattr(module, "make_compiler", lambda _: object())
+    manager = CompilerManager(NS(compilation_time=0.0))
+    manager._maybe_start_timer(0, False, None)
+    manager._maybe_finish_timer(1, 2, None, True, "compile")
+    assert manager.compilation_config.compilation_time == 0.0

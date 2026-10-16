@@ -6,10 +6,9 @@ import importlib.util
 import operator
 import os
 import pickle
-import shutil
 import sys
 import time
-from typing import Any, Optional
+from typing import Any
 
 import torch
 import torch.fx as fx
@@ -18,11 +17,6 @@ from vllm.logger import init_logger
 from vllm.utils import resolve_obj_by_qualname
 
 logger = init_logger(__name__)
-
-
-def _runtime_shape_label(runtime_shape: Optional[int]) -> str:
-    return "dynamic" if runtime_shape is None else str(runtime_shape)
-
 
 _FX_NODE_REF = "__fx_node_ref__"
 _FX_TUPLE = "__fx_tuple__"
@@ -213,16 +207,6 @@ def _deserialize_graph_module_for_subprocess(payload: dict[str, Any]) -> fx.Grap
     return fx.GraphModule(root, graph)
 
 
-def _save_graph_module_for_subprocess(
-    graph_module: fx.GraphModule, graph_path: str
-) -> None:
-    shutil.rmtree(graph_path, ignore_errors=True)
-    os.makedirs(graph_path, exist_ok=True)
-    payload_path = os.path.join(graph_path, "graph_module.pkl")
-    with open(payload_path, "wb") as f:
-        pickle.dump(_serialize_graph_module_for_subprocess(graph_module), f)
-
-
 def _load_graph_module_for_subprocess(graph_path: str) -> fx.GraphModule:
     payload_path = os.path.join(graph_path, "graph_module.pkl")
     if os.path.exists(payload_path):
@@ -250,11 +234,3 @@ def _load_graph_module_for_subprocess(graph_path: str) -> fx.GraphModule:
 
     graph_cls = getattr(module, _FX_SUBPROCESS_MODULE_CLASS)
     return graph_cls()
-
-
-def _validate_saved_graph_for_subprocess(graph_path: str) -> Optional[str]:
-    try:
-        _load_graph_module_for_subprocess(graph_path)
-        return None
-    except Exception as exc:
-        return repr(exc)

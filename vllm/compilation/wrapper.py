@@ -322,7 +322,7 @@ class TorchCompileWrapperWithCustomDispatcher:
         forward_globals[compiled_names[0]] = compiled_fn
         self.compiled_codes.append(transformed_code)
         install_s = time.perf_counter() - install_started
-        logger.info(
+        logger.debug(
             "Dynamo frontend replay breakdown: validation=%.6f s "
             "graph_restore=%.6f s symbols=%.6f s backend=%.6f s "
             "install=%.6f s",
