@@ -31,7 +31,7 @@ MAX_MODEL_LEN=${MAX_MODEL_LEN:-2048}
 GPU_UTIL=${GPU_UTIL:-0.9}
 SUFFIX="__len${MAX_MODEL_LEN}__gpuutil${GPU_UTIL}"
 
-DATASET=${DATASET:-$REPO/benchmarks_custom/ShareGPT_validated_2000.json}
+DATASET=${DATASET:-$REPO/benchmarks/igniteserve/ShareGPT_validated_2000.json}
 RESOURCE_ROOT=${RESOURCE_ROOT:-$REPO/vllm_startup_resources}
 # Ground-truth hotspot CSVs produced by the material stage. NEVER written by
 # the formal stage (formal uses a separate, seeded HOTSPOT_ROOT below).
@@ -39,8 +39,8 @@ MATERIAL_HOTSPOT_ROOT=${MATERIAL_HOTSPOT_ROOT:-$RESOURCE_ROOT/cuda_graph_hotspot
 COMPILE_CACHE_DIR=${COMPILE_CACHE_DIR:-$HOME/.cache/vllm/torch_compile_cache}
 OUT_ROOT=${OUT_ROOT:-$REPO/benchmark_results/IgniteServe_e2e}
 
-BURST_CLIENT=$REPO/benchmarks_custom/vllm_benchmark_burst.py
-RPS_CLIENT=$REPO/benchmarks_custom/vllm_benchmark_rps.py
+BURST_CLIENT=$REPO/benchmarks/igniteserve/vllm_benchmark_burst.py
+RPS_CLIENT=$REPO/benchmarks/igniteserve/vllm_benchmark_rps.py
 
 READY_TIMEOUT_S=${READY_TIMEOUT_S:-1800}
 SHUTDOWN_TIMEOUT_S=${SHUTDOWN_TIMEOUT_S:-240}

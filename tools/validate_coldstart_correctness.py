@@ -198,7 +198,7 @@ def main() -> int:
     s = sub.add_parser("sample")
     s.add_argument("--model", required=True)
     s.add_argument("--sharegpt-path", default=str(
-        REPO / "benchmarks_custom/ShareGPT_V3_unfiltered_cleaned_split.json"))
+        REPO / "benchmarks/igniteserve/ShareGPT_V3_unfiltered_cleaned_split.json"))
     s.add_argument("--num-random", type=int, default=64)
     s.add_argument("--num-sharegpt", type=int, default=64)
     s.add_argument("--input-len", type=int, default=256)

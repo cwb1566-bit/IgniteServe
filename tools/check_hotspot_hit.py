@@ -13,9 +13,9 @@ The replication of the Top-K selection mirrors gpu_model_runner exactly:
 
 Usage:
   python tools/check_hotspot_hit.py \
-    --server-log A100_0606/IgniteServe_e2e/formal/Qwen3-4B/<fullkey>.server.log \
+    --server-log benchmark_results/Qwen3-4B/<fullkey>.server.log \
     --material-csv vllm_startup_resources/cuda_graph_hotspots/<fullkey>/cuda_graph_hits.csv \
-    --report A100_0606/IgniteServe_e2e/formal/Qwen3-4B/<fullkey>.hitcheck.json
+    --report benchmark_results/Qwen3-4B/<fullkey>.hitcheck.json
 """
 from __future__ import annotations
 

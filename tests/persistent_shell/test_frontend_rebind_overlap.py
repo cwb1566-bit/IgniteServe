@@ -91,7 +91,7 @@ def test_sync_rollback() -> None:
     assert engine.engine_core.calls == ["new", "old"]
 
 
-async def test_async_overlap() -> None:
+async def _check_async_overlap() -> None:
     old, new = config("old"), config("new")
     engine = object.__new__(async_module.AsyncLLM)
     engine.vllm_config = old
@@ -123,10 +123,14 @@ async def test_async_overlap() -> None:
     assert engine.engine_core.calls == ["new"]
 
 
+def test_async_overlap() -> None:
+    asyncio.run(_check_async_overlap())
+
+
 def main() -> None:
     test_sync_overlap()
     test_sync_rollback()
-    asyncio.run(test_async_overlap())
+    test_async_overlap()
     print("FRONTEND_REBIND_OVERLAP_OK")
 
 
