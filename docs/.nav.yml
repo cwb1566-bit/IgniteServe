@@ -1,4 +1,7 @@
 nav:
+  - IgniteServe:
+    - Deployment and Startup: deployment.md
+    - Architecture and Source Guide: architecture.md
   - Home: 
     - vLLM: README.md
     - Getting Started:

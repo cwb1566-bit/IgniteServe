@@ -81,6 +81,9 @@ class Executor(ExecutorBase):
     def load_weights(self) -> None:
         self.collective_rpc("load_weights")
 
+    def load_weights_and_trigger_compile(self) -> list[dict[str, object]]:
+        return self.collective_rpc("load_weights_and_trigger_compile")
+
     def run_to_trigger_compile(self) -> None:
         self.collective_rpc("run_to_trigger_compile")
 
@@ -111,10 +114,11 @@ class Executor(ExecutorBase):
         self,
         max_pieces_per_shape: Optional[int] = None,
         deadline_ms: Optional[float] = None,
+        selected_shape: Optional[int] = None,
     ) -> int:
         results = self.collective_rpc(
             "capture_pending_cudagraphs",
-            args=(max_pieces_per_shape, deadline_ms),
+            args=(max_pieces_per_shape, deadline_ms, selected_shape),
         )
         return sum(int(result or 0) for result in results)
 

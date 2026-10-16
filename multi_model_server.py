@@ -46,15 +46,6 @@ def hotspot_root_dir() -> Path:
     return resource_dir("cuda_graph_hotspots")
 
 
-def reset_hotspot_analyzer_state(analyzer) -> None:
-    analyzer.stats.clear()
-    analyzer.recent_sizes.clear()
-    analyzer.total_requests = 0
-    analyzer.triggered_thresholds.clear()
-    analyzer.pending_captures.clear()
-    analyzer.has_exported_final = False
-
-
 class TemplateManager:
     @staticmethod
     def get_prompt_and_stop(model_name: str, messages: list):
@@ -116,7 +107,23 @@ class MultiModelManager:
         self.hotspot_lock = asyncio.Lock()
         self.current_hotspot_key: str | None = None
         self.current_hotspot_dir: Path | None = None
-        asyncio.create_task(self._idle_sweeper())
+        self.persistent_shell_enabled = (
+            os.environ.get(
+                "VLLM_ENABLE_PERSISTENT_ENGINE_SHELL", "0").lower()
+            in ("1", "true", "yes", "on")
+            and self.max_concurrent_models == 1
+        )
+        self.shell_condition = asyncio.Condition()
+        self.shell_engine: AsyncLLMEngine | None = None
+        self.shell_identity: tuple[str, str | None] | None = None
+        self.shell_active_requests = 0
+        self.shell_switching = False
+        self._idle_task = asyncio.create_task(self._idle_sweeper())
+
+        if self.persistent_shell_enabled:
+            print("[Persistent Shell] Enabled general model rebind; worker "
+                  "processes and fixed-topology communication state will be "
+                  "retained across model switches.")
 
     def _complete_hotspot_key(self, hotspot_key: str | None) -> str | None:
         normalized_key = normalize_hotspot_key(hotspot_key)
@@ -150,15 +157,7 @@ class MultiModelManager:
                 os.environ["VLLM_CUDA_GRAPH_HOTSPOT_DIR"] = str(hotspot_dir)
                 return normalized_key
 
-            try:
-                from vllm.v1.worker.HotspotAnalyzer import HotspotAnalyzer
-                if self.current_hotspot_key is not None:
-                    HotspotAnalyzer.check_and_export(True)
-                HotspotAnalyzer.output_dir = hotspot_dir
-                reset_hotspot_analyzer_state(HotspotAnalyzer)
-            except Exception as exc:
-                print(f"[CUDA Graph Hotspot] Failed to rebind analyzer: {exc}")
-
+            # Each worker's manager exports and resets observations at rebind.
             os.environ["VLLM_CUDA_GRAPH_HOTSPOT_DIR"] = str(hotspot_dir)
             self.current_hotspot_key = normalized_key
             self.current_hotspot_dir = hotspot_dir
@@ -222,6 +221,12 @@ class MultiModelManager:
                 print(f"[-] Model {model_name} resources released\n")
 
     async def shutdown_all(self):
+        if not self._idle_task.done():
+            self._idle_task.cancel()
+            try:
+                await self._idle_task
+            except asyncio.CancelledError:
+                pass
         async with self.global_lock:
             model_names = [
                 name for name, state in self.registry.items()
@@ -259,9 +264,117 @@ class MultiModelManager:
                             models_to_unload.append(name)
 
             for name in models_to_unload:
+                if self.persistent_shell_enabled:
+                    # Keep the shell/model ready until a different model takes
+                    # ownership. Destroying the AsyncLLM here would also tear
+                    # down the worker processes, CUDA context and NCCL state.
+                    continue
                 print(f"\n[Timeout] Model {name} idle for more than "
                       f"{self.keepalive}s, unloading")
                 await self._unload_engine(name)
+
+    async def _activate_persistent_shell(
+            self, model_name: str,
+            hotspot_key: str | None) -> AsyncLLMEngine:
+        async with self.global_lock:
+            if model_name not in self.registry:
+                self.registry[model_name] = EngineState(model_name)
+            state = self.registry[model_name]
+            state.is_loading = True
+
+        started = time.perf_counter()
+        if hotspot_key is not None:
+            await self._apply_hotspot_key(hotspot_key)
+        req_args = copy.copy(self.base_args)
+        req_args.model = model_name
+        engine_args = AsyncEngineArgs.from_cli_args(req_args)
+        weight_prewarm_proc = getattr(engine_args, "_weight_prewarm_proc",
+                                      None)
+        try:
+            if self.shell_engine is None:
+                print(f"[Persistent Shell] Creating shell for {model_name}")
+                engine = AsyncLLMEngine.from_engine_args(engine_args)
+                mode = "create"
+                rebind_result = None
+            else:
+                rebind = getattr(self.shell_engine, "rebind_model", None)
+                if not callable(rebind):
+                    raise RuntimeError(
+                        "Persistent shell rebind requires the vLLM V1 "
+                        "AsyncLLM engine")
+                old_identity = self.shell_identity
+                print("[Persistent Shell] Rebinding "
+                      f"{old_identity} -> {(model_name, hotspot_key)}")
+                vllm_config = engine_args.create_engine_config()
+                rebind_result = await rebind(vllm_config)
+                engine = self.shell_engine
+                mode = "general_rebind"
+
+            for other_state in self.registry.values():
+                if other_state is not state and other_state.engine is engine:
+                    other_state.engine = None
+                    other_state.is_loading = False
+            state.engine = engine
+            state.hotspot_key = hotspot_key
+            state.last_active_time = time.time()
+            state.is_loading = False
+            print("[Persistent Shell] Activation finished: "
+                  f"mode={mode} model={model_name} "
+                  f"elapsed={time.perf_counter() - started:.3f}s")
+            if rebind_result is not None:
+                print("[Persistent Shell] Rebind metrics: "
+                      f"{json.dumps(rebind_result, default=str)}")
+            return engine
+        except BaseException:
+            state.is_loading = False
+            raise
+        finally:
+            stop_async_weight_prewarm(
+                weight_prewarm_proc, "persistent shell activation finished")
+
+    async def _acquire_persistent_engine(
+            self, model_name: str,
+            hotspot_key: str | None) -> AsyncLLMEngine:
+        identity = (model_name, hotspot_key)
+        while True:
+            async with self.shell_condition:
+                if self.shell_switching:
+                    await self.shell_condition.wait()
+                    continue
+                if (self.shell_engine is not None
+                        and self.shell_identity == identity):
+                    self.shell_active_requests += 1
+                    self.registry[model_name].last_active_time = time.time()
+                    return self.shell_engine
+                if self.shell_active_requests == 0:
+                    self.shell_switching = True
+                    break
+                await self.shell_condition.wait()
+
+        try:
+            engine = await self._activate_persistent_shell(
+                model_name, hotspot_key)
+        except BaseException:
+            async with self.shell_condition:
+                self.shell_switching = False
+                self.shell_condition.notify_all()
+            raise
+
+        async with self.shell_condition:
+            self.shell_engine = engine
+            self.shell_identity = identity
+            self.shell_active_requests += 1
+            self.shell_switching = False
+            self.shell_condition.notify_all()
+            return engine
+
+    async def _release_persistent_engine(self) -> None:
+        async with self.shell_condition:
+            self.shell_active_requests -= 1
+            if self.shell_active_requests < 0:
+                self.shell_active_requests = 0
+                raise RuntimeError("Persistent shell request count underflow")
+            self.shell_condition.notify_all()
 
     # async def get_or_load_engine(self, model_name: str) -> AsyncLLMEngine:
     #     async with self.global_lock:
@@ -402,15 +515,27 @@ class MultiModelManager:
     async def generate_stream(self, model_name: str, prompt: str,
                               sampling_params: SamplingParams,
                               hotspot_key: str | None = None):
-        normalized_hotspot_key = await self._apply_hotspot_key(hotspot_key)
-        engine = await self.get_or_load_engine(model_name,
-                                               normalized_hotspot_key)
-        self.registry[model_name].last_active_time = time.time()
+        if self.persistent_shell_enabled:
+            # Defer the environment/profile switch until all requests using
+            # the current model/profile have drained.
+            normalized_hotspot_key = self._complete_hotspot_key(hotspot_key)
+            engine = await self._acquire_persistent_engine(
+                model_name, normalized_hotspot_key)
+        else:
+            normalized_hotspot_key = await self._apply_hotspot_key(hotspot_key)
+            engine = await self.get_or_load_engine(
+                model_name, normalized_hotspot_key)
+            self.registry[model_name].last_active_time = time.time()
 
         request_id = f"req-{time.time()}"
-        results_generator = engine.generate(prompt, sampling_params, request_id)
-        async for request_output in results_generator:
-            yield request_output
+        try:
+            results_generator = engine.generate(
+                prompt, sampling_params, request_id)
+            async for request_output in results_generator:
+                yield request_output
+        finally:
+            if self.persistent_shell_enabled:
+                await self._release_persistent_engine()
 
 
 global_cli_args = None

@@ -6,7 +6,9 @@ import glob
 import hashlib
 import json
 import os
+import re
 import tempfile
+import threading
 import time
 from collections import defaultdict
 from collections.abc import Generator
@@ -455,21 +457,140 @@ def np_cache_weights_iterator(
         yield name, torch.from_numpy(param)
 
 
+class _WeightShardPrefetcher:
+    """Read one future shard into the host page cache on a bounded thread."""
+
+    def __init__(self) -> None:
+        chunk_mb = max(
+            1, int(os.environ.get("VLLM_WEIGHT_SHARD_PREFETCH_CHUNK_MB", "8")))
+        self.chunk_bytes = chunk_mb * 1024 * 1024
+        self.cancel_event = threading.Event()
+        self.thread: Optional[threading.Thread] = None
+        self.target: Optional[str] = None
+        self.bytes_read = 0
+        self.completed = 0
+        self.cancelled = 0
+        self.errors = 0
+        self.started_at = 0.0
+
+    def start(self, path: str) -> None:
+        if self.thread is not None:
+            raise RuntimeError("A weight shard prefetch is already active")
+        self.cancel_event.clear()
+        self.target = path
+        self.started_at = time.perf_counter()
+
+        def read_ahead() -> None:
+            reached_eof = False
+            try:
+                with open(path, "rb", buffering=0) as shard:
+                    if hasattr(os, "posix_fadvise"):
+                        os.posix_fadvise(shard.fileno(), 0, 0,
+                                        os.POSIX_FADV_SEQUENTIAL)
+                    while not self.cancel_event.is_set():
+                        data = shard.read(self.chunk_bytes)
+                        if not data:
+                            reached_eof = True
+                            break
+                        self.bytes_read += len(data)
+            except OSError as exc:
+                self.errors += 1
+                logger.warning("Weight shard prefetch failed for %s: %s",
+                               path, exc)
+            finally:
+                if reached_eof:
+                    self.completed += 1
+                elif self.cancel_event.is_set():
+                    self.cancelled += 1
+
+        self.thread = threading.Thread(
+            target=read_ahead,
+            daemon=True,
+            name="vllm-weight-shard-prefetch",
+        )
+        self.thread.start()
+
+    def finish(self, cancel_if_running: bool) -> None:
+        thread = self.thread
+        if thread is None:
+            return
+        if cancel_if_running and thread.is_alive():
+            self.cancel_event.set()
+        thread.join()
+        self.thread = None
+        self.target = None
+
+
+def _weight_shard_pipeline_scope(hf_weights_files: list[str]) -> Optional[str]:
+    enabled = os.environ.get(
+        "VLLM_ENABLE_WEIGHT_SHARD_PIPELINE", "0").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+    if not enabled:
+        return None
+    leader_only = os.environ.get(
+        "VLLM_WEIGHT_SHARD_PREFETCH_LEADER_ONLY", "1").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+    if leader_only and torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
+        file_ranks = {
+            int(match.group(1))
+            for path in hf_weights_files
+            for match in [re.search(r"global-rank-(\d+)",
+                                    os.path.basename(path))]
+            if match is not None
+        }
+        # Topology-sharded checkpoints have disjoint files per rank. Let each
+        # rank prefetch its own next file; leader-only is useful only when all
+        # ranks consume the same checkpoint files through the shared page
+        # cache.
+        if file_ranks == {rank}:
+            return "rank_local"
+        return "shared_leader" if rank == 0 else None
+    return "all_ranks"
+
+
 def safetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
-    for st_file in tqdm(
-            hf_weights_files,
+    pipeline_scope = _weight_shard_pipeline_scope(hf_weights_files)
+    prefetcher = (_WeightShardPrefetcher()
+                  if pipeline_scope is not None else None)
+    pipeline_started = time.perf_counter()
+    try:
+        iterator = tqdm(
+            enumerate(hf_weights_files),
+            total=len(hf_weights_files),
             desc="Loading safetensors checkpoint shards",
             disable=not enable_tqdm(use_tqdm_on_load),
             bar_format=_BAR_FORMAT,
-    ):
-        with safe_open(st_file, framework="pt") as f:
-            for name in f.keys():  # noqa: SIM118
-                param = f.get_tensor(name)
-                yield name, param
+        )
+        for index, st_file in iterator:
+            # If next-shard prefetch has not completed by the time the real
+            # loader reaches it, stop it immediately to avoid I/O contention.
+            if prefetcher is not None:
+                prefetcher.finish(cancel_if_running=True)
+            with safe_open(st_file, framework="pt") as f:
+                if (prefetcher is not None
+                        and index + 1 < len(hf_weights_files)):
+                    prefetcher.start(hf_weights_files[index + 1])
+                for name in f.keys():  # noqa: SIM118
+                    param = f.get_tensor(name)
+                    yield name, param
+    finally:
+        if prefetcher is not None:
+            prefetcher.finish(cancel_if_running=True)
+            logger.info(
+                "Weight shard pipeline finished in %.3f s: "
+                "scope=%s shards=%d prefetched_bytes=%d completed=%d cancelled=%d "
+                "errors=%d chunk_mb=%d",
+                time.perf_counter() - pipeline_started,
+                pipeline_scope, len(hf_weights_files), prefetcher.bytes_read,
+                prefetcher.completed, prefetcher.cancelled,
+                prefetcher.errors, prefetcher.chunk_bytes // (1024 * 1024))
 
 
 def runai_safetensors_weights_iterator(

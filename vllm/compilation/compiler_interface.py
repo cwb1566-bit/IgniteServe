@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
 import copy
+import functools
 import hashlib
 import os
 import threading
@@ -21,6 +22,59 @@ from vllm.utils import is_torch_equal_or_newer
 from .inductor_pass import pass_context
 from vllm.logger import init_logger
 logger = init_logger(__name__)
+
+# Cached graph materialization imports Triton extension modules with shared
+# launcher names. Serialize this import/binding phase across loader threads;
+# compilation in separate processes and subsequent graph execution stay parallel.
+_cached_graph_load_lock = threading.RLock()
+
+
+class FullFxCompileBackend:
+    """Lazy boundary to the patched Torch pool; futures stay with the caller.
+
+    No additional executor, serialization pass, or wait is introduced here.
+    """
+
+    @staticmethod
+    def pool():
+        from torch._inductor.compile_fx_full_subproc import FullFxCompilePool
+        return FullFxCompilePool
+
+    @staticmethod
+    def configure(max_workers, *, prewarm_cuda=False):
+        os.environ.setdefault('TORCHINDUCTOR_FULL_FX_COMPILE_WORKERS', str(max_workers))
+        os.environ.setdefault('TORCHINDUCTOR_FX_COMPILE_INNER_THREADS', '1')
+        if prewarm_cuda:
+            os.environ.setdefault('TORCHINDUCTOR_FX_COMPILE_PREWARM_CUDA', '1')
+        imports = [name for name in os.environ.get(
+            'TORCHINDUCTOR_FX_COMPILE_WORKER_IMPORTS', '').split(',') if name]
+        for name in ('vllm._custom_ops', 'vllm.compilation.pass_manager'):
+            if name not in imports:
+                imports.append(name)
+        os.environ['TORCHINDUCTOR_FX_COMPILE_WORKER_IMPORTS'] = ','.join(imports)
+
+    @classmethod
+    def prewarm(cls):
+        return cls.pool().prewarm_workers()
+
+    @classmethod
+    def prewarm_futures(cls):
+        return cls.pool().all_prewarm_futures()
+
+    @classmethod
+    def submit(cls, graph, inputs, config, worker_contexts):
+        return cls.pool().submit(graph, inputs, config, unsafe_force_cache=True,
+                                 worker_context_factories=worker_contexts)
+
+    @classmethod
+    def begin_shutdown(cls):
+        return cls.pool().begin_shutdown_pool()
+
+    @classmethod
+    def shutdown(cls):
+        return cls.pool().shutdown_pool()
+
+
 class CompilerInterface:
     """
     The interface for a compiler that can be used by vLLM.
@@ -148,7 +202,11 @@ class AlwaysHitShapeEnv:
         return ""
 
 
-def get_inductor_factors() -> list[Any]:
+_inductor_factor_prewarm_thread: Optional[threading.Thread] = None
+
+
+@functools.lru_cache(maxsize=1)
+def _get_inductor_factors_cached() -> list[Any]:
     factors: list[Any] = []
     # summarize system state
     from torch._inductor.codecache import CacheBase
@@ -160,6 +218,28 @@ def get_inductor_factors() -> list[Any]:
     torch_factors = torch_key()
     factors.append(torch_factors)
     return factors
+
+
+def get_inductor_factors() -> list[Any]:
+    thread = _inductor_factor_prewarm_thread
+    if thread is not None and thread is not threading.current_thread():
+        thread.join()
+    return _get_inductor_factors_cached()
+
+
+def start_inductor_factor_prewarm() -> None:
+    """Compute the compiler identity while model weights are loading."""
+    global _inductor_factor_prewarm_thread
+    thread = _inductor_factor_prewarm_thread
+    if thread is not None:
+        return
+    thread = threading.Thread(
+        target=get_inductor_factors,
+        name="inductor-factor-prewarm",
+        daemon=True,
+    )
+    _inductor_factor_prewarm_thread = thread
+    thread.start()
 
 
 class InductorStandaloneAdaptor(CompilerInterface):
@@ -393,13 +473,11 @@ class ThreadSafeInductorAdaptor(CompilerInterface):
         # 验证
         if not envs.VLLM_DISABLE_COMPILE_CACHE:
             if hash_str is None:
-                raise RuntimeError(
-                    f"[Thread-{thread_id}] Failed to compile graph_{graph_index}. "
-                    "The most likely reason for this is that a previous compilation "
-                    "failed, leading to a corrupted compilation artifact. "
-                    "We recommend trying to "
-                    "remove ~/.cache/vllm/torch_compile_cache and try again "
-                    "to see the real issue.")
+                # An AOT cache hit can return a callable without invoking the
+                # inner-compile hook. It has no new exportable handle.
+                if callable(compiled_graph):
+                    return compiled_graph, None
+                raise RuntimeError(f"Compilation produced no callable for graph_{graph_index}")
             assert file_path is not None, (
                 f"[Thread-{thread_id}] Failed to get the file path of the compiled graph")
 
@@ -613,7 +691,8 @@ class ThreadSafeInductorAdaptor(CompilerInterface):
         graph: fx.GraphModule,
         example_inputs: list[Any],
         graph_index: int,
-        runtime_shape: Optional[int] = None
+        runtime_shape: Optional[int] = None,
+        artifact_payloads=None,
     ) -> Callable:
         """加载缓存的编译图（线程安全）"""
         assert isinstance(handle, tuple)
@@ -628,20 +707,46 @@ class ThreadSafeInductorAdaptor(CompilerInterface):
         from torch._functorch._aot_autograd.autograd_cache import AOTAutogradCache
         from torch._inductor.codecache import FxGraphCache
 
-        with ExitStack() as exit_stack:
-            exit_stack.enter_context(
-                patch("torch._inductor.codecache.FxGraphCache._get_shape_env",
-                      lambda *args, **kwargs: AlwaysHitShapeEnv()))
-
-            if hasattr(AOTAutogradCache, "_get_shape_env"):
-                exit_stack.enter_context(
-                    patch(
-                        "torch._functorch._aot_autograd.autograd_cache.AOTAutogradCache._get_shape_env",
-                        lambda *args, **kwargs: AlwaysHitShapeEnv()))
-
+        with _cached_graph_load_lock, ExitStack() as exit_stack:
             exit_stack.enter_context(self.metrics_context())
+            # Triton bundle restoration increments top-level compile metrics.
+            # A loader thread has neither Dynamo's event span nor its TLS.
+            from torch._dynamo.utils import dynamo_timed
+            exit_stack.enter_context(dynamo_timed("igniteserve_artifact_load"))
 
-            if torch.__version__.startswith("2.5"):
+            # Cache lookup runs in a loader thread, outside Dynamo's TLS.
+            # Supply the actual input ShapeEnv, never an always-true guard stub.
+            from torch._guards import TracingContext, detect_fake_mode, tracing
+            if TracingContext.try_get() is None:
+                mode = detect_fake_mode(example_inputs)
+                if mode is None or mode.shape_env is None:
+                    raise ValueError("cache load requires the current input ShapeEnv")
+                exit_stack.enter_context(tracing(TracingContext(mode)))
+
+            if artifact_payloads is not None:
+                # Feed source cache bytes through Inductor's cache-reader API.
+                # Never switch process-wide cache directories during parallel
+                # compilation. Deserialization still checks the current guards
+                # and rebinds constants to the current graph.
+                import base64
+                from torch._inductor.output_code import CompiledFxGraphConstantsWithGm
+                constants = CompiledFxGraphConstantsWithGm(graph)
+                class Candidate:
+                    def __init__(self, payload):
+                        self.payload = payload
+
+                    def get(self, key):
+                        return {"data": base64.b64encode(self.payload).decode("ascii")}
+
+                inductor_compiled_graph = None
+                for payload in artifact_payloads:
+                    inductor_compiled_graph, _ = FxGraphCache._lookup_graph(
+                        hash_str, example_inputs, False, Candidate(payload), constants)
+                    if inductor_compiled_graph is not None:
+                        break
+                if inductor_compiled_graph is None:
+                    raise ValueError("global artifact guards or dependencies rejected")
+            elif torch.__version__.startswith("2.5"):
                 inductor_compiled_graph = FxGraphCache._lookup_graph(
                     hash_str, example_inputs, True, False)
                 assert inductor_compiled_graph is not None, (

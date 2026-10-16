@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -31,6 +32,32 @@ PREWARM_ENV_KEYS = (
     PREWARM_MODEL_ENV,
     PREWARM_STARTED_AT_ENV,
 )
+REBIND_RUNTIME_ENV_KEYS = (
+    *PREWARM_ENV_KEYS,
+    "VLLM_CUDA_GRAPH_HOTSPOT_DIR",
+)
+
+
+def export_rebind_runtime_env() -> dict[str, str]:
+    """Export the small runtime-env handoff accepted by EngineCore rebind."""
+    return {
+        key: os.environ[key]
+        for key in REBIND_RUNTIME_ENV_KEYS
+        if key in os.environ
+    }
+
+
+def apply_rebind_runtime_env(values: dict[str, str]) -> None:
+    """Apply a validated frontend-to-EngineCore rebind environment handoff."""
+    unknown = set(values).difference(REBIND_RUNTIME_ENV_KEYS)
+    if unknown:
+        raise ValueError(f"Unsupported rebind runtime env keys: {unknown}")
+    for key in REBIND_RUNTIME_ENV_KEYS:
+        value = values.get(key)
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = str(value)
 
 
 def weight_prewarm_enabled() -> bool:
@@ -153,6 +180,20 @@ def _pid_is_running_work(pid: int) -> bool:
     return True
 
 
+def _proc_io_counters(pid: int) -> dict[str, int]:
+    try:
+        lines = Path(f"/proc/{pid}/io").read_text(
+            encoding="utf-8").splitlines()
+    except (FileNotFoundError, PermissionError, OSError):
+        return {}
+    counters = {}
+    for line in lines:
+        key, separator, value = line.partition(":")
+        if separator and value.strip().isdigit():
+            counters[key] = int(value.strip())
+    return counters
+
+
 def _wait_pid_stopped(pid: int, timeout: float = 2.0) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -171,19 +212,17 @@ def start_async_weight_prewarm(model_path: str) -> Optional[subprocess.Popen]:
         logger.info("[WEIGHT_PREWARM] no weight files found for %s", model_path)
         return None
 
-    env = os.environ.copy()
-    env["TOKENIZERS_PARALLELISM"] = "false"
-    cmd = [
-        sys.executable,
-        "-m",
-        "vllm.v1.engine.weight_pagecache",
-        "warm",
-        "--model",
-        model_path,
-    ]
+    # Avoid launching ``python -m vllm...`` here. Importing vLLM in the child
+    # can consume the whole frontend overlap window before a single weight
+    # page is read. ``cat`` performs the same sequential page-cache fill with
+    # no shell and negligible process startup overhead.
+    cat = shutil.which("cat")
+    if cat is None:
+        logger.warning("[WEIGHT_PREWARM] cat is unavailable; skipping prewarm")
+        return None
+    cmd = [cat, *(str(path) for path in files)]
     proc = subprocess.Popen(
         cmd,
-        env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
@@ -195,6 +234,43 @@ def start_async_weight_prewarm(model_path: str) -> Optional[subprocess.Popen]:
         "bytes=%.2f GiB model=%s",
         proc.pid, len(files), total_bytes / (1024 ** 3), model_path)
     return proc
+
+
+def ensure_async_weight_prewarm(
+        model_path: str) -> Optional[subprocess.Popen]:
+    """Start prewarm once and let later startup layers adopt it.
+
+    Async CLI construction already starts prewarm before constructing
+    ``AsyncEngineArgs``. Direct ``EngineArgs`` construction reaches the common
+    post-init hook instead. The environment record is the hand-off contract
+    across both paths and into a separately spawned EngineCore process.
+    """
+    pid_text = os.environ.get(PREWARM_PID_ENV)
+    existing_model = os.environ.get(PREWARM_MODEL_ENV)
+    try:
+        same_model = (existing_model is not None and
+                      Path(existing_model).expanduser().resolve() ==
+                      Path(model_path).expanduser().resolve())
+    except OSError:
+        same_model = existing_model == model_path
+
+    if pid_text:
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            pid = -1
+        if pid > 0 and same_model and _pid_is_running_work(pid):
+            logger.info(
+                "[WEIGHT_PREWARM] adopting existing async prewarm pid=%s "
+                "model=%s", pid, model_path)
+            return None
+        if pid > 0 and _pid_is_running_work(pid):
+            stop_async_weight_prewarm_from_env(
+                "new engine requested a different model")
+        else:
+            _clear_prewarm_env()
+
+    return start_async_weight_prewarm(model_path)
 
 
 def stop_async_weight_prewarm(
@@ -255,9 +331,17 @@ def stop_async_weight_prewarm_from_env(reason: str = "load_weights") -> str:
         _clear_prewarm_env()
         return "completed"
 
-    logger.info("[WEIGHT_PREWARM] stopping external prewarm at %s pid=%s "
-                "pgid=%s model=%s to avoid I/O contention", reason, pid,
-                pgid, model_path)
+    started_text = os.environ.get(PREWARM_STARTED_AT_ENV)
+    try:
+        overlap_s = max(0.0, time.time() - float(started_text))
+    except (TypeError, ValueError):
+        overlap_s = 0.0
+    io_counters = _proc_io_counters(pid)
+    logger.info(
+        "[WEIGHT_PREWARM] stopping external prewarm at %s pid=%s pgid=%s "
+        "model=%s overlap_s=%.6f rchar_bytes=%s read_bytes=%s to avoid "
+        "I/O contention", reason, pid, pgid, model_path, overlap_s,
+        io_counters.get("rchar", 0), io_counters.get("read_bytes", 0))
     try:
         os.killpg(pgid, signal.SIGTERM)
     except ProcessLookupError:

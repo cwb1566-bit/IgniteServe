@@ -15,6 +15,7 @@ from threading import Thread
 from typing import Any, Callable, Optional, TypeVar, Union
 
 import msgspec.msgpack
+import cloudpickle
 import zmq
 import zmq.asyncio
 
@@ -30,9 +31,18 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.engine.utils import (CoreEngineActorManager,
                                   CoreEngineProcManager, launch_core_engines)
 from vllm.v1.executor.abstract import Executor
+from vllm.v1.engine.weight_pagecache import export_rebind_runtime_env
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
 
 logger = init_logger(__name__)
+
+
+def _serialize_rebind_request(vllm_config: VllmConfig) -> bytes:
+    return cloudpickle.dumps({
+        "schema": "vllm-persistent-shell-rebind-v1",
+        "vllm_config": vllm_config,
+        "runtime_env": export_rebind_runtime_env(),
+    })
 
 AnyFuture = Union[asyncio.Future[Any], Future[Any]]
 
@@ -120,6 +130,9 @@ class EngineCoreClient(ABC):
     def wake_up(self, tags: Optional[list[str]] = None) -> None:
         raise NotImplementedError
 
+    def rebind_model(self, vllm_config: VllmConfig) -> dict[str, Any]:
+        raise NotImplementedError
+
     def is_sleeping(self) -> bool:
         raise NotImplementedError
 
@@ -181,6 +194,10 @@ class EngineCoreClient(ABC):
         raise NotImplementedError
 
     async def wake_up_async(self, tags: Optional[list[str]] = None) -> None:
+        raise NotImplementedError
+
+    async def rebind_model_async(
+            self, vllm_config: VllmConfig) -> dict[str, Any]:
         raise NotImplementedError
 
     async def is_sleeping_async(self) -> bool:
@@ -257,6 +274,9 @@ class InprocClient(EngineCoreClient):
 
     def wake_up(self, tags: Optional[list[str]] = None) -> None:
         self.engine_core.wake_up(tags)
+
+    def rebind_model(self, vllm_config: VllmConfig) -> dict[str, Any]:
+        return self.engine_core.rebind_model(vllm_config)
 
     def is_sleeping(self) -> bool:
         return self.engine_core.is_sleeping()
@@ -633,6 +653,10 @@ class SyncMPClient(MPClient):
     def wake_up(self, tags: Optional[list[str]] = None) -> None:
         self.call_utility("wake_up", tags)
 
+    def rebind_model(self, vllm_config: VllmConfig) -> dict[str, Any]:
+        payload = _serialize_rebind_request(vllm_config)
+        return self.call_utility("rebind_model_serialized", payload)
+
     def is_sleeping(self) -> bool:
         return self.call_utility("is_sleeping")
 
@@ -814,6 +838,11 @@ class AsyncMPClient(MPClient):
 
     async def wake_up_async(self, tags: Optional[list[str]] = None) -> None:
         await self.call_utility_async("wake_up", tags)
+
+    async def rebind_model_async(
+            self, vllm_config: VllmConfig) -> dict[str, Any]:
+        payload = _serialize_rebind_request(vllm_config)
+        return await self.call_utility_async("rebind_model_serialized", payload)
 
     async def is_sleeping_async(self) -> bool:
         return await self.call_utility_async("is_sleeping")

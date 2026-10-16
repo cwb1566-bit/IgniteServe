@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import os
 import time
 from contextlib import ExitStack
 from typing import Any, Callable, Optional
@@ -38,6 +39,36 @@ class ConcreteSizeEntry:
     # for cudagraph debugging, track the input addresses
     # during capture, and check if they are the same during replay
     input_addresses: Optional[list[int]] = None
+
+    # Experimental formal-capture state. The whole shape is published only
+    # after every piece has been captured by the background worker.
+    concurrent_capture_in_progress: bool = False
+    concurrent_capture_gate: Optional[Any] = None
+    concurrent_capture_pool: Optional[Any] = None
+    concurrent_capture_stream: Optional[torch.cuda.Stream] = None
+    warmup_signature: Optional[Any] = None
+    concurrent_signature: Optional[Any] = None
+    replay_verified: bool = False
+
+
+def _input_signature(args: tuple[Any, ...]) -> tuple:
+    """Compare layouts and storage alias groups without reading tensor data."""
+    storages = {}
+    def describe(value):
+        if isinstance(value, torch.Tensor):
+            storage = (str(value.device), value.untyped_storage().data_ptr())
+            alias = storages.setdefault(storage, len(storages))
+            return ('tensor', tuple(value.shape), tuple(value.stride()),
+                    str(value.dtype), str(value.device), str(value.layout),
+                    value.storage_offset(), alias)
+        if isinstance(value, (tuple, list)):
+            return (type(value).__name__, tuple(describe(v) for v in value))
+        if isinstance(value, dict):
+            return ('dict', tuple((k, describe(v)) for k, v in value.items()))
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return (type(value).__name__, value)
+        raise TypeError(f'Unsupported concurrent capture input: {type(value)}')
+    return tuple(describe(arg) for arg in args)
 
 
 class CUDAPiecewiseBackend:
@@ -100,10 +131,95 @@ class CUDAPiecewiseBackend:
                 use_cudagraph=shape in self.cudagraph_capture_sizes,
             )
 
+    def prepare_concurrent_capture(self, runtime_shape: int, graph_pool: Any,
+                                   capture_stream: torch.cuda.Stream,
+                                   capture_gate: Any) -> bool:
+        """Arm one warmed, uncaptured entry for background formal capture."""
+        entry = self.concrete_size_entries.get(runtime_shape)
+        if (entry is None or not entry.use_cudagraph
+                or entry.cudagraph is not None
+                or entry.concurrent_capture_in_progress
+                or entry.runnable is None
+                or entry.warmup_signature is None
+                or (entry.need_to_compile and not entry.compiled)
+                or entry.num_finished_warmup <
+                self.compilation_config.cudagraph_num_of_warmups):
+            return False
+        entry.concurrent_capture_in_progress = True
+        entry.concurrent_capture_gate = capture_gate
+        entry.concurrent_capture_pool = graph_pool
+        entry.concurrent_capture_stream = capture_stream
+        return True
+
+    def finish_concurrent_capture(self, runtime_shape: int) -> bool:
+        """Publish an entry after the shape-wide capture pass succeeds."""
+        entry = self.concrete_size_entries.get(runtime_shape)
+        if entry is None or entry.cudagraph is None:
+            return False
+        entry.concurrent_capture_in_progress = False
+        entry.concurrent_capture_gate = None
+        entry.concurrent_capture_pool = None
+        entry.concurrent_capture_stream = None
+        return True
+
+    def abort_concurrent_capture(self, runtime_shape: int) -> None:
+        """Discard a partially captured entry and restore eager fallback."""
+        entry = self.concrete_size_entries.get(runtime_shape)
+        if entry is None:
+            return
+        if entry.concurrent_capture_in_progress and entry.cudagraph is not None:
+            try:
+                entry.cudagraph.reset()
+            except Exception:
+                logger.exception(
+                    "Failed to reset partial concurrent CUDA graph: "
+                    "piece=%d shape=%d", self.piecewise_compile_index,
+                    runtime_shape)
+            entry.cudagraph = None
+            entry.output = None
+            entry.input_addresses = None
+        entry.concurrent_capture_in_progress = False
+        entry.concurrent_capture_gate = None
+        entry.concurrent_capture_pool = None
+        entry.concurrent_capture_stream = None
+        entry.concurrent_signature = None
+        entry.replay_verified = False
+
     def _run(self, mode: str, runnable: Callable, args: tuple[Any, ...]) -> Any:
         label = f"piece.{self.piecewise_compile_index}.{mode}"
-        with operator_pipeline_range(label):
-            return runnable(*args)
+        if os.getenv("VLLM_PIECEWISE_INPUT_PROBE"):
+            arg_descriptions = []
+            for index, value in enumerate(args):
+                if isinstance(value, torch.Tensor):
+                    arg_descriptions.append({
+                        "index": index,
+                        "shape": tuple(value.shape),
+                        "stride": tuple(value.stride()),
+                        "dtype": str(value.dtype),
+                        "device": str(value.device),
+                    })
+                else:
+                    arg_descriptions.append({
+                        "index": index,
+                        "type": type(value).__name__,
+                        "repr": repr(value),
+                    })
+            placeholders = [
+                node.name for node in self.graph.graph.nodes
+                if node.op == "placeholder"
+            ]
+            logger.info("Piecewise input probe piece=%d mode=%s "
+                        "sym_shape_indices=%s placeholders=%s args=%s",
+                        self.piecewise_compile_index, mode,
+                        self.sym_shape_indices, placeholders,
+                        arg_descriptions)
+        try:
+            with operator_pipeline_range(label):
+                return runnable(*args)
+        except BaseException:
+            logger.exception("Piecewise execution failed: piece=%d mode=%s",
+                             self.piecewise_compile_index, mode)
+            raise
 
     def check_for_ending_compilation(self):
         if self.is_last_graph and not self.to_be_compiled_sizes:
@@ -122,6 +238,9 @@ class CUDAPiecewiseBackend:
         if not self.first_run_finished:
             self.first_run_finished = True
             if self.is_first_graph:
+                from vllm.compilation.weight_compile_overlap import (
+                    wait_for_weights_ready)
+                wait_for_weights_ready("First compiled execution")
                 if "after_backend_return_until_first_piecewise" in timer.start_times:
                     from vllm.compilation import gap_profiler
                     gap_profiler.stop()
@@ -132,8 +251,14 @@ class CUDAPiecewiseBackend:
             self.check_for_ending_compilation()
             return output
 
+        forward_context = get_forward_context()
+        adaptation_stats = forward_context.cudagraph_adaptation_stats
+        if adaptation_stats is not None:
+            adaptation_stats['pieces'] = adaptation_stats.get('pieces', 0) + 1
         runtime_shape = args[self.sym_shape_indices[0]]
         if runtime_shape not in self.concrete_size_entries:
+            if adaptation_stats is not None:
+                forward_context.skip_cuda_graphs = True
             # we don't need to do anything for this shape
             return self._run("general", self.compiled_graph_for_general_shape,
                              args)
@@ -162,11 +287,16 @@ class CUDAPiecewiseBackend:
 
         # Skip CUDA graphs if this entry doesn't use them OR
         # if we're supposed to skip them globally
-        forward_context = get_forward_context()
+        if adaptation_stats is not None:
+            if entry.cudagraph is None or entry.concurrent_capture_in_progress:
+                # A split must never initiate foreground capture or use partial
+                # output. Finish this part eagerly; do not retry prior KV writes.
+                forward_context.skip_cuda_graphs = True
         skip_cuda_graphs = forward_context.skip_cuda_graphs
         if not entry.use_cudagraph or skip_cuda_graphs:
             output = self._run("eager", entry.runnable, args)
             if entry.use_cudagraph and forward_context.cudagraph_runtime_warmup:
+                entry.warmup_signature = _input_signature(args)
                 # This target shape just completed a real eager execution.
                 # Count it as the required warmup so the idle controller can
                 # perform capture without repeating dummy model forwards.
@@ -175,6 +305,18 @@ class CUDAPiecewiseBackend:
                     self.compilation_config.cudagraph_num_of_warmups,
                 )
             return output
+
+        capture_not_published = (
+            entry.concurrent_capture_in_progress
+            and (entry.concurrent_capture_gate is None
+                 or not entry.concurrent_capture_gate.is_set()))
+        if (capture_not_published
+                and not forward_context.concurrent_cudagraph_capture):
+            # Do not expose a partially captured shape to foreground requests.
+            # The request continues eagerly while the background worker builds
+            # and instantiates all piece graphs.
+            return self._run("eager-during-concurrent-capture",
+                             entry.runnable, args)
 
         if entry.cudagraph is None:
             if entry.num_finished_warmup < self.compilation_config.cudagraph_num_of_warmups:  # noqa
@@ -214,12 +356,20 @@ class CUDAPiecewiseBackend:
                 x.data_ptr() for x in args if isinstance(x, torch.Tensor)
             ]
             entry.input_addresses = input_addresses
+            if forward_context.concurrent_cudagraph_capture:
+                signature = _input_signature(args)
+                if signature != entry.warmup_signature:
+                    raise RuntimeError(
+                        f'Warmup/capture input contract mismatch: '
+                        f'piece={self.piecewise_compile_index} shape={runtime_shape}')
+                entry.concurrent_signature = signature
             cudagraph = torch.cuda.CUDAGraph()
             piece_capture_started = time.perf_counter()
 
             with operator_pipeline_range(
                     f"piece.{self.piecewise_compile_index}.capture"), ExitStack() as stack:
-                if not self.is_first_graph:
+                if (not self.is_first_graph
+                        and not forward_context.concurrent_cudagraph_capture):
                     # during every model forward, we will capture
                     # many pieces of cudagraphs (roughly one per layer).
                     # running gc again and again across layers will
@@ -231,7 +381,22 @@ class CUDAPiecewiseBackend:
                         patch("torch.cuda.empty_cache", lambda: None))
 
                 # mind-exploding: carefully manage the reference and memory.
-                with torch.cuda.graph(cudagraph, pool=self.graph_pool):
+                graph_pool = (entry.concurrent_capture_pool
+                              if forward_context.concurrent_cudagraph_capture
+                              else self.graph_pool)
+                graph_kwargs = {}
+                if forward_context.concurrent_cudagraph_capture:
+                    graph_kwargs = {
+                        "stream": entry.concurrent_capture_stream,
+                        "capture_error_mode": "thread_local",
+                        "synchronize_before_capture": False,
+                        "collect_before_capture": False,
+                        "empty_cache_before_capture": False,
+                        "manage_default_generator": False,
+                    }
+                with torch.cuda.graph(cudagraph,
+                                      pool=graph_pool,
+                                      **graph_kwargs):
                     # `output` is managed by pytorch's cudagraph pool
                     output = entry.runnable(*args)
                     if self.is_last_graph:
@@ -270,6 +435,21 @@ class CUDAPiecewiseBackend:
             # manage the memory during cuda graph capture
             return output
 
+        if entry.concurrent_signature is not None:
+            signature = _input_signature(args)
+            addresses = [x.data_ptr() for x in args if isinstance(x, torch.Tensor)]
+            if signature != entry.concurrent_signature or addresses != entry.input_addresses:
+                # A fallback piece may allocate new outputs. Its suffix must
+                # not replay graphs bound to the old intermediate addresses.
+                forward_context.skip_cuda_graphs = True
+                logger.warning('Concurrent graph input mismatch; using eager: piece=%d shape=%d',
+                               self.piecewise_compile_index, runtime_shape)
+                return self._run('concurrent-contract-fallback', entry.runnable, args)
+            if not entry.replay_verified:
+                entry.replay_verified = True
+                logger.info('Concurrent graph replay contract verified: piece=%d shape=%d',
+                            self.piecewise_compile_index, runtime_shape)
+
         if self.is_debugging_mode:
             # check if the input addresses are the same
             new_input_addresses = [
@@ -283,4 +463,6 @@ class CUDAPiecewiseBackend:
         with operator_pipeline_range(
                 f"piece.{self.piecewise_compile_index}.replay"):
             entry.cudagraph.replay()
+        if adaptation_stats is not None:
+            adaptation_stats['replays'] = adaptation_stats.get('replays', 0) + 1
         return entry.output

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import concurrent.futures
+import time
 from collections.abc import Mapping
 from copy import copy
 from typing import Any, Callable, Optional, Union
@@ -67,6 +69,7 @@ class LLMEngine:
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
+        self.mm_registry = mm_registry
 
         self.log_stats = log_stats
         self.stat_logger: Optional[StatLoggerBase] = None
@@ -169,6 +172,59 @@ class LLMEngine:
         if not has_unfinished and aggregated_has_unfinished:
             self.should_execute_dummy_batch = True
         return aggregated_has_unfinished
+
+    def rebind_model(self, vllm_config: VllmConfig) -> dict[str, Any]:
+        """Switch models while retaining the EngineCore executor shell."""
+        if self.has_unfinished_requests():
+            raise RuntimeError("Cannot rebind while requests are unfinished")
+
+        def load_tokenizer():
+            started = time.perf_counter()
+            tokenizer = init_tokenizer_from_configs(
+                model_config=vllm_config.model_config,
+                scheduler_config=vllm_config.scheduler_config,
+                lora_config=vllm_config.lora_config)
+            return tokenizer, time.perf_counter() - started
+
+        started = time.perf_counter()
+        old_vllm_config = self.vllm_config
+        core_switched = False
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="vllm-rebind-tokenizer") as pool:
+            tokenizer_future = pool.submit(load_tokenizer)
+            try:
+                core_started = time.perf_counter()
+                result = self.engine_core.rebind_model(vllm_config)
+                core_wall_s = time.perf_counter() - core_started
+                core_switched = True
+                tokenizer, tokenizer_s = tokenizer_future.result()
+            except BaseException:
+                if core_switched:
+                    logger.exception(
+                        "Tokenizer preparation failed after EngineCore "
+                        "rebind; rolling the shell back to the old model")
+                    self.engine_core.rebind_model(old_vllm_config)
+                raise
+        result["frontend_rebind"] = {
+            "elapsed_s": time.perf_counter() - started,
+            "engine_core_s": core_wall_s,
+            "tokenizer_s": tokenizer_s,
+            "overlapped": True,
+        }
+        self.vllm_config = vllm_config
+        self.model_config = vllm_config.model_config
+        self.cache_config = vllm_config.cache_config
+        self.tokenizer = tokenizer
+        self.processor = Processor(vllm_config=vllm_config,
+                                   tokenizer=tokenizer,
+                                   mm_registry=self.mm_registry)
+        self.output_processor = OutputProcessor(tokenizer,
+                                                log_stats=self.log_stats)
+        if self.log_stats:
+            self.stat_logger = PrometheusStatLogger(vllm_config)
+        self.reset_mm_cache()
+        return result
 
     @classmethod
     def validate_outputs(cls, outputs, output_type):

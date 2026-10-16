@@ -1,0 +1,727 @@
+{
+  "schema": "igniteserve-startup-v3",
+  "status": "final",
+  "nodes": [
+    {
+      "name": "engine_core_construct",
+      "action_id": "engine_core_construct",
+      "dependencies": [],
+      "required_state": [],
+      "produced_state": [
+        "ready.engine_core_construct"
+      ],
+      "resources": {
+        "cpu": 1
+      },
+      "estimated_cost_s": 0.01,
+      "thread_affinity": null
+    },
+    {
+      "name": "plugins",
+      "action_id": "plugins",
+      "dependencies": [],
+      "required_state": [
+        "ready.engine_core_construct"
+      ],
+      "produced_state": [
+        "ready.plugins"
+      ],
+      "resources": {
+        "cpu": 1
+      },
+      "estimated_cost_s": 0.1,
+      "thread_affinity": null
+    },
+    {
+      "name": "executor_shell",
+      "action_id": "executor_shell",
+      "dependencies": [],
+      "required_state": [
+        "ready.engine_core_construct"
+      ],
+      "produced_state": [
+        "ready.executor_shell"
+      ],
+      "resources": {
+        "cpu": 1
+      },
+      "estimated_cost_s": 0.01,
+      "thread_affinity": null
+    },
+    {
+      "name": "worker_wrapper",
+      "action_id": "worker_wrapper",
+      "dependencies": [],
+      "required_state": [
+        "ready.executor_shell"
+      ],
+      "produced_state": [
+        "ready.worker_wrapper"
+      ],
+      "resources": {
+        "cpu": 1
+      },
+      "estimated_cost_s": 0.05,
+      "thread_affinity": null
+    },
+    {
+      "name": "worker_prepare",
+      "action_id": "worker_prepare",
+      "dependencies": [],
+      "required_state": [
+        "ready.worker_wrapper",
+        "ready.plugins"
+      ],
+      "produced_state": [
+        "ready.worker_prepare"
+      ],
+      "resources": {
+        "cpu": 1
+      },
+      "estimated_cost_s": 0.1,
+      "thread_affinity": null
+    },
+    {
+      "name": "worker_construct",
+      "action_id": "worker_construct",
+      "dependencies": [],
+      "required_state": [
+        "ready.worker_prepare"
+      ],
+      "produced_state": [
+        "ready.worker_construct"
+      ],
+      "resources": {
+        "cpu": 1
+      },
+      "estimated_cost_s": 0.2,
+      "thread_affinity": null
+    },
+    {
+      "name": "static_resource_probe",
+      "action_id": "static_resource_probe",
+      "dependencies": [],
+      "required_state": [
+        "ready.worker_construct"
+      ],
+      "produced_state": [
+        "ready.static_resource_probe",
+        "static_worker_states"
+      ],
+      "resources": {
+        "worker_rpc": 1
+      },
+      "estimated_cost_s": 0.05,
+      "thread_affinity": "worker-0"
+    },
+    {
+      "name": "compile_worker_prewarm",
+      "action_id": "compile_worker_prewarm",
+      "dependencies": [],
+      "required_state": [
+        "ready.worker_construct"
+      ],
+      "produced_state": [
+        "ready.compile_worker_prewarm"
+      ],
+      "resources": {
+        "worker_rpc": 1,
+        "compiler_cpu": 1
+      },
+      "estimated_cost_s": 0.2,
+      "thread_affinity": "worker-0"
+    },
+    {
+      "name": "cuda_device",
+      "action_id": "cuda_device",
+      "dependencies": [],
+      "required_state": [
+        "ready.compile_worker_prewarm"
+      ],
+      "produced_state": [
+        "ready.cuda_device"
+      ],
+      "resources": {
+        "worker_rpc": 1,
+        "gpu_runtime": 1
+      },
+      "estimated_cost_s": 0.8,
+      "thread_affinity": "worker-0"
+    },
+    {
+      "name": "distributed_environment",
+      "action_id": "distributed_environment",
+      "dependencies": [],
+      "required_state": [
+        "ready.cuda_device"
+      ],
+      "produced_state": [
+        "ready.distributed_environment"
+      ],
+      "resources": {
+        "worker_rpc": 1,
+        "gpu_runtime": 1
+      },
+      "estimated_cost_s": 0.5,
+      "thread_affinity": "worker-0"
+    },
+    {
+      "name": "model_runner",
+      "action_id": "model_runner",
+      "dependencies": [],
+      "required_state": [
+        "ready.compile_worker_prewarm",
+        "ready.distributed_environment"
+      ],
+      "produced_state": [
+        "ready.model_runner"
+      ],
+      "resources": {
+        "worker_rpc": 1,
+        "gpu_memory": 1
+      },
+      "estimated_cost_s": 0.8,
+      "thread_affinity": "worker-0"
+    },
+    {
+      "name": "prepare_startup_assets",
+      "action_id": "prepare_startup_assets",
+      "dependencies": [],
+      "required_state": [
+        "ready.model_runner"
+      ],
+      "produced_state": [
+        "ready.prepare_startup_assets",
+        "assets.prepared"
+      ],
+      "resources": {
+        "worker_rpc": 1,
+        "disk_io": 1
+      },
+      "estimated_cost_s": 0.05,
+      "thread_affinity": "worker-0"
+    },
+    {
+      "name": "usage_reporting",
+      "action_id": "usage_reporting",
+      "dependencies": [],
+      "required_state": [
+        "ready.model_runner"
+      ],
+      "produced_state": [
+        "ready.usage_reporting"
+      ],
+      "resources": {
+        "worker_rpc": 1
+      },
+      "estimated_cost_s": 0.01,
+      "thread_affinity": "worker-0"
+    },
+    {
+      "name": "state_probe",
+      "action_id": "state_probe",
+      "dependencies": [],
+      "required_state": [
+        "ready.usage_reporting",
+        "ready.static_resource_probe",
+        "ready.prepare_startup_assets",
+        "static_worker_states"
+      ],
+      "produced_state": [
+        "ready.state_probe",
+        "startup_state"
+      ],
+      "resources": {
+        "worker_rpc": 1
+      },
+      "estimated_cost_s": 0.05,
+      "thread_affinity": "worker-0"
+    },
+    {
+      "name": "init_model",
+      "action_id": "init_model",
+      "dependencies": [],
+      "required_state": [
+        "ready.state_probe"
+      ],
+      "produced_state": [
+        "ready.init_model"
+      ],
+      "resources": {
+        "worker_rpc": 1
+      },
+      "estimated_cost_s": 1.0,
+      "thread_affinity": "worker-0"
+    },
+    {
+      "name": "stop_weight_prewarm",
+      "action_id": "stop_weight_prewarm",
+      "dependencies": [],
+      "required_state": [
+        "ready.init_model"
+      ],
+      "produced_state": [
+        "ready.stop_weight_prewarm"
+      ],
+      "resources": {},
+      "estimated_cost_s": 0.01,
+      "thread_affinity": null
+    },
+    {
+      "name": "load_weights",
+      "action_id": "load_weights",
+      "dependencies": [],
+      "required_state": [
+        "ready.stop_weight_prewarm"
+      ],
+      "produced_state": [
+        "ready.load_weights",
+        "weights.compile_completed",
+        "assets.kv_profile_usable"
+      ],
+      "resources": {
+        "worker_rpc": 1,
+        "disk_io": 1
+      },
+      "estimated_cost_s": 10.0,
+      "thread_affinity": "worker-0"
+    },
+    {
+      "name": "compile_model",
+      "action_id": "compile_model",
+      "dependencies": [],
+      "required_state": [
+        "ready.load_weights",
+        "weights.compile_completed"
+      ],
+      "produced_state": [
+        "ready.compile_model"
+      ],
+      "resources": {
+        "worker_rpc": 1,
+        "compiler_cpu": 1
+      },
+      "estimated_cost_s": 10.0,
+      "thread_affinity": "worker-0",
+      "routes": [
+        {
+          "name": "already_compiled",
+          "when": {
+            "weights.compile_completed": true
+          },
+          "action_id": "compile_already_ready",
+          "resources": {},
+          "estimated_cost_s": 0.0,
+          "thread_affinity": "main_thread"
+        }
+      ]
+    },
+    {
+      "name": "kv_profile",
+      "action_id": "kv_profile",
+      "dependencies": [],
+      "required_state": [
+        "ready.compile_model",
+        "ready.load_weights",
+        "assets.kv_profile_usable"
+      ],
+      "produced_state": [
+        "ready.kv_profile",
+        "available_gpu_memory"
+      ],
+      "resources": {
+        "worker_rpc": 1,
+        "gpu_compute": 1
+      },
+      "estimated_cost_s": 2.0,
+      "thread_affinity": "worker-0",
+      "routes": [
+        {
+          "name": "try_cached_profile",
+          "when": {
+            "assets.kv_profile_usable": true
+          },
+          "action_id": "kv_profile",
+          "resources": {
+            "worker_rpc": 1,
+            "gpu_compute": 1
+          },
+          "estimated_cost_s": 0.01,
+          "thread_affinity": "worker-0"
+        }
+      ]
+    },
+    {
+      "name": "kv_cache_allocate",
+      "action_id": "kv_cache_allocate",
+      "dependencies": [],
+      "required_state": [
+        "ready.kv_profile",
+        "ready.load_weights",
+        "available_gpu_memory"
+      ],
+      "produced_state": [
+        "ready.kv_cache_allocate",
+        "kv_cache_config"
+      ],
+      "resources": {
+        "worker_rpc": 1,
+        "gpu_memory": 1
+      },
+      "estimated_cost_s": 1.0,
+      "thread_affinity": "worker-0"
+    },
+    {
+      "name": "cuda_graph_precapture",
+      "action_id": "cuda_graph_precapture",
+      "dependencies": [],
+      "required_state": [
+        "ready.compile_model",
+        "ready.kv_cache_allocate"
+      ],
+      "produced_state": [
+        "ready.cuda_graph_precapture"
+      ],
+      "resources": {
+        "worker_rpc": 1,
+        "gpu_compute": 1,
+        "gpu_memory": 1
+      },
+      "estimated_cost_s": 3.0,
+      "thread_affinity": "worker-0"
+    },
+    {
+      "name": "structured_output",
+      "action_id": "structured_output",
+      "dependencies": [],
+      "required_state": [
+        "ready.init_model"
+      ],
+      "produced_state": [
+        "ready.structured_output"
+      ],
+      "resources": {
+        "cpu": 1
+      },
+      "estimated_cost_s": 0.2,
+      "thread_affinity": null
+    },
+    {
+      "name": "mm_input_cache",
+      "action_id": "mm_input_cache",
+      "dependencies": [],
+      "required_state": [
+        "ready.init_model"
+      ],
+      "produced_state": [
+        "ready.mm_input_cache"
+      ],
+      "resources": {
+        "cpu": 1
+      },
+      "estimated_cost_s": 0.1,
+      "thread_affinity": null
+    },
+    {
+      "name": "scheduler",
+      "action_id": "scheduler",
+      "dependencies": [],
+      "required_state": [
+        "ready.structured_output",
+        "ready.kv_cache_allocate",
+        "kv_cache_config"
+      ],
+      "produced_state": [
+        "ready.scheduler"
+      ],
+      "resources": {
+        "cpu": 1
+      },
+      "estimated_cost_s": 0.2,
+      "thread_affinity": null
+    },
+    {
+      "name": "batch_queue",
+      "action_id": "batch_queue",
+      "dependencies": [],
+      "required_state": [
+        "ready.scheduler"
+      ],
+      "produced_state": [
+        "ready.batch_queue"
+      ],
+      "resources": {
+        "cpu": 1
+      },
+      "estimated_cost_s": 0.01,
+      "thread_affinity": null
+    },
+    {
+      "name": "ready",
+      "action_id": "ready",
+      "dependencies": [],
+      "required_state": [
+        "ready.cuda_graph_precapture",
+        "ready.batch_queue",
+        "ready.mm_input_cache"
+      ],
+      "produced_state": [
+        "ready.ready",
+        "assets.released"
+      ],
+      "resources": {
+        "worker_rpc": 1
+      },
+      "estimated_cost_s": 0.0,
+      "thread_affinity": "worker-0"
+    }
+  ],
+  "compatibility": {
+    "engine": "vllm-v1-deferred"
+  },
+  "initial_state": [],
+  "adapter_sha256": "268e17e4cf857cdcc77a870ebe5d4d9754809e4d354ac13c687af8d08d4832b8",
+  "sources": {
+    "vllm/v1/engine/core.py": "35d528d470dc47841d3757abbff3bde63446f57e16f2fe0f2fe259ba3cbd4421",
+    "vllm/v1/engine/declarative_startup.py": "72efae437e2cb7d4ded115683d7d1a9bb7fe5f0230bdd5195238a6283644a823",
+    "vllm/v1/worker/gpu_worker.py": "afdcb7acc32feedfaffd5fef014d66067d6cd556cdb4174f947349e0b2ea92eb",
+    "vllm/v1/worker/gpu_model_runner.py": "81bd8348a24055e299708e689789224cee9e818ac21e56a467a302921fe95bda",
+    "vllm/v1/executor/abstract.py": "0d9c9e3d4e0f3f3bf4538f6f1b67225a8b68696229e5912ab2876f35676fef46",
+    "vllm/executor/uniproc_executor.py": "ee4ba1e6cc3e762eb1373c19bb46a9462787ec6687cc017586177eadec657701",
+    "vllm/v1/executor/multiproc_executor.py": "27cadf6950fb8f722b117415844264a6e3932d6e916885b742839859495c5665",
+    "vllm/worker/worker_base.py": "0db5afa1c0abf2e29576a08349f3058d8e4c8a7a873e10e0393c5567b9f0a2f8",
+    "igniteserve_startup/runtime.py": "80b0b3e7fdf693b9de7872017d0599669b4f70570a1a3a885a5828922d306e45",
+    "igniteserve_startup/contract.py": "7f1e318c9fd275602a1868ecbd52d3e3ec50cb6cbeee14acd125dcf9461424d2",
+    "vllm/compilation/startup_assets.py": "edc04bf83298db248cec9c5e70479dec686955fbd2e37f2f0e3181d7c1e3544b",
+    "vllm/v1/worker/kv_profile_cache.py": "fbfdc2ab39520801dcca57345cd3c92c0ff57959fb6d090b3500f1b3c4cc21a3",
+    "vllm/compilation/compiler_interface.py": "68ba35323f6fa9736c88d416fe844ab9134d2896f80611327b750c9a0a7e4688",
+    "vllm/compilation/backends.py": "98c3572faf1f8618bbf6a81818084af5255be435a7a9161de17f4c02b8b5517f",
+    "vllm/compilation/cache_reuse.py": "2e1e7ccdd33ed1c81a1719a70dc4c7556cf05b5f1efd3a47389f3cd5b0ebd257",
+    "vllm/compilation/compile_manager.py": "9ce86dfe4a9d4ca087a581da95c0e589b59badf0a040ba23af8ddda875c6af1f",
+    "vllm/compilation/parallel_compile.py": "814c31861d69e690c3a1a7167399c08b6302f4d8a78c0bae41468411c4c62a8f",
+    "vllm/compilation/input_metadata.py": "75fecd459b8c47217de0b35f40bda931552fefcd427ed8aa835f9fe5793d5609",
+    "vllm/compilation/piecewise_inputs.py": "dd0f315358b1822ad1020e195d0a2c8da0897c3e71b310bc138d78363e0313ab",
+    "vllm/compilation/fx_transport.py": "644af4ca1f2bb85865440fad1f8b58daadf0c4f62a347e91bffa4f8e971126c5",
+    "vllm/compilation/input_contract.py": "444cad1ed397f960187b000f023bf001cf3823b00cbcabf158938c1eeee12856",
+    "vllm/forward_context.py": "fa4182524eefe907102e85231505bbb6f150c9c2fadfcb0ecc9d80d70b01aebc",
+    "vllm/compilation/cuda_piecewise_backend.py": "555ef6a3f442403c94dc3349589a824d28bbab0e6aadb8ca303011c72df392f0",
+    "vllm/v1/worker/cudagraph_adaptation.py": "71f7942d9e9fbb9893cb2700cc32eaf58d37e03afacba32eb0adb7747d866017",
+    "vllm/v1/worker/cudagraph_profile.py": "6f91ca15f9a65d5741acc97391ab51626f7b2be0edae7ac579f557ea75292d74",
+    "vllm/v1/worker/CudaGraphManager.py": "ad8d0b3806f59244a0e9f25e1b26bcfd2deb709a18741aadd2f416e5325cb7d3",
+    "vllm/v1/worker/HotspotAnalyzer.py": "e5ae79aa7d84a9e8910210f34961f8bafd3c51d25369489d6e1fed40084208e9",
+    "vllm/v1/worker/piecewise_graph_registry.py": "953111152705ea5fdb4e3860b6219b1c514bd6378bdf7595c1a067acdacda944",
+    "vllm/v1/worker/composite_cudagraph.py": "a97f716bba792fc69a3b8cc73f80b465acd4d8a4e958af170c4852a35e648ca9",
+    "vllm/v1/worker/concurrent_piecewise_cudagraph.py": "1a68b6a7fe55990c13c79b47aa07297ecfb53f3f60dfe69b7735dac77b80834e",
+    "vllm/v1/attention/backends/flash_attn.py": "feadd18b454ee762a38179b8cf0aefe8dbeacc3c6d5ae92ef41a63bad199bc3c"
+  },
+  "resource_capacities": {
+    "cpu": 2,
+    "worker_rpc": 2,
+    "compiler_cpu": 1,
+    "disk_io": 1,
+    "gpu_compute": 1,
+    "gpu_memory": 1,
+    "gpu_runtime": 1
+  },
+  "discovery": {
+    "entry": "EngineCore._initialize_engine_core",
+    "source_sha256": "35d528d470dc47841d3757abbff3bde63446f57e16f2fe0f2fe259ba3cbd4421",
+    "regions": 49,
+    "boundary_policy": "reviewed deferred API; conservative opaque manager actions"
+  },
+  "variants": [
+    {
+      "name": "prewarm",
+      "match": {
+        "two_phase_prewarm": true
+      }
+    },
+    {
+      "name": "standard",
+      "match": {
+        "two_phase_prewarm": false
+      },
+      "overrides": {
+        "compile_worker_prewarm": {
+          "required_state": [
+            "ready.distributed_environment"
+          ]
+        },
+        "cuda_device": {
+          "required_state": [
+            "ready.worker_construct"
+          ]
+        }
+      }
+    }
+  ],
+  "validation": {
+    "identity": "d24501d1617e46e8037b933e7d60d9d481dbcdee3a8201424919dba9f3ec45ac",
+    "review": {
+      "identity": "d24501d1617e46e8037b933e7d60d9d481dbcdee3a8201424919dba9f3ec45ac",
+      "reviewer": "Codex source review",
+      "actions": {
+        "engine_core_construct": "approved",
+        "plugins": "approved",
+        "executor_shell": "approved",
+        "worker_wrapper": "approved",
+        "worker_prepare": "approved",
+        "worker_construct": "approved",
+        "static_resource_probe": "approved",
+        "compile_worker_prewarm": "approved",
+        "cuda_device": "approved",
+        "distributed_environment": "approved",
+        "model_runner": "approved",
+        "prepare_startup_assets": "approved",
+        "usage_reporting": "approved",
+        "state_probe": "approved",
+        "init_model": "approved",
+        "stop_weight_prewarm": "approved",
+        "load_weights": "approved",
+        "compile_model": "approved",
+        "kv_profile": "approved",
+        "kv_cache_allocate": "approved",
+        "cuda_graph_precapture": "approved",
+        "structured_output": "approved",
+        "mm_input_cache": "approved",
+        "scheduler": "approved",
+        "batch_queue": "approved",
+        "ready": "approved"
+      },
+      "constraints": "approved",
+      "rationale": "Readability cleanup preserves the reviewed deferred engine interfaces. Cold startup and persistent rebind share runtime action implementations; only cold startup probes and releases prepared assets. The fused weight/compile call joins before publishing readiness; the compile marker does not compile again. State producers, dependencies, resource reservations and worker affinity are unchanged. Removed private bootstrap builders and file-based process launch helpers have no internal callers. Active Torch pool submission, FX transport constants, validated reuse and serial fallback are retained. Compiler timings are isolated by manager and shape. Real Qwen3-4B single-GPU validation covers both variants, serial/scheduled execution, cold/warm assets, global reuse and disabled weight overlap. This is not a new performance comparison or arbitrary/distributed-model proof. Logging-only review: timer measurements, exported fields, dependencies, routes, affinity, resource capacities and capture synchronization are unchanged. Main completions remain INFO, internal timings use DEBUG; the fused compile readiness marker is not reported as compilation work. Fresh serial/scheduled generated-adapter evidence is required."
+    },
+    "verification": {
+      "identity": "d24501d1617e46e8037b933e7d60d9d481dbcdee3a8201424919dba9f3ec45ac",
+      "serial_equivalence": true,
+      "scheduled_equivalence": true,
+      "variants": [
+        "prewarm",
+        "standard"
+      ],
+      "model": "/data/wenbiao/models/Qwen3-4B",
+      "scope": "single GPU EngineCore; greedy token equivalence",
+      "cases": [
+        {
+          "case": "prewarm-1",
+          "nodes": 26,
+          "overlap": false,
+          "token_match": true,
+          "compile_route": "already_compiled",
+          "kv_route": "try_cached_profile",
+          "prepared_assets": [
+            {
+              "files": 14,
+              "bytes": 550717
+            }
+          ],
+          "reused_reads": 5,
+          "global_subgraph_hits": 0,
+          "elapsed": 13.04367814026773
+        },
+        {
+          "case": "prewarm-4",
+          "nodes": 26,
+          "overlap": true,
+          "token_match": true,
+          "compile_route": "already_compiled",
+          "kv_route": "try_cached_profile",
+          "prepared_assets": [
+            {
+              "files": 14,
+              "bytes": 550717
+            }
+          ],
+          "reused_reads": 5,
+          "global_subgraph_hits": 0,
+          "elapsed": 12.679332718253136
+        },
+        {
+          "case": "standard-1",
+          "nodes": 26,
+          "overlap": false,
+          "token_match": true,
+          "compile_route": "already_compiled",
+          "kv_route": "try_cached_profile",
+          "prepared_assets": [
+            {
+              "files": 14,
+              "bytes": 550717
+            }
+          ],
+          "reused_reads": 5,
+          "global_subgraph_hits": 0,
+          "elapsed": 13.247992468066514
+        },
+        {
+          "case": "standard-4",
+          "nodes": 26,
+          "overlap": true,
+          "token_match": true,
+          "compile_route": "already_compiled",
+          "kv_route": "try_cached_profile",
+          "prepared_assets": [
+            {
+              "files": 14,
+              "bytes": 550717
+            }
+          ],
+          "reused_reads": 5,
+          "global_subgraph_hits": 0,
+          "elapsed": 12.568047907203436
+        },
+        {
+          "case": "cold",
+          "nodes": 26,
+          "overlap": true,
+          "token_match": true,
+          "compile_route": "already_compiled",
+          "kv_route": "default",
+          "prepared_assets": [
+            {
+              "files": 0,
+              "bytes": 0
+            }
+          ],
+          "reused_reads": 0,
+          "global_subgraph_hits": 0,
+          "elapsed": 38.604703564196825
+        },
+        {
+          "case": "global-reuse",
+          "nodes": 26,
+          "overlap": true,
+          "token_match": true,
+          "compile_route": "already_compiled",
+          "kv_route": "try_cached_profile",
+          "prepared_assets": [
+            {
+              "files": 14,
+              "bytes": 550717
+            }
+          ],
+          "reused_reads": 17,
+          "global_subgraph_hits": 3,
+          "elapsed": 14.437709511257708
+        },
+        {
+          "case": "no-weight-overlap",
+          "nodes": 26,
+          "overlap": true,
+          "token_match": true,
+          "compile_route": "default",
+          "kv_route": "try_cached_profile",
+          "prepared_assets": [
+            {
+              "files": 14,
+              "bytes": 550717
+            }
+          ],
+          "reused_reads": 5,
+          "global_subgraph_hits": 0,
+          "elapsed": 15.461212008725852
+        }
+      ]
+    }
+  }
+}

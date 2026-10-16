@@ -6,7 +6,6 @@ import json
 import os
 import platform
 import tempfile
-import time
 from pathlib import Path
 from types import CodeType
 from typing import Any, Optional
@@ -20,11 +19,10 @@ from vllm.compilation.startup_resources import (
     resource_file,
 )
 from vllm.logger import init_logger
+from . import startup_assets as assets
 
 logger = init_logger(__name__)
 
-_DEFAULT_STORE = resource_file("transformed_code", "transformed_code_store.json")
-_DEFAULT_ARTIFACT_DIR = resource_dir("transformed_code") / "artifacts"
 _SCHEMA = "dynamo-transformed-code-cache-v1"
 
 
@@ -33,11 +31,11 @@ def enabled() -> bool:
 
 
 def store_path() -> Path:
-    return env_path("VLLM_TRANSFORMED_CODE_CACHE_FILE", _DEFAULT_STORE)
+    return env_path("VLLM_TRANSFORMED_CODE_CACHE_FILE", resource_file("transformed_code", "legacy.json"))
 
 
 def artifact_dir() -> Path:
-    return env_path("VLLM_TRANSFORMED_CODE_CACHE_DIR", _DEFAULT_ARTIFACT_DIR)
+    return env_path("VLLM_TRANSFORMED_CODE_CACHE_DIR", resource_dir("transformed_code"))
 
 
 def _json_hash(payload: Any) -> str:
@@ -121,41 +119,14 @@ def build_key(old_code: CodeType, new_code: CodeType,
         "old_code_hash": _code_hash(old_code),
         "new_code_hash": _code_hash(new_code),
         "versions": _version_payload(),
+        "source": assets.source_hash("compilation/wrapper.py"),
     }
     if wrapper_class is not None:
         payload["wrapper_class"] = {
             "module": getattr(wrapper_class, "__module__", None),
             "qualname": getattr(wrapper_class, "__qualname__", None),
         }
-    return _json_hash(payload), payload
-
-
-def _read_store(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {"version": 1, "schema": _SCHEMA, "entries": {}}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        logger.warning("Failed to read transformed-code cache %s: %s", path,
-                       exc)
-        return {"version": 1, "schema": _SCHEMA, "entries": {}}
-    if not isinstance(data, dict):
-        return {"version": 1, "schema": _SCHEMA, "entries": {}}
-    data.setdefault("version", 1)
-    data.setdefault("schema", _SCHEMA)
-    data.setdefault("entries", {})
-    if not isinstance(data["entries"], dict):
-        data["entries"] = {}
-    return data
-
-
-def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", delete=False, dir=str(path.parent),
-                                    encoding="utf-8") as f:
-        json.dump(data, f, indent=2, sort_keys=True)
-        tmp_name = f.name
-    os.replace(tmp_name, path)
+    return assets.digest(payload), payload
 
 
 def _atomic_copy(src: Path, dst: Path) -> None:
@@ -177,8 +148,15 @@ def lookup(old_code: CodeType, new_code: CodeType, target_file: str,
     key, payload = build_key(old_code, new_code, wrapper_class)
     if not enabled():
         return False, key, payload, None
-    store = _read_store(store_path())
-    entry = store.get("entries", {}).get(key)
+    root = artifact_dir() / key
+    override = os.getenv("VLLM_TRANSFORMED_CODE_CACHE_FILE")
+    entry = assets.load("transformed_code", payload, override) if override else None
+    if not override:
+        if not assets.verify_bundle(root, payload):
+            return False, key, payload, None
+        source_path = root / "transformed_code.py"
+        _atomic_copy(source_path, Path(target_file))
+        return True, key, payload, {"transformed_code_path": str(source_path)}
     if not isinstance(entry, dict):
         return False, key, payload, None
     source = entry.get("transformed_code_path")
@@ -212,29 +190,18 @@ def save(old_code: CodeType, new_code: CodeType, transformed_file: str,
     content = source.read_bytes()
     sha256 = _bytes_hash(content)
 
-    root = artifact_dir()
+    root = artifact_dir() / key
     root.mkdir(parents=True, exist_ok=True)
-    artifact = root / f"{key}.py"
+    artifact = root / "transformed_code.py"
     if not artifact.exists() or _bytes_hash(artifact.read_bytes()) != sha256:
         with tempfile.NamedTemporaryFile("wb", delete=False, dir=str(root)) as f:
             f.write(content)
             tmp_name = f.name
         os.replace(tmp_name, artifact)
 
-    store = _read_store(path)
-    entries = store.setdefault("entries", {})
-    prev = entries.get(key) if isinstance(entries.get(key), dict) else {}
-    local_cache_dirs = list(prev.get("local_cache_dirs", []))
-    if local_cache_dir and local_cache_dir not in local_cache_dirs:
-        local_cache_dirs.append(local_cache_dir)
-    entries[key] = {
-        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "payload": payload,
-        "transformed_code_path": str(artifact),
-        "sha256": sha256,
-        "source_transformed_code_path": str(source),
-        "local_cache_dir": local_cache_dir,
-        "local_cache_dirs": local_cache_dirs,
-    }
-    _atomic_write_json(path, store)
-    return key, path
+    assets.publish_bundle(root, payload, [artifact.name])
+    override = os.getenv("VLLM_TRANSFORMED_CODE_CACHE_FILE")
+    if override:
+        assets.save("transformed_code", payload,
+                    {"transformed_code_path": str(artifact), "sha256": sha256}, override)
+    return key, root / "manifest.json"

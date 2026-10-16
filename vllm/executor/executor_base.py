@@ -69,6 +69,45 @@ class ExecutorBase(ABC):
         self._init_executor()
         self._executor_initialized = True
 
+    def bind_vllm_config(self, vllm_config: VllmConfig) -> None:
+        """Rebind configuration fields while retaining executor resources."""
+        self.vllm_config = vllm_config
+        self.model_config = vllm_config.model_config
+        self.cache_config = vllm_config.cache_config
+        self.lora_config = vllm_config.lora_config
+        self.load_config = vllm_config.load_config
+        self.parallel_config = vllm_config.parallel_config
+        self.scheduler_config = vllm_config.scheduler_config
+        self.device_config = vllm_config.device_config
+        self.speculative_config = vllm_config.speculative_config
+        self.prompt_adapter_config = vllm_config.prompt_adapter_config
+        self.observability_config = vllm_config.observability_config
+
+    def rebind_model(
+        self,
+        vllm_config: VllmConfig,
+        runtime_env: Optional[dict[str, str]] = None,
+    ) -> list[Any]:
+        """Replace model-owned state without destroying the executor shell."""
+        results = self.collective_rpc(
+            "rebind_model", args=(vllm_config, runtime_env))
+        self.bind_vllm_config(vllm_config)
+        return results
+
+    def can_rebind_weights_in_place(
+            self, vllm_config: VllmConfig) -> list[Any]:
+        """Ask every rank whether model storage can be reused safely."""
+        return self.collective_rpc(
+            "can_rebind_weights_in_place", args=(vllm_config, ))
+
+    def rebind_weights_in_place(self,
+                                vllm_config: VllmConfig) -> list[Any]:
+        """Collectively overwrite compatible weights on existing storage."""
+        results = self.collective_rpc(
+            "rebind_weights_in_place", args=(vllm_config, ))
+        self.bind_vllm_config(vllm_config)
+        return results
+
     @classmethod
     def supports_deferred_startup(cls) -> bool:
         """Whether this executor exposes independently callable init stages."""

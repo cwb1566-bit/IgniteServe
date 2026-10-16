@@ -56,8 +56,12 @@ _R = TypeVar('_R')  # Return type for collective_rpc
 import threading
 from vllm.v1.phase_profiler import timer
 from vllm.v1.metrics_recorder import recorder
-from vllm.v1.worker.HotspotAnalyzer import HotspotAnalyzer
-from vllm.v1.engine.weight_pagecache import stop_async_weight_prewarm_from_env
+from vllm.v1.engine.weight_pagecache import (
+    apply_rebind_runtime_env,
+    ensure_async_weight_prewarm,
+    export_rebind_runtime_env,
+    stop_async_weight_prewarm_from_env,
+)
 
 class EngineCore:
     """Inner loop of vLLM's Engine."""
@@ -68,20 +72,120 @@ class EngineCore:
                  log_stats: bool,
                  executor_fail_callback: Optional[Callable] = None):
 
+        requested_mode = os.environ.get(
+            "VLLM_STARTUP_DAG_MODE", "off").strip().lower()
+        if requested_mode == "execute-generated":
+            from vllm.v1.engine.declarative_startup import uses_v3
+            if uses_v3(os.environ.get("VLLM_STARTUP_CONTRACT_PATH")):
+                self._initialize_engine_core(
+                    vllm_config, executor_class, log_stats,
+                    executor_fail_callback)
+                return
+        if requested_mode == "execute-generated":
+            contract = os.environ.get("VLLM_STARTUP_CONTRACT_PATH")
+            adapter = os.environ.get("VLLM_STARTUP_ADAPTER_PATH")
+            if not contract:
+                from vllm.v1.engine.startup_analysis.generated import repository_contract
+                contract = repository_contract(vllm_config, Path(__file__))
+            if contract:
+                from vllm.v1.engine.startup_analysis.generated import (
+                    GeneratedStartupRejected,
+                    prepare_generated_startup,
+                )
+                try:
+                    generated_plan = prepare_generated_startup(
+                        self,
+                        vllm_config,
+                        {
+                            "input.vllm_config": vllm_config,
+                            "input.executor_class": executor_class,
+                            "input.log_stats": log_stats,
+                            "input.executor_fail_callback":
+                                executor_fail_callback,
+                        },
+                        contract_path=Path(contract),
+                        adapter_path=Path(adapter) if adapter else None,
+                        source_path=Path(__file__),
+                    )
+                except GeneratedStartupRejected as exc:
+                    logger.warning(
+                        "Generated startup contract rejected before execution: "
+                        "%s; falling back to the sequential startup path.", exc)
+                else:
+                    logger.info(
+                        "Executing generated startup contract: contract=%s "
+                        "adapter=%s variant=%s", generated_plan.contract_path,
+                        generated_plan.adapter_path,
+                        generated_plan.variant["name"])
+                    generated_plan.execute()
+                    logger.info("Generated startup contract completed")
+                    return
+            else:
+                logger.warning(
+                    "VLLM_STARTUP_DAG_MODE=execute-generated requires "
+                    "VLLM_STARTUP_CONTRACT_PATH; falling back to the "
+                    "sequential startup path.")
+        if requested_mode != "discover":
+            self._initialize_engine_core(
+                vllm_config, executor_class, log_stats,
+                executor_fail_callback)
+            return
+
+        from vllm.v1.engine.startup_analysis.recorder import get_startup_recorder
+        startup_recorder = get_startup_recorder()
+        if startup_recorder is None:
+            logger.warning(
+                "VLLM_STARTUP_DAG_MODE=discover requires "
+                "VLLM_STARTUP_OFFLINE_ANALYSIS_DIR; using the legacy path "
+                "without trace collection.")
+            self._initialize_engine_core(
+                vllm_config, executor_class, log_stats,
+                executor_fail_callback)
+            return
+        try:
+            initializer = self._initialize_engine_core
+            stage_map = os.environ.get("VLLM_STARTUP_DISCOVERY_STAGE_MAP")
+            if stage_map:
+                from vllm.v1.engine.startup_analysis.source_instrumentation import (
+                    build_instrumented_bound_method,
+                )
+                initializer = build_instrumented_bound_method(
+                    initializer, Path(stage_map), startup_recorder)
+            with startup_recorder.stage("engine_startup.root"):
+                initializer(
+                    vllm_config, executor_class, log_stats,
+                    executor_fail_callback)
+            from vllm.v1.engine.startup_analysis.generated import (
+                runtime_compatibility_facts,
+            )
+            startup_recorder.record(
+                "startup_compatibility",
+                facts=runtime_compatibility_facts(
+                    vllm_config, source_path=Path(__file__)))
+        finally:
+            startup_recorder.flush()
+
+    def _initialize_engine_core(
+        self,
+        vllm_config: VllmConfig,
+        executor_class: type[Executor],
+        log_stats: bool,
+        executor_fail_callback: Optional[Callable] = None,
+    ) -> None:
+
         timer.start("Total Init")
         requested_dag_mode = os.environ.get(
             "VLLM_STARTUP_DAG_MODE", "off").strip().lower()
         deferred_supported = bool(
             getattr(executor_class, "supports_deferred_startup",
                     lambda: False)())
-        if (requested_dag_mode == "execute"
-                and vllm_config.parallel_config.world_size == 1
-                and deferred_supported):
-            self._initialize_with_full_startup_dag(
+        if requested_dag_mode in {"execute", "execute-generated"} and deferred_supported:
+            if self._initialize_with_full_startup_dag(
                 vllm_config, executor_class, log_stats,
-                executor_fail_callback)
-            timer.end("Total Init")
-            return
+                executor_fail_callback):
+                timer.end("Total Init")
+                return
+            self._startup_dag_mode_override = "off"
         if requested_dag_mode == "execute" and not deferred_supported:
             logger.warning(
                 "Executor %s does not expose deferred startup stages; "
@@ -92,90 +196,10 @@ class EngineCore:
         from vllm.plugins import load_general_plugins
         load_general_plugins()
 
-        self.vllm_config = vllm_config
-        self._adaptive_cudagraph_enabled = os.environ.get(
-            "VLLM_ENABLE_ADAPTIVE_CUDAGRAPH", "").lower() in (
-                "1", "true", "yes", "on")
-        self._adaptive_cudagraph_idle_grace_s = max(
-            0.0,
-            float(
-                os.environ.get("VLLM_ADAPTIVE_CUDAGRAPH_IDLE_GRACE_MS", "10"))
-            / 1000.0)
-        self._adaptive_cudagraph_slo_capture_enabled = (
-            self._adaptive_cudagraph_enabled and os.environ.get(
-                "VLLM_ADAPTIVE_CUDAGRAPH_ENABLE_SLO_CAPTURE",
-                "1").lower() in ("1", "true", "yes", "on"))
-        self._adaptive_cudagraph_tpot_slo_ms = max(
-            0.0,
-            float(
-                os.environ.get("VLLM_ADAPTIVE_CUDAGRAPH_TPOT_SLO_MS",
-                               "100")))
-        self._adaptive_cudagraph_ttft_slo_ms = max(
-            0.0,
-            float(
-                os.environ.get("VLLM_ADAPTIVE_CUDAGRAPH_TTFT_SLO_MS",
-                               "2000")))
-        self._adaptive_cudagraph_prefill_step_estimate_ms = max(
-            0.1,
-            float(
-                os.environ.get(
-                    "VLLM_ADAPTIVE_CUDAGRAPH_PREFILL_STEP_ESTIMATE_MS",
-                    "30")))
-        self._adaptive_cudagraph_allow_waiting = os.environ.get(
-            "VLLM_ADAPTIVE_CUDAGRAPH_ALLOW_WAITING_REQUESTS",
-            "1").lower() in ("1", "true", "yes", "on")
-        self._adaptive_cudagraph_slo_guard_ms = max(
-            0.0,
-            float(
-                os.environ.get("VLLM_ADAPTIVE_CUDAGRAPH_SLO_GUARD_MS", "5")))
-        self._adaptive_cudagraph_capture_estimate_ms = max(
-            0.1,
-            float(
-                os.environ.get(
-                    "VLLM_ADAPTIVE_CUDAGRAPH_CAPTURE_CHUNK_ESTIMATE_MS",
-                    "30")))
-        self._adaptive_cudagraph_slo_interval_steps = max(
-            1,
-            int(
-                os.environ.get(
-                    "VLLM_ADAPTIVE_CUDAGRAPH_SLO_CAPTURE_INTERVAL_STEPS",
-                    "8")))
-        # Zero selects a slack-driven piece budget. A positive value keeps the
-        # fixed-budget mode used by controlled experiments.
-        self._adaptive_cudagraph_slo_pieces = max(
-            0,
-            int(
-                os.environ.get(
-                    "VLLM_ADAPTIVE_CUDAGRAPH_SLO_PIECES_PER_STEP", "0")))
-        self._adaptive_cudagraph_slo_max_pieces = max(
-            1,
-            int(
-                os.environ.get(
-                    "VLLM_ADAPTIVE_CUDAGRAPH_SLO_MAX_PIECES_PER_STEP", "64")))
-        self._adaptive_cudagraph_capture_fixed_estimate_ms = max(
-            0.1,
-            float(
-                os.environ.get(
-                    "VLLM_ADAPTIVE_CUDAGRAPH_CAPTURE_FIXED_ESTIMATE_MS",
-                    "20")))
-        self._adaptive_cudagraph_capture_safety_factor = max(
-            1.0,
-            float(
-                os.environ.get(
-                    "VLLM_ADAPTIVE_CUDAGRAPH_CAPTURE_SAFETY_FACTOR",
-                    "1.05")))
-        self._adaptive_cudagraph_recent_step_ms: deque[float] = deque(
-            maxlen=64)
-        self._adaptive_cudagraph_recent_capture_ms: deque[float] = deque(
-            maxlen=32)
-        self._adaptive_cudagraph_capture_samples: deque[
-            tuple[int, float]] = deque(maxlen=32)
-        self._adaptive_cudagraph_model_steps = 0
-        self._adaptive_cudagraph_last_slo_capture_step = 0
+        self._initialize_engine_core_fields(vllm_config, log_stats)
         logger.info("Initializing a V1 LLM engine (v%s) with config: %s",
                     VLLM_VERSION, vllm_config)
 
-        self.log_stats = log_stats
         self.model_executor = executor_class(vllm_config)
         if executor_fail_callback is not None:
             self.model_executor.register_failure_callback(
@@ -185,6 +209,8 @@ class EngineCore:
         startup_dag_mode = getattr(
             self, "_startup_dag_mode_override",
             os.environ.get("VLLM_STARTUP_DAG_MODE", "off")).strip().lower()
+        if startup_dag_mode in {"discover", "execute-generated"}:
+            startup_dag_mode = "off"
         if startup_dag_mode not in {"off", "shadow", "execute"}:
             logger.warning("Unknown VLLM_STARTUP_DAG_MODE=%s; using off",
                            startup_dag_mode)
@@ -204,32 +230,57 @@ class EngineCore:
         if startup_dag_mode == "shadow":
             self._write_startup_dag_shadow_plan()
 
-        timer.start("Init Model")
-        self.model_executor.init_model()
-        timer.end("Init Model")
-
-        stop_async_weight_prewarm_from_env("EngineCore.load_weights")
+        native_distributed_baseline = (
+            self.vllm_config.parallel_config.world_size > 1
+            and os.environ.get(
+                "VLLM_DISTRIBUTED_NATIVE_BASELINE", "").strip().lower()
+            in {"1", "true", "yes", "on"})
         self._weight_loading_error = None
-        # timer.start("Loading Weights")
-        # self.model_executor.load_weights()
-        # timer.end("Loading Weights")
+        weight_compile_sync = None
+        if native_distributed_baseline:
+            # Multiproc workers have already followed the upstream lifecycle:
+            # init_device() + load_model(). The first profile run below is the
+            # compilation trigger, matching unmodified vLLM V1 startup.
+            logger.info(
+                "Using strict native distributed startup baseline; skipping "
+                "the split init/load/compile-only stages.")
+        else:
+            timer.start("Init Model")
+            self.model_executor.init_model()
+            timer.end("Init Model")
 
-        def _load_weights_target():
-            try:
-                self.model_executor.load_weights()
-            except BaseException as exc:
-                self._weight_loading_error = exc
-                raise
-        self._weight_loading_thread = threading.Thread(
-            target=_load_weights_target,
-            daemon=True,
-            name="WeightLoadingThread"
-        )
-        self._weight_loading_thread.start()
+            stop_async_weight_prewarm_from_env("EngineCore.load_weights")
 
-        timer.start("Model Compilation")
-        self.model_executor.run_to_trigger_compile()
-        timer.end("Model Compilation")
+            # The single-rank path deliberately overlaps value-independent
+            # frontend/backend preparation with weight loading. Arm a
+            # rank-local barrier so the first compiled kernel cannot observe
+            # partially loaded parameter storage.
+            if self.vllm_config.parallel_config.world_size == 1:
+                from vllm.compilation import weight_compile_overlap
+                weight_compile_sync = weight_compile_overlap
+                weight_compile_sync.begin()
+
+            def _load_weights_target():
+                try:
+                    self.model_executor.load_weights()
+                except BaseException as exc:
+                    self._weight_loading_error = exc
+                    if weight_compile_sync is not None:
+                        weight_compile_sync.mark_weights_failed(exc)
+                    raise
+                else:
+                    if weight_compile_sync is not None:
+                        weight_compile_sync.mark_weights_ready()
+            self._weight_loading_thread = threading.Thread(
+                target=_load_weights_target,
+                daemon=True,
+                name="WeightLoadingThread"
+            )
+            self._weight_loading_thread.start()
+
+            timer.start("Model Compilation")
+            self.model_executor.run_to_trigger_compile()
+            timer.end("Model Compilation")
 
         timer.start("KV Cache Init")
         available_gpu_memory = self.model_executor.determine_available_memory()
@@ -249,6 +300,8 @@ class EngineCore:
             logger.info("Waiting for background weight loading before CUDA "
                         "graph pre-capture.")
             weight_loading_thread.join()
+        if not native_distributed_baseline and weight_compile_sync is not None:
+            weight_compile_sync.end()
         if self._weight_loading_error is not None:
             raise self._weight_loading_error
 
@@ -366,259 +419,11 @@ class EngineCore:
         self._adaptive_cudagraph_last_slo_capture_step = 0
 
     def _initialize_with_full_startup_dag(
-        self,
-        vllm_config: VllmConfig,
-        executor_class: type[Executor],
-        log_stats: bool,
-        executor_fail_callback: Optional[Callable],
-    ) -> None:
-        """Plan from EngineCore construction and expand after state probing."""
-        from vllm.compilation.startup_resources import resource_dir
-        from vllm.v1.engine.startup_orchestrator import (
-            ResourceAwareDAGExecutor,
-            StartupContext,
-            StartupCostHistory,
-            StartupState,
-            build_bootstrap_startup_dag,
-            build_engine_startup_dag,
-            combine_startup_dags,
-            write_bootstrap_plan,
-            write_plan,
-        )
-
-        root = resource_dir("startup_orchestration")
-        model_name = Path(str(vllm_config.model_config.model)).name
-        plan_path = root / "plans" / (
-            f"{model_name}_{os.getpid()}_{time.time_ns()}.json")
-        history = StartupCostHistory(root / "startup_costs.json")
-        bootstrap_state = StartupState(
-            model=str(vllm_config.model_config.model),
-            compile_mode="bootstrap",
-            kv_profile_hit=False,
-            attributes={
-                "planning_state": "before_worker_state",
-                "executor_class": (executor_class.__module__ + "." +
-                                   executor_class.__qualname__),
-                "device": str(vllm_config.device_config.device),
-                "dtype": str(vllm_config.model_config.dtype),
-                "max_model_len": vllm_config.model_config.max_model_len,
-                "max_num_batched_tokens": (
-                    vllm_config.scheduler_config.max_num_batched_tokens),
-                "max_num_seqs": vllm_config.scheduler_config.max_num_seqs,
-                "tensor_parallel_size": (
-                    vllm_config.parallel_config.tensor_parallel_size),
-                "pipeline_parallel_size": (
-                    vllm_config.parallel_config.pipeline_parallel_size),
-                "data_parallel_size": (
-                    vllm_config.parallel_config.data_parallel_size),
-            },
-        )
-
-        def timed(stage_name, action):
-            def invoke(context):
-                timer.start(stage_name)
-                try:
-                    return action(context)
-                finally:
-                    timer.end(stage_name)
-            return invoke
-
-        def construct_core(_):
-            self._initialize_engine_core_fields(vllm_config, log_stats)
-            logger.info("Initializing a V1 LLM engine (v%s) with config: %s",
-                        VLLM_VERSION, vllm_config)
-
-        def load_plugins(_):
-            from vllm.plugins import load_general_plugins
-            load_general_plugins()
-
-        def executor_shell(_):
-            self.model_executor = executor_class(vllm_config, defer_init=True)
-            if executor_fail_callback is not None:
-                self.model_executor.register_failure_callback(
-                    executor_fail_callback)
-
-        def state_probe(context):
-            state = self._collect_startup_state()
-            static_states = context.get("static_worker_states")
-            if static_states:
-                state.attributes["static_worker_states"] = static_states
-            return context.put("startup_state", state)
-
-        def static_resource_probe(context):
-            snapshots = self.collective_rpc(
-                "get_static_startup_resource_snapshot")
-            return context.put("static_worker_states", snapshots)
-
-        bootstrap_actions = {
-            "engine_core_construct": timed("EngineCore Construct",
-                                             construct_core),
-            "plugins": timed("Plugin Initialization", load_plugins),
-            "executor_shell": timed("Executor Shell", executor_shell),
-            "worker_wrapper": timed(
-                "Worker Wrapper",
-                lambda _: self.model_executor.initialize_worker_wrapper()),
-            "worker_prepare": timed(
-                "Worker Prepare", lambda _: self.model_executor.prepare_worker()),
-            "worker_construct": timed(
-                "Worker Construct",
-                lambda _: self.model_executor.construct_worker()),
-            "static_resource_probe": timed(
-                "Static Resource Probe", static_resource_probe),
-            "cuda_device": timed(
-                "CUDA Device Initialization",
-                lambda _: self.model_executor.initialize_cuda_device()),
-            "distributed_environment": timed(
-                "Distributed Environment",
-                lambda _: self.model_executor.
-                initialize_distributed_environment()),
-            "compile_worker_prewarm": timed(
-                "Compile Worker Prewarm",
-                lambda _: self.model_executor.
-                initialize_compile_worker_prewarm()),
-            "model_runner": timed(
-                "GPU ModelRunner Initialization",
-                lambda _: self.model_executor.initialize_model_runner()),
-            "usage_reporting": timed(
-                "Usage Reporting",
-                lambda _: self.model_executor.initialize_usage_reporting()),
-            "state_probe": timed("Startup State Probe", state_probe),
-        }
-        bootstrap = build_bootstrap_startup_dag(bootstrap_actions)
-        bootstrap_defaults = {
-            name: node.estimated_cost_s for name, node in bootstrap.nodes.items()
-        }
-        bootstrap = build_bootstrap_startup_dag(
-            bootstrap_actions,
-            history.estimates(bootstrap_state, bootstrap_defaults))
-        write_bootstrap_plan(plan_path, bootstrap)
-
-        bootstrap_executor = ResourceAwareDAGExecutor(
-            max_workers=max(1, int(os.environ.get(
-                "VLLM_STARTUP_DAG_BOOTSTRAP_MAX_WORKERS", "2"))),
-            resource_capacities={
-                "worker_rpc": 1,
-                "gpu_runtime": 1,
-                "gpu_memory": 1,
-                "compiler_cpu": 1,
-                "cpu": 2,
-            })
-        context = StartupContext(bootstrap_state)
-        timer.start("Startup DAG Bootstrap")
-        try:
-            bootstrap_results = bootstrap_executor.run(bootstrap, context)
-        finally:
-            timer.end("Startup DAG Bootstrap")
-        history.update(bootstrap_state, bootstrap_results)
-
-        state = context.require("startup_state")
-
-        def init_model(_):
-            self.model_executor.init_model()
-
-        def stop_weight_prewarm(_):
-            stop_async_weight_prewarm_from_env("EngineCore.load_weights")
-
-        def load_weights(_):
-            self.model_executor.load_weights()
-
-        def kv_profile(ctx):
-            return ctx.put(
-                "available_gpu_memory",
-                self.model_executor.determine_available_memory())
-
-        def kv_cache_allocate(ctx):
-            available = ctx.require("available_gpu_memory")
-            gpu_blocks, cpu_blocks, config = self._initialize_kv_caches(
-                self.vllm_config, available)
-            self.vllm_config.cache_config.num_gpu_blocks = gpu_blocks
-            self.vllm_config.cache_config.num_cpu_blocks = cpu_blocks
-            self.collective_rpc("initialize_cache",
-                                args=(gpu_blocks, cpu_blocks))
-            return ctx.put("kv_cache_config", config)
-
-        def structured_output(_):
-            self.structured_output_manager = StructuredOutputManager(
-                self.vllm_config)
-
-        def mm_input_cache(_):
-            self.mm_input_cache_server = MirroredProcessingCache(
-                self.vllm_config.model_config)
-
-        def create_scheduler(ctx):
-            scheduler_cls = self.vllm_config.scheduler_config.scheduler_cls
-            Scheduler = (resolve_obj_by_qualname(scheduler_cls)
-                         if isinstance(scheduler_cls, str) else scheduler_cls)
-            self.scheduler = Scheduler(
-                vllm_config=self.vllm_config,
-                kv_cache_config=ctx.require("kv_cache_config"),
-                structured_output_manager=self.structured_output_manager,
-                include_finished_set=(self.vllm_config.parallel_config.
-                                      data_parallel_size > 1),
-                log_stats=self.log_stats,
-            )
-
-        def create_batch_queue(_):
-            self.batch_queue_size = self.model_executor.max_concurrent_batches
-            self.batch_queue = None
-            if self.batch_queue_size > 1:
-                self.batch_queue = queue.Queue(self.batch_queue_size)
-
-        runtime_actions = {
-            "init_model": timed("Init Model", init_model),
-            "stop_weight_prewarm": stop_weight_prewarm,
-            "load_weights": timed("Loading Weights", load_weights),
-            "compile_model": timed(
-                "Model Compilation",
-                lambda _: self.model_executor.run_to_trigger_compile()),
-            "kv_profile": timed("KV Profile", kv_profile),
-            "kv_cache_allocate": timed("KV Cache Allocation",
-                                         kv_cache_allocate),
-            "cuda_graph_precapture": timed(
-                "CUDA Graph Pre-capture",
-                lambda _: self.model_executor.compile_or_warm_up_model()),
-            "structured_output": timed("Others.Structured Output",
-                                         structured_output),
-            "mm_input_cache": timed("Others.MM Input Cache", mm_input_cache),
-            "scheduler": timed("Others.Scheduler", create_scheduler),
-            "batch_queue": timed("Others.Batch Queue", create_batch_queue),
-            "ready": lambda _: None,
-        }
-        runtime = build_engine_startup_dag(state, runtime_actions)
-        runtime_defaults = {
-            name: node.estimated_cost_s for name, node in runtime.nodes.items()
-        }
-        runtime = build_engine_startup_dag(
-            state, runtime_actions, history.estimates(state, runtime_defaults))
-        expanded = combine_startup_dags(bootstrap, runtime)
-        write_plan(plan_path, state, expanded, bootstrap_results)
-
-        runtime_executor = ResourceAwareDAGExecutor(
-            # Two workers are the minimum needed to preserve the established
-            # compile-only/weight-loading overlap. A one-worker schedule would
-            # execute compile-only against unloaded parameters.
-            max_workers=max(2, int(os.environ.get(
-                "VLLM_STARTUP_DAG_MAX_WORKERS", "2"))),
-            resource_capacities={
-                "worker_rpc": 2,
-                "disk_io": 1,
-                "compiler_cpu": 1,
-                "gpu_compute": 1,
-                "gpu_memory": 1,
-                "cpu": 2,
-            })
-        timer.start("Startup DAG Runtime")
-        try:
-            runtime_results = runtime_executor.run(runtime, context)
-        finally:
-            timer.end("Startup DAG Runtime")
-        history.update(state, runtime_results)
-        all_results = {**bootstrap_results, **runtime_results}
-        write_plan(plan_path, state, expanded, all_results)
-        logger.info(
-            "Full startup DAG finished: plan=%s bootstrap_nodes=%d "
-            "runtime_nodes=%d state=%s", plan_path, len(bootstrap.nodes),
-            len(runtime.nodes), state.signature()[:16])
+        self, vllm_config, executor_class, log_stats, executor_fail_callback,
+    ) -> bool:
+        from vllm.v1.engine.declarative_startup import run
+        return run(self, vllm_config, executor_class, log_stats,
+                   executor_fail_callback)
 
     def _collect_startup_state(self):
         from vllm.v1.engine.startup_orchestrator import StartupState
@@ -647,12 +452,12 @@ class EngineCore:
             hotspot_profile_present=all_workers("hotspot_profile_present"),
             attributes={
                 "worker_states": worker_states,
-                # The compile-only dummy forward and GraphPickler read module
-                # parameters. Concurrent in-place loading is a data race even
-                # for dense FP16 models, so compilation requires the complete
-                # loader/post-load boundary for every configuration.
+                # The final dependency is selected when the executable DAG is
+                # built. Only verified in-place dense loaders may overlap the
+                # value-independent structural compile portion.
                 "compile_requires_finalized_weights": True,
-                "overlap_safe_weight_loading": False,
+                "overlap_safe_weight_loading": all_workers(
+                    "weight_compile_overlap_safe"),
                 "max_model_len": model_config.max_model_len,
                 "max_num_batched_tokens":
                     scheduler_config.max_num_batched_tokens,
@@ -665,13 +470,13 @@ class EngineCore:
         )
 
     def _startup_orchestration_paths(self) -> tuple[Path, Path]:
-        from vllm.compilation.startup_resources import resource_dir
+        from vllm.compilation.startup_resources import resource_dir, run_dir
 
-        root = resource_dir("startup_orchestration")
+        root = run_dir()
         plan_root = root / "plans"
         model_name = Path(str(self.vllm_config.model_config.model)).name
         plan_name = f"{model_name}_{os.getpid()}_{time.time_ns()}.json"
-        return root / "startup_costs.json", plan_root / plan_name
+        return resource_dir("startup_cost"), plan_root / plan_name
 
     def _write_startup_dag_shadow_plan(self) -> None:
         from vllm.v1.engine.startup_orchestrator import (
@@ -701,7 +506,9 @@ class EngineCore:
             logger.exception("Startup DAG shadow planning failed; continuing "
                              "with the legacy startup path")
 
-    def _initialize_with_startup_dag(self) -> None:
+    def _initialize_with_startup_dag(
+            self, *, allow_weight_compile_overlap: bool = True
+    ) -> dict[str, Any]:
         from vllm.v1.engine.startup_orchestrator import (
             ResourceAwareDAGExecutor,
             StartupContext,
@@ -711,100 +518,24 @@ class EngineCore:
         )
 
         state = self._collect_startup_state()
+        overlap_requested = (
+            allow_weight_compile_overlap and os.environ.get(
+                "VLLM_ENABLE_WEIGHT_COMPILE_OVERLAP", "").strip().lower()
+            in {"1", "true", "yes", "on"})
+        overlap_weight_compile = overlap_requested and bool(
+            state.attributes.get("overlap_safe_weight_loading", False))
+        state.attributes["compile_requires_finalized_weights"] = (
+            not overlap_weight_compile)
+        if overlap_requested and not overlap_weight_compile:
+            logger.warning("Weight/compile overlap was requested but the "
+                           "current model loader is not eligible; using the "
+                           "sequential startup dependency.")
         history_path, plan_path = self._startup_orchestration_paths()
         history = StartupCostHistory(history_path)
 
-        def timed(stage_name, action):
-            def invoke(context):
-                timer.start(stage_name)
-                try:
-                    return action(context)
-                finally:
-                    timer.end(stage_name)
-            return invoke
-
-        def init_model(_):
-            self.model_executor.init_model()
-
-        def stop_weight_prewarm(_):
-            stop_async_weight_prewarm_from_env("EngineCore.load_weights")
-
-        def load_weights(_):
-            self.model_executor.load_weights()
-
-        def compile_model(_):
-            self.model_executor.run_to_trigger_compile()
-
-        def kv_profile(context):
-            return context.put(
-                "available_gpu_memory",
-                self.model_executor.determine_available_memory())
-
-        def kv_cache_allocate(context):
-            available_gpu_memory = context.require("available_gpu_memory")
-            num_gpu_blocks, num_cpu_blocks, kv_cache_config = (
-                self._initialize_kv_caches(
-                    self.vllm_config, available_gpu_memory))
-            self.vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks
-            self.vllm_config.cache_config.num_cpu_blocks = num_cpu_blocks
-            self.collective_rpc("initialize_cache",
-                                args=(num_gpu_blocks, num_cpu_blocks))
-            return context.put("kv_cache_config", kv_cache_config)
-
-        def cuda_graph_precapture(_):
-            self.model_executor.compile_or_warm_up_model()
-
-        def structured_output(_):
-            self.structured_output_manager = StructuredOutputManager(
-                self.vllm_config)
-
-        def mm_input_cache(_):
-            self.mm_input_cache_server = MirroredProcessingCache(
-                self.vllm_config.model_config)
-
-        def create_scheduler(context):
-            scheduler_cls = self.vllm_config.scheduler_config.scheduler_cls
-            Scheduler = (resolve_obj_by_qualname(scheduler_cls)
-                         if isinstance(scheduler_cls, str) else scheduler_cls)
-            if Scheduler is not V1Scheduler:
-                logger.warning(
-                    "Using configured V1 scheduler class %s. This scheduler "
-                    "interface is not public and compatibility may not be "
-                    "maintained.", scheduler_cls)
-            self.scheduler = Scheduler(
-                vllm_config=self.vllm_config,
-                kv_cache_config=context.require("kv_cache_config"),
-                structured_output_manager=self.structured_output_manager,
-                include_finished_set=(
-                    self.vllm_config.parallel_config.data_parallel_size > 1),
-                log_stats=self.log_stats,
-            )
-
-        def create_batch_queue(_):
-            self.batch_queue_size = self.model_executor.max_concurrent_batches
-            self.batch_queue = None
-            if self.batch_queue_size > 1:
-                logger.info("Batch queue is enabled with size %d",
-                            self.batch_queue_size)
-                self.batch_queue = queue.Queue(self.batch_queue_size)
-
-        actions = {
-            "init_model": timed("Init Model", init_model),
-            "stop_weight_prewarm": stop_weight_prewarm,
-            "load_weights": timed("Loading Weights", load_weights),
-            "compile_model": timed("Model Compilation", compile_model),
-            "kv_profile": timed("KV Profile", kv_profile),
-            "kv_cache_allocate": timed("KV Cache Allocation",
-                                        kv_cache_allocate),
-            "cuda_graph_precapture": timed("CUDA Graph Pre-capture",
-                                            cuda_graph_precapture),
-            "structured_output": timed("Others.Structured Output",
-                                       structured_output),
-            "mm_input_cache": timed("Others.MM Input Cache", mm_input_cache),
-            "scheduler": timed("Others.Scheduler", create_scheduler),
-            "batch_queue": timed("Others.Batch Queue", create_batch_queue),
-            "ready": lambda _: None,
-        }
+        from vllm.v1.engine.vllm_startup_adapter import build_runtime_actions
+        actions = build_runtime_actions(
+            self, overlap_weight_compile=overlap_weight_compile)
         initial_dag = build_engine_startup_dag(state, actions)
         defaults = {
             name: node.estimated_cost_s
@@ -814,7 +545,7 @@ class EngineCore:
         dag = build_engine_startup_dag(state, actions, costs)
         write_plan(plan_path, state, dag)
         predicted_path, predicted_s = dag.critical_path()
-        logger.info(
+        logger.debug(
             "Startup DAG execution started: state=%s kv_profile_hit=%s "
             "critical_path=%s predicted_s=%.6f plan=%s",
             state.signature()[:16], state.kv_profile_hit,
@@ -843,13 +574,27 @@ class EngineCore:
 
         actual_path = sorted(
             results.values(), key=lambda result: result.started_at)
-        logger.info(
+        logger.debug(
             "Startup DAG execution finished: plan=%s stages=%s",
             plan_path,
             ", ".join(
                 f"{result.name}:{result.elapsed_s:.6f}s"
                 for result in actual_path),
         )
+        from vllm.v1.engine.startup_analysis.recorder import get_startup_recorder
+        startup_recorder = get_startup_recorder()
+        if startup_recorder is not None:
+            startup_recorder.flush()
+        stage_seconds = {
+            name: result.elapsed_s for name, result in results.items()
+        }
+        worker_overlap = context.get("weight_compile_worker_results", [])
+        return {
+            "stage_seconds": stage_seconds,
+            "weight_compile_worker_results": worker_overlap,
+            "weight_compile_overlap": overlap_weight_compile,
+            "plan_path": str(plan_path),
+        }
         # timer.save(
         #     filepath=f"./analysis_results/IgniteServe_tests/cold_with_caches/total_init_{model_name}_IgniteServe_with_caches.json",
         #     csv_filepath=f"./analysis_results/IgniteServe_tests/cold_with_caches/timing_summary_{model_name}_IgniteServe_with_caches.csv"
@@ -1021,9 +766,18 @@ class EngineCore:
         return engine_core_outputs, scheduled_batch
 
     def shutdown(self):
-        HotspotAnalyzer.check_and_export(True)
         self.structured_output_manager.clear_backend()
         if self.model_executor:
+            try:
+                self.model_executor.collective_rpc("shutdown_cudagraphs")
+            except Exception:
+                logger.exception("Failed to drain CUDA graph capture worker")
+            try:
+                self.model_executor.collective_rpc(
+                    "export_cudagraph_hotspot_profile")
+            except Exception:
+                logger.exception(
+                    "Failed to export distributed CUDA graph hotspots")
             if self._adaptive_cudagraph_enabled:
                 try:
                     self.model_executor.collective_rpc(
@@ -1055,6 +809,252 @@ class EngineCore:
 
     def wake_up(self, tags: Optional[list[str]] = None):
         self.model_executor.wake_up(tags)
+
+    @staticmethod
+    def _persistent_shell_topology_signature(
+            vllm_config: VllmConfig) -> tuple:
+        parallel = vllm_config.parallel_config
+        return (
+            parallel.world_size,
+            parallel.tensor_parallel_size,
+            parallel.pipeline_parallel_size,
+            parallel.data_parallel_size,
+            str(parallel.distributed_executor_backend),
+            str(parallel.worker_cls),
+        )
+
+    def _rebind_weights_in_place(
+            self, vllm_config: VllmConfig,
+            eligibility: list[dict[str, Any]]) -> dict[str, Any]:
+        """Replace compatible weights while retaining KV and CUDA graphs."""
+        started = time.perf_counter()
+        old_model = str(self.vllm_config.model_config.model)
+        new_model = str(vllm_config.model_config.model)
+        kv_cache_config = self.scheduler.kv_cache_config
+        vllm_config.cache_config.num_gpu_blocks = (
+            self.vllm_config.cache_config.num_gpu_blocks)
+        vllm_config.cache_config.num_cpu_blocks = (
+            self.vllm_config.cache_config.num_cpu_blocks)
+
+        self.structured_output_manager.clear_backend()
+        self.scheduler.shutdown()
+        self.batch_queue = None
+        self.mm_input_cache_server.reset()
+
+        load_started = time.perf_counter()
+        worker_results = self.model_executor.rebind_weights_in_place(
+            vllm_config)
+        load_weights_s = time.perf_counter() - load_started
+        self.vllm_config = vllm_config
+
+        runtime_started = time.perf_counter()
+        self.structured_output_manager = StructuredOutputManager(vllm_config)
+        self.mm_input_cache_server = MirroredProcessingCache(
+            vllm_config.model_config)
+        scheduler_cls = vllm_config.scheduler_config.scheduler_cls
+        Scheduler = (resolve_obj_by_qualname(scheduler_cls)
+                     if isinstance(scheduler_cls, str) else scheduler_cls)
+        self.scheduler = Scheduler(
+            vllm_config=vllm_config,
+            kv_cache_config=kv_cache_config,
+            structured_output_manager=self.structured_output_manager,
+            include_finished_set=(
+                vllm_config.parallel_config.data_parallel_size > 1),
+            log_stats=self.log_stats,
+        )
+        self.batch_queue_size = self.model_executor.max_concurrent_batches
+        self.batch_queue = None
+        if self.batch_queue_size > 1:
+            self.batch_queue = queue.Queue(self.batch_queue_size)
+        if hasattr(self, "step_fn"):
+            self.step_fn = (self.step if self.batch_queue is None else
+                            self.step_with_batch_queue)
+        runtime_s = time.perf_counter() - runtime_started
+
+        result = {
+            "mode": "inplace_weights",
+            "old_model": old_model,
+            "new_model": new_model,
+            "elapsed_s": time.perf_counter() - started,
+            "shell_reset_s": 0.0,
+            "init_model_s": 0.0,
+            "load_weights_s": load_weights_s,
+            "compile_s": 0.0,
+            "kv_s": 0.0,
+            "cuda_graph_s": 0.0,
+            "runtime_s": runtime_s,
+            "eligibility": eligibility,
+            "worker_results": worker_results,
+        }
+        logger.info("In-place EngineCore rebind finished: %s", result)
+        return result
+
+    def rebind_model(self, vllm_config: VllmConfig) -> dict[str, Any]:
+        """Rebuild model-owned runtime while retaining the executor shell."""
+        if os.environ.get(
+                "VLLM_ENABLE_PERSISTENT_ENGINE_SHELL", "0").lower() not in {
+                    "1", "true", "yes", "on"
+                }:
+            raise RuntimeError(
+                "Persistent engine shell rebind is disabled. Set "
+                "VLLM_ENABLE_PERSISTENT_ENGINE_SHELL=1 to enable it.")
+        if self.scheduler.has_unfinished_requests():
+            raise RuntimeError("Cannot rebind while requests are unfinished")
+        if self.batch_queue is not None and not self.batch_queue.empty():
+            raise RuntimeError("Cannot rebind with pipeline batches in flight")
+        old_signature = self._persistent_shell_topology_signature(
+            self.vllm_config)
+        new_signature = self._persistent_shell_topology_signature(vllm_config)
+        if old_signature != new_signature:
+            raise ValueError(
+                "Persistent shell topology mismatch: "
+                f"old={old_signature!r} new={new_signature!r}")
+
+        started = time.perf_counter()
+        self._persistent_shell_rebind_epoch = getattr(
+            self, "_persistent_shell_rebind_epoch", 0) + 1
+        rebind_epoch = self._persistent_shell_rebind_epoch
+        old_model = str(self.vllm_config.model_config.model)
+        new_model = str(vllm_config.model_config.model)
+        logger.info("Persistent engine shell rebind started: %s -> %s",
+                    old_model, new_model)
+
+        rebind_mode = os.environ.get(
+            "VLLM_PERSISTENT_SHELL_REBIND_MODE", "general").strip().lower()
+        if rebind_mode not in {"general", "auto", "inplace"}:
+            raise ValueError(
+                "VLLM_PERSISTENT_SHELL_REBIND_MODE must be one of "
+                "general, auto, or inplace")
+        if ("VLLM_PERSISTENT_SHELL_REBIND_MODE" not in os.environ
+                and os.environ.get(
+                    "VLLM_PERSISTENT_SHELL_INPLACE_WEIGHTS",
+                    "0").lower() in {"1", "true", "yes", "on"}):
+            logger.warning(
+                "VLLM_PERSISTENT_SHELL_INPLACE_WEIGHTS is deprecated and "
+                "does not override the safe default general rebind. Set "
+                "VLLM_PERSISTENT_SHELL_REBIND_MODE=inplace explicitly to "
+                "retain model-owned state.")
+        if rebind_mode in {"auto", "inplace"}:
+            eligibility = self.model_executor.can_rebind_weights_in_place(
+                vllm_config)
+            if eligibility and all(
+                    item.get("eligible", False) for item in eligibility):
+                return self._rebind_weights_in_place(
+                    vllm_config, eligibility)
+            if rebind_mode == "inplace":
+                raise ValueError(
+                    "Explicit in-place rebind is not safe for this model: "
+                    f"{eligibility}")
+            logger.warning(
+                "Automatic in-place weight rebind is not safe; "
+                "falling back to general shell rebind: %s", eligibility)
+
+        prewarm_started = time.perf_counter()
+        ensure_async_weight_prewarm(new_model)
+        prewarm_launch_s = time.perf_counter() - prewarm_started
+
+        self.structured_output_manager.clear_backend()
+        self.scheduler.shutdown()
+        self.batch_queue = None
+        self.mm_input_cache_server.reset()
+
+        try:
+            reset_started = time.perf_counter()
+            worker_results = self.model_executor.rebind_model(
+                vllm_config, export_rebind_runtime_env())
+            reset_s = time.perf_counter() - reset_started
+            self.vllm_config = vllm_config
+
+            # Structural compile-only can overlap an in-place dense-weight
+            # loader because model construction has already fixed parameter
+            # metadata and real launches/autotune wait for finalized weights.
+            # Keep this opt-in until loaders that replace/repack parameters
+            # have an explicit capability check.
+            allow_rebind_compile_overlap = os.environ.get(
+                "VLLM_PERSISTENT_SHELL_ALLOW_WEIGHT_COMPILE_OVERLAP",
+                "0").strip().lower() in {"1", "true", "yes", "on"}
+            dag_result = self._initialize_with_startup_dag(
+                allow_weight_compile_overlap=allow_rebind_compile_overlap)
+            stages = dag_result["stage_seconds"]
+            worker_overlap = dag_result["weight_compile_worker_results"]
+            if worker_overlap:
+                load_weights_s = max(
+                    float(item.get("load_weights_s", 0.0))
+                    for item in worker_overlap)
+                compile_s = max(
+                    float(item.get("compile_s", 0.0))
+                    for item in worker_overlap)
+            else:
+                load_weights_s = float(stages.get("load_weights", 0.0))
+                compile_s = float(stages.get("compile_model", 0.0))
+            init_model_s = float(stages.get("init_model", 0.0))
+            weight_compile_overlap_s = (
+                float(stages.get("load_weights", 0.0))
+                if dag_result["weight_compile_overlap"] else 0.0)
+            weight_compile_critical_s = (
+                weight_compile_overlap_s
+                if dag_result["weight_compile_overlap"] else
+                load_weights_s + compile_s)
+            kv_s = (float(stages.get("kv_profile", 0.0))
+                    + float(stages.get("kv_cache_allocate", 0.0)))
+            cuda_graph_s = float(
+                stages.get("cuda_graph_precapture", 0.0))
+            runtime_s = sum(float(stages.get(name, 0.0)) for name in (
+                "structured_output", "mm_input_cache", "scheduler",
+                "batch_queue"))
+            runtime_validation = self.model_executor.collective_rpc(
+                "get_general_rebind_runtime_state")
+            if hasattr(self, "step_fn"):
+                self.step_fn = (self.step if self.batch_queue is None else
+                                self.step_with_batch_queue)
+        except BaseException:
+            stop_async_weight_prewarm_from_env(
+                "persistent general rebind failure")
+            raise
+
+        elapsed = time.perf_counter() - started
+        result = {
+            "mode": "general_shell_rebind",
+            "rebind_epoch": rebind_epoch,
+            "old_model": old_model,
+            "new_model": new_model,
+            "elapsed_s": elapsed,
+            "shell_reset_s": reset_s,
+            "weight_prewarm_launch_s": prewarm_launch_s,
+            "init_model_s": init_model_s,
+            "load_weights_s": load_weights_s,
+            "compile_s": compile_s,
+            "weight_compile_overlap_s": weight_compile_overlap_s,
+            "weight_compile_critical_s": weight_compile_critical_s,
+            "kv_s": kv_s,
+            "cuda_graph_s": cuda_graph_s,
+            "runtime_s": runtime_s,
+            "worker_results": worker_results,
+            "runtime_validation": runtime_validation,
+            "startup_dag": dag_result,
+        }
+        logger.info("Persistent engine shell rebind finished: %s", result)
+        return result
+
+    def rebind_model_serialized(self, payload: bytes) -> dict[str, Any]:
+        """Decode the explicitly serialized local shell-control message."""
+        import cloudpickle
+
+        decoded = cloudpickle.loads(payload)
+        if isinstance(decoded, dict) and decoded.get(
+                "schema") == "vllm-persistent-shell-rebind-v1":
+            vllm_config = decoded.get("vllm_config")
+            runtime_env = decoded.get("runtime_env", {})
+            if not isinstance(runtime_env, dict):
+                raise TypeError("Persistent shell runtime_env must be a dict")
+            apply_rebind_runtime_env(runtime_env)
+        else:
+            # Backward compatibility for local tools using the old payload.
+            vllm_config = decoded
+        if not isinstance(vllm_config, VllmConfig):
+            raise TypeError(
+                "Persistent shell payload did not contain a VllmConfig")
+        return self.rebind_model(vllm_config)
 
     def is_sleeping(self) -> bool:
         return self.model_executor.is_sleeping
@@ -1366,7 +1366,7 @@ class EngineCoreProc(EngineCore):
                     # stream-capture window.
                     if not self.input_queue.empty():
                         continue
-                    if self.model_executor.capture_pending_cudagraphs() > 0:
+                    if self._capture_pending_cudagraphs_coordinated() > 0:
                         # Re-enter the grace period before capturing another
                         # graph, so a request can preempt the maintenance queue.
                         continue
@@ -1401,6 +1401,51 @@ class EngineCoreProc(EngineCore):
             self._maybe_capture_cudagraph_with_slo_slack()
 
         return model_executed
+
+    def _capture_pending_cudagraphs_coordinated(
+        self,
+        max_pieces_per_shape: Optional[int] = None,
+        deadline_ms: Optional[float] = None,
+        selected_shape: Optional[int] = None,
+    ) -> int:
+        """Capture only a shape that is pending on every distributed rank."""
+        world_size = self.vllm_config.parallel_config.world_size
+        if world_size == 1:
+            return self.model_executor.capture_pending_cudagraphs(
+                max_pieces_per_shape=max_pieces_per_shape,
+                deadline_ms=deadline_ms,
+                selected_shape=selected_shape,
+            )
+        if os.environ.get(
+                "VLLM_ENABLE_DISTRIBUTED_ADAPTIVE_CUDAGRAPH",
+                "").strip().lower() not in ("1", "true", "yes", "on"):
+            return 0
+
+        pending_by_rank = self.model_executor.collective_rpc(
+            "get_pending_cudagraph_shapes")
+        if len(pending_by_rank) != world_size or not pending_by_rank:
+            return 0
+        common = set(int(shape) for shape in pending_by_rank[0])
+        for pending in pending_by_rank[1:]:
+            common.intersection_update(int(shape) for shape in pending)
+        if selected_shape is not None:
+            candidate = int(selected_shape)
+            if candidate not in common:
+                return 0
+        else:
+            candidate = next(
+                (int(shape) for shape in pending_by_rank[0]
+                 if int(shape) in common), None)
+            if candidate is None:
+                return 0
+        logger.info(
+            "Distributed adaptive CUDA graph capture admitted: "
+            "shape=%d world_size=%d", candidate, world_size)
+        return self.model_executor.capture_pending_cudagraphs(
+            max_pieces_per_shape=max_pieces_per_shape,
+            deadline_ms=deadline_ms,
+            selected_shape=candidate,
+        )
 
     @staticmethod
     def _percentile(values: deque[float], quantile: float) -> float:
@@ -1469,7 +1514,11 @@ class EngineCoreProc(EngineCore):
         if not self._adaptive_cudagraph_slo_capture_enabled:
             return
         parallel_config = self.vllm_config.parallel_config
-        if (parallel_config.world_size != 1
+        distributed_capture_enabled = os.environ.get(
+            "VLLM_ENABLE_DISTRIBUTED_ADAPTIVE_CUDAGRAPH",
+            "").strip().lower() in ("1", "true", "yes", "on")
+        if ((parallel_config.world_size != 1
+             and not distributed_capture_enabled)
                 or parallel_config.data_parallel_size != 1
                 or self.batch_queue is not None):
             return
@@ -1561,8 +1610,15 @@ class EngineCoreProc(EngineCore):
             ),
         )
         plans = [plan for plan in capture_plans if plan is not None]
-        if not plans:
+        if not plans or len(plans) != parallel_config.world_size:
             return
+        plan_shapes = {int(plan["shape"]) for plan in plans}
+        if len(plan_shapes) != 1:
+            logger.warning(
+                "Skipping distributed CUDA graph capture because rank "
+                "plans disagree: shapes=%s", sorted(plan_shapes))
+            return
+        selected_shape = next(iter(plan_shapes))
         piece_budget = min(int(plan["piece_budget"]) for plan in plans)
         predicted_capture_ms = max(
             float(plan["predicted_ms"]) for plan in plans)
@@ -1578,9 +1634,10 @@ class EngineCoreProc(EngineCore):
             self._adaptive_cudagraph_model_steps)
         capture_started = time.perf_counter()
         try:
-            progressed = self.model_executor.capture_pending_cudagraphs(
+            progressed = self._capture_pending_cudagraphs_coordinated(
                 max_pieces_per_shape=piece_budget,
                 deadline_ms=slack_ms,
+                selected_shape=selected_shape,
             )
         except Exception:
             logger.exception(
@@ -1592,7 +1649,7 @@ class EngineCoreProc(EngineCore):
                 capture_elapsed_ms)
             self._adaptive_cudagraph_capture_samples.append(
                 (piece_budget, capture_elapsed_ms))
-            logger.info(
+            logger.debug(
                 "Adaptive CUDA graph SLO capture progressed: workers=%d "
                 "piece_budget=%d predicted_ms=%.3f elapsed_ms=%.3f "
                 "admitted_slack_ms=%.3f "

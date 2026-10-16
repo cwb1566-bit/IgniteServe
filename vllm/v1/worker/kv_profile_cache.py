@@ -1,8 +1,5 @@
-import hashlib
-import json
 import os
 import platform
-import tempfile
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -16,10 +13,9 @@ from vllm.compilation.startup_resources import (
     resource_file,
 )
 from vllm.logger import init_logger
+from vllm.compilation import startup_assets as assets
 
 logger = init_logger(__name__)
-
-_DEFAULT_STORE = resource_file("kv_profile", "kv_profile_store.json")
 
 
 def enabled() -> bool:
@@ -27,12 +23,7 @@ def enabled() -> bool:
 
 
 def store_path() -> Path:
-    return env_path("VLLM_KV_PROFILE_CACHE_FILE", _DEFAULT_STORE)
-
-
-def _json_hash(payload: Any) -> str:
-    text = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return env_path("VLLM_KV_PROFILE_CACHE_FILE", resource_file("kv_profile", "legacy.json"))
 
 
 def _canonical_model_identity(model_path: Any) -> Any:
@@ -72,7 +63,7 @@ def build_key(vllm_config: Any, device: torch.device) -> tuple[str, dict[str, An
 
     from vllm import __version__ as vllm_version
     payload = {
-        "schema": "kv-profile-cache-v2",
+        "schema": "kv-profile-cache-v3",
         # Do not use vllm_config.compute_hash() or envs.compute_hash() here:
         # they may include compile-cache-path or graph-cache factors that do
         # not affect the peak memory measured by profile_run(). The key below
@@ -83,7 +74,18 @@ def build_key(vllm_config: Any, device: torch.device) -> tuple[str, dict[str, An
             getattr(model_config, "model", None)),
         "dtype": str(getattr(model_config, "dtype", None)),
         "max_model_len": getattr(model_config, "max_model_len", None),
-        "served_model_name": str(getattr(model_config, "served_model_name", None)),
+        "source": assets.source_hash("v1/worker", "model_executor/models",
+                                     "model_executor/layers", "compilation"),
+        "model_config": getattr(getattr(model_config, "hf_config", None),
+                                "to_dict", lambda: {})(),
+        "lora": str(getattr(vllm_config, "lora_config", None)),
+        "speculative": str(getattr(vllm_config, "speculative_config", None)),
+        "rank": getattr(parallel_config, "rank", None),
+        "dp_rank": getattr(parallel_config, "data_parallel_rank", None),
+        "partition": os.getenv("VLLM_PP_LAYER_PARTITION"),
+        "allocator": os.getenv("PYTORCH_CUDA_ALLOC_CONF", ""),
+        "attention_backend": os.getenv("VLLM_ATTENTION_BACKEND", ""),
+        "persistent": os.getenv("VLLM_ENABLE_PERSISTENT_ENGINE_SHELL", "0"),
         "load_format": str(getattr(getattr(vllm_config, "load_config", None),
                                    "load_format", None)),
         "trust_remote_code": getattr(model_config, "trust_remote_code", None),
@@ -114,40 +116,43 @@ def build_key(vllm_config: Any, device: torch.device) -> tuple[str, dict[str, An
         "full_cuda_graph": getattr(compilation_config, "full_cuda_graph", None),
         "device": _device_fingerprint(device),
     }
-    return _json_hash(payload), payload
+    payload["model_config"].pop("_name_or_path", None)
+    return assets.digest(payload), payload
 
 
-def _read_store(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {"version": 1, "entries": {}}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        logger.warning("Failed to read KV profile cache %s: %s", path, exc)
-        return {"version": 1, "entries": {}}
-    if not isinstance(data, dict):
-        return {"version": 1, "entries": {}}
-    data.setdefault("version", 1)
-    data.setdefault("entries", {})
-    if not isinstance(data["entries"], dict):
-        data["entries"] = {}
-    return data
-
-
-def lookup(vllm_config: Any, device: torch.device) -> tuple[Optional[int], str, dict[str, Any], Optional[dict[str, Any]]]:
+def lookup(vllm_config: Any, device: torch.device, *,
+           weights_memory: Optional[int] = None,
+           requested_memory: Optional[int] = None,
+           init_snapshot: Any = None) -> tuple[Optional[int], str, dict[str, Any], Optional[dict[str, Any]]]:
     if not enabled():
         key, payload = build_key(vllm_config, device)
         return None, key, payload, None
     key, payload = build_key(vllm_config, device)
-    path = store_path()
-    data = _read_store(path)
-    entry = data.get("entries", {}).get(key)
+    entry = assets.load("kv_profile", payload, os.getenv("VLLM_KV_PROFILE_CACHE_FILE"))
     if not isinstance(entry, dict):
         return None, key, payload, None
-    value = entry.get("available_kv_cache_memory")
     try:
-        value = int(value)
-    except (TypeError, ValueError):
+        profile = entry["profile"]
+        peak = profile["torch_peak_increase"]
+        non_torch = profile["non_torch_increase"]
+        saved_weights = entry["weights_memory"]
+        if (not entry.get("complete") or weights_memory != saved_weights
+                or requested_memory is None or init_snapshot is None
+                or any(type(v) is not int or v < 0
+                       for v in (peak, non_torch, saved_weights))):
+            return None, key, payload, entry
+        # Reuse measured increments, never a historical remaining budget.
+        value = int(requested_memory) - weights_memory - peak - non_torch
+        free, total = torch.cuda.mem_get_info(device)
+        reserved = torch.cuda.memory_reserved(device)
+        allocated = torch.cuda.memory_allocated(device)
+        reclaimable = max(0, reserved - allocated)
+        margin = 64 * 1024 * 1024
+        if (total != payload["device"]["gpu_total_memory"]
+                or init_snapshot.free_memory < requested_memory
+                or value + peak + non_torch + margin > free + reclaimable):
+            return None, key, payload, entry
+    except (TypeError, ValueError, KeyError):
         return None, key, payload, None
     if value <= 0:
         return None, key, payload, None
@@ -155,17 +160,19 @@ def lookup(vllm_config: Any, device: torch.device) -> tuple[Optional[int], str, 
 
 
 def save(vllm_config: Any, device: torch.device, available_kv_cache_memory: int,
-         *, profile_result: Any = None) -> tuple[str, Path]:
+         *, profile_result: Any = None,
+         weights_memory: Optional[int] = None) -> tuple[str, Path]:
     key, payload = build_key(vllm_config, device)
-    path = store_path()
+    override = os.getenv("VLLM_KV_PROFILE_CACHE_FILE")
+    path = Path(override) if override else assets.asset_path("kv_profile", payload)
     if not enabled():
         return key, path
-    path.parent.mkdir(parents=True, exist_ok=True)
-    data = _read_store(path)
     entry = {
         "available_kv_cache_memory": int(available_kv_cache_memory),
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "payload": payload,
+        "weights_memory": weights_memory,
+        "complete": profile_result is not None and weights_memory is not None,
     }
     if profile_result is not None:
         entry["profile"] = {
@@ -176,10 +183,5 @@ def save(vllm_config: Any, device: torch.device, available_kv_cache_memory: int,
             "non_torch_increase": int(getattr(profile_result,
                                               "non_torch_increase", 0)),
         }
-    data.setdefault("entries", {})[key] = entry
-    with tempfile.NamedTemporaryFile("w", delete=False,
-                                    dir=str(path.parent), encoding="utf-8") as f:
-        json.dump(data, f, indent=2, sort_keys=True)
-        tmp_name = f.name
-    os.replace(tmp_name, path)
+    assets.save("kv_profile", payload, entry, override)
     return key, path

@@ -4,8 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 from typing import Any, Optional
-
-import torch.fx as fx
+from functools import lru_cache
 
 from vllm.compilation.startup_resources import enabled_by_master
 
@@ -27,7 +26,7 @@ def canonical_model_identity(model_path: str) -> str:
         return model_path
     resolved = path.resolve()
     config_path = resolved / "config.json"
-    identity: dict[str, Any] = {"basename": resolved.name}
+    identity: dict[str, Any] = {}
     if config_path.exists():
         try:
             config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -92,70 +91,182 @@ def normalized_model_paths(vllm_config):
     yield normalized_config
 
 
-def _normalize_fx_target(target: Any) -> str:
-    import re
-    return re.sub(r"\d+", "#", str(target))
+@lru_cache(maxsize=1)
+def _native_code_identity():
+    from . import startup_assets as assets
+    package = Path(__file__).resolve().parents[1]
+    return {p.name: assets.file_hash(p) for p in sorted(package.glob("*.so"))}
 
 
-def graph_semantic_key(graph: fx.GraphModule,
-                       runtime_shape: Optional[int],
-                       compiler_name: str) -> str:
-    nodes = []
+def compilation_context(vllm_config, compiler, options) -> dict:
+    """Conservative backend identity, independent of model name/cache path."""
+    import torch
+    from torch._inductor import config
+    from . import startup_assets as assets
+
+    def stable(value):
+        if value is None or type(value) in (str, int, float, bool):
+            return value
+        if isinstance(value, (tuple, list)):
+            return [stable(v) for v in value]
+        if isinstance(value, dict) and all(isinstance(k, str) for k in value):
+            return {k: stable(v) for k, v in value.items()}
+        # vLLM's post-grad pass manager exposes its compilation identity.
+        from .inductor_pass import InductorPass
+        from .pass_manager import PostGradPassManager
+        if isinstance(value, (InductorPass, PostGradPassManager)):
+            return {"pass": type(value).__qualname__, "uuid": str(value.uuid())}
+        raise ValueError(f"unsupported compilation option: {type(value)}")
+
+    parallel = vllm_config.parallel_config
+    return {"backend": compiler.name, "torch": torch.__version__,
+            "cuda": torch.version.cuda,
+            "compiler": compiler.compute_hash(vllm_config),
+            "source": assets.source_hash("compilation", "model_executor"),
+            "native_code": _native_code_identity(),
+            "runtime": {"grad": torch.is_grad_enabled(),
+                        "inference": torch.is_inference_mode_enabled(),
+                        "deterministic": torch.are_deterministic_algorithms_enabled(),
+                        "default_dtype": str(torch.get_default_dtype()),
+                        "matmul_precision": torch.get_float32_matmul_precision(),
+                        "fp16_reduction": torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction,
+                        "bf16_reduction": torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
+                        "cudnn": {name: getattr(torch.backends.cudnn, name) for name in
+                                  ("enabled", "benchmark", "deterministic", "allow_tf32")},
+                        "autocast": torch.is_autocast_enabled(),
+                        "autocast_dtype": str(torch.get_autocast_dtype("cuda"))},
+            "options": stable(options),
+            "inductor": stable(config.save_config_portable()),
+            "parallel": {"config": parallel.compute_hash(),
+                         "rank": parallel.rank,
+                         "dp_rank": parallel.data_parallel_rank,
+                         "disable_custom_all_reduce": getattr(parallel, "disable_custom_all_reduce", None),
+                         "enable_eplb": getattr(parallel, "enable_eplb", None)}}
+
+
+def subgraph_identity(graph, example_inputs, context, runtime_shape=None):
+    """Only graphs with current output evidence are globally reusable."""
+    import torch
+    from .input_contract import graph_key, input_contract
+    if (context.get("options", {}).get("freezing")
+            or context.get("inductor", {}).get("freezing")):
+        raise ValueError("frozen tensor values require content-aware keys")
+    from torch.utils._pytree import tree_leaves
     for node in graph.graph.nodes:
-        nodes.append({
-            "op": node.op,
-            "target": _normalize_fx_target(node.target),
-            "args": _normalize_fx_target(node.args),
-            "kwargs": _normalize_fx_target(node.kwargs),
-        })
-    payload = {
-        "runtime_shape": runtime_shape,
-        "compiler": compiler_name,
-        "nodes": nodes,
-    }
-    return _hash_json(payload)
+        for argument in tree_leaves((node.args, node.kwargs)):
+            if (isinstance(argument, torch._ops.OpOverload)
+                    and argument.namespace not in {"aten", "prims", "_C", "_C_cache_ops", "vllm"}):
+                raise ValueError("unversioned nested custom operator")
+        if node.op != "call_function":
+            continue
+        target = node.target
+        if isinstance(target, torch._ops.OpOverload):
+            # Unknown registered kernels may depend on unversioned native code.
+            if target.namespace not in {"aten", "prims", "_C", "_C_cache_ops", "vllm"}:
+                raise ValueError("unversioned custom operator")
+        else:
+            module = getattr(target, "__module__", "")
+            if not (module.startswith("torch.") or module in {"torch", "operator", "_operator", "builtins"}):
+                raise ValueError("unversioned Python code dependency")
+    output = next(n for n in graph.graph.nodes if n.op == "output")
+
+    def evidence(node):
+        if "val" in node.meta:
+            return node.meta["val"]
+        return node.meta["example_value"]
+
+    outputs = torch.fx.node.map_arg(output.args[0], evidence)
+    placeholders = tuple(evidence(n) for n in graph.graph.nodes if n.op == "placeholder")
+    if (input_contract(tuple(example_inputs), canonical=True)["value"]
+            != input_contract(placeholders, canonical=True)["value"]):
+        raise ValueError("current graph evidence does not match compilation inputs")
+    return {"schema": "subgraph-v1", "ir": graph_key(graph),
+            # Restored FakeTensors have fresh storages. Use the *current graph's*
+            # matched placeholder/output evidence to retain output-view aliases.
+            "signature": input_contract((placeholders, outputs),
+                                        canonical=True)["value"],
+            "context": context, "runtime_shape": runtime_shape}
 
 
 class GlobalSubgraphCache:
-    """Small JSON index from semantic subgraph keys to compiler handles."""
+    """Per-key descriptors; compiler-owned payloads remain at their source.
+
+    The repository is trusted executable input, not a sandbox. Checksums detect
+    corruption, not malicious replacement. Missing dependencies are cache misses.
+    """
 
     def __init__(self, local_cache_dir: str, prefix: str = "") -> None:
-        local = Path(local_cache_dir).resolve()
+        from .startup_resources import resource_root, resource_dir
+        self.root = resource_root()
+        self.path = resource_dir("compile") / "subgraphs"
+        self.local = Path(local_cache_dir).resolve()
+        self.base = self.local
+        for _ in Path(prefix).parts:
+            self.base = self.base.parent
+
+    def lookup(self, identity) -> Optional[dict]:
+        from . import startup_assets as assets
+        if identity is None:
+            return None
+        data = assets.read_record(self.path / f"{assets.digest(identity)}.json",
+                                  identity)
+        return data if self.verify_entry(self.root, data) else None
+
+    @staticmethod
+    def verify_entry(root, data) -> bool:
+        from . import startup_assets as assets
+        if not isinstance(data, dict):
+            return False
         try:
-            compile_root = local.parents[2]
-        except IndexError:
-            compile_root = local.parent
-        self.path = compile_root / "global_subgraph_cache.json"
-        self.prefix = prefix
-        self.data: dict[str, Any] = self._load()
+            files = data["files"]
+            if not files or not data["candidates"]:
+                return False
+            if data["handle"][1] not in files:
+                return False
+            if not all(name in files for name in data["candidates"]):
+                return False
+            if not all(assets.file_hash(assets.member(root, name)) == sha
+                       for name, sha in files.items()):
+                return False
+            return True
+        except (OSError, ValueError, KeyError, TypeError, AttributeError, IndexError):
+            return False
 
-    def _load(self) -> dict[str, Any]:
-        if not self.path.exists():
-            return {}
+    def register(self, identity, handle, graph_index, runtime_shape) -> bool:
+        from . import startup_assets as assets
+        if identity is None:
+            return False
         try:
-            return json.loads(self.path.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
+            # Do not publish handles outside the configured repository, or
+            # compiler variants without the supported FX-cache representation.
+            code = Path(handle[1]).resolve()
+            key = handle[0]
+            if not isinstance(key, str) or not key.isalnum():
+                return False
+            fx_root = self.base / "inductor_cache" / "fxgraph" / key[1:3] / key
+            candidates = sorted(p for p in fx_root.iterdir() if p.is_file())
+            if not candidates:
+                return False
+            relative = lambda p: p.relative_to(self.root).as_posix()
+            files = {relative(p): assets.file_hash(assets.member(self.root, relative(p)))
+                     for p in [code, *candidates]}
+            data = {"handle": [key, relative(code)], "files": files,
+                    "candidates": [relative(p) for p in candidates],
+                    "source_cache_dir": relative(self.local),
+                    "graph_index": graph_index, "runtime_shape": runtime_shape}
+            path = self.path / f"{assets.digest(identity)}.json"
+            with assets.locked(path):
+                assets.write_json(path, assets.record(identity, data))
+            return True
+        except (OSError, ValueError, TypeError, IndexError):
+            return False
 
-    def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = self.path.with_suffix(".tmp")
-        tmp_path.write_text(json.dumps(self.data, indent=2, sort_keys=True), encoding="utf-8")
-        os.replace(tmp_path, self.path)
-
-    def lookup(self, key: str) -> Optional[Any]:
-        entry = self.data.get(key)
-        if isinstance(entry, dict):
-            return entry.get("handle")
-        return None
-
-    def register(self, key: str, handle: Any, source_cache_dir: str,
-                 graph_index: int, runtime_shape: Optional[int]) -> None:
-        self.data[key] = {
-            "handle": handle,
-            "source_cache_dir": source_cache_dir,
-            "graph_index": graph_index,
-            "runtime_shape": runtime_shape,
-            "prefix": self.prefix,
-        }
-        self.save()
+    def payloads(self, entry):
+        """Verify the exact bytes used by the loader, not just earlier stats."""
+        import hashlib
+        from . import startup_assets as assets
+        for name in entry["candidates"]:
+            data = assets.member(self.root, name).read_bytes()
+            if hashlib.sha256(data).hexdigest() != entry["files"][name]:
+                raise ValueError("compiled subgraph changed during load")
+            yield data

@@ -1,8 +1,6 @@
-import hashlib
 import json
 import os
 import platform
-import tempfile
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -15,11 +13,11 @@ from vllm.compilation.startup_resources import (
     resource_file,
 )
 from vllm.logger import init_logger
+from vllm.compilation import startup_assets as assets
 
 logger = init_logger(__name__)
 
-_DEFAULT_STORE = resource_file("best_config", "best_config_store.json")
-_SCHEMA = "triton-best-config-cache-v1"
+_SCHEMA = "triton-best-config-cache-v2"
 
 
 def enabled() -> bool:
@@ -27,12 +25,7 @@ def enabled() -> bool:
 
 
 def store_path() -> Path:
-    return env_path("VLLM_BEST_CONFIG_CACHE_FILE", _DEFAULT_STORE)
-
-
-def _json_hash(payload: Any) -> str:
-    text = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return env_path("VLLM_BEST_CONFIG_CACHE_FILE", resource_file("best_config", "legacy.json"))
 
 
 def _version_payload() -> dict[str, Any]:
@@ -72,45 +65,44 @@ def _device_payload(device: Optional[torch.device] = None) -> dict[str, Any]:
 
 
 def build_key(kernel_name: str, configs_hash: str,
-              device: Optional[torch.device] = None) -> tuple[str, dict[str, Any]]:
+              device: Optional[torch.device] = None, *,
+              signature: Optional[dict] = None) -> tuple[str, dict[str, Any]]:
     payload = {
         "schema": _SCHEMA,
         "kernel_name": kernel_name,
         "configs_hash": configs_hash,
         "device": _device_payload(device),
         "versions": _version_payload(),
+        "signature": signature,
+        "source": assets.source_hash("v1/worker/startup_compile.py"),
     }
-    return _json_hash(payload), payload
+    return assets.digest(payload), payload
 
 
-def _read_store(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {"version": 1, "schema": _SCHEMA, "entries": {}}
+def tuning_signature(tuner: Any, args: tuple, kwargs: dict) -> Optional[dict]:
+    def describe(value):
+        if isinstance(value, torch.Tensor):
+            return {"shape": list(value.shape), "stride": list(value.stride()),
+                    "dtype": str(value.dtype), "layout": str(value.layout),
+                    "offset": value.storage_offset(), "device": value.device.type}
+        if value is None or type(value) in (str, int, float, bool):
+            return value
+        raise ValueError("unsupported tuner input")
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        logger.warning("Failed to read best-config cache %s: %s", path, exc)
-        return {"version": 1, "schema": _SCHEMA, "entries": {}}
-    if not isinstance(data, dict):
-        return {"version": 1, "schema": _SCHEMA, "entries": {}}
-    data.setdefault("version", 1)
-    data.setdefault("schema", _SCHEMA)
-    data.setdefault("entries", {})
-    if not isinstance(data["entries"], dict):
-        data["entries"] = {}
-    return data
-
-
-def _atomic_write(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", delete=False, dir=str(path.parent),
-                                    encoding="utf-8") as f:
-        json.dump(data, f, indent=2, sort_keys=True)
-        tmp_name = f.name
-    os.replace(tmp_name, path)
+        fn = tuner.fn
+        key = getattr(fn, "cache_key", None)
+        if not isinstance(key, str) or not key:
+            return None
+        return {"kernel": key, "args": [describe(v) for v in args],
+                "kwargs": {k: describe(v) for k, v in kwargs.items()}}
+    except (ValueError, AttributeError, TypeError):
+        return None
 
 
 def load_best_config_data(entry: dict[str, Any]) -> Optional[dict[str, Any]]:
+    data = entry.get("best_config")
+    if isinstance(data, dict):
+        return data
     best_path = entry.get("best_config_path")
     if best_path:
         try:
@@ -127,12 +119,12 @@ def load_best_config_data(entry: dict[str, Any]) -> Optional[dict[str, Any]]:
 
 
 def lookup(kernel_name: str, configs_hash: str,
-           device: Optional[torch.device] = None) -> tuple[Optional[dict[str, Any]], str, dict[str, Any], Optional[dict[str, Any]]]:
-    key, payload = build_key(kernel_name, configs_hash, device)
-    if not enabled():
+           device: Optional[torch.device] = None, *,
+           signature: Optional[dict] = None) -> tuple[Optional[dict[str, Any]], str, dict[str, Any], Optional[dict[str, Any]]]:
+    key, payload = build_key(kernel_name, configs_hash, device, signature=signature)
+    if not enabled() or signature is None:
         return None, key, payload, None
-    store = _read_store(store_path())
-    entry = store.get("entries", {}).get(key)
+    entry = assets.load("best_config", payload, os.getenv("VLLM_BEST_CONFIG_CACHE_FILE"))
     if not isinstance(entry, dict):
         return None, key, payload, None
     best = load_best_config_data(entry)
@@ -144,21 +136,21 @@ def lookup(kernel_name: str, configs_hash: str,
 def save(kernel_name: str, configs_hash: str, best_config_path: str,
          best_config: dict[str, Any], *, source_root: Optional[str] = None,
          source_model: Optional[str] = None,
-         device: Optional[torch.device] = None) -> tuple[str, Path]:
-    key, payload = build_key(kernel_name, configs_hash, device)
-    path = store_path()
-    if not enabled():
+         device: Optional[torch.device] = None,
+         signature: Optional[dict] = None) -> tuple[str, Path]:
+    key, payload = build_key(kernel_name, configs_hash, device, signature=signature)
+    override = os.getenv("VLLM_BEST_CONFIG_CACHE_FILE")
+    path = Path(override) if override else assets.asset_path("best_config", payload)
+    if not enabled() or signature is None:
         return key, path
-    store = _read_store(path)
-    entries = store.setdefault("entries", {})
-    prev = entries.get(key) if isinstance(entries.get(key), dict) else {}
+    prev = assets.load("best_config", payload, override) or {}
     source_models = list(prev.get("source_models", []))
     if source_model and source_model not in source_models:
         source_models.append(source_model)
     source_roots = list(prev.get("source_roots", []))
     if source_root and source_root not in source_roots:
         source_roots.append(source_root)
-    entries[key] = {
+    entry = {
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "payload": payload,
         "best_config_path": str(best_config_path),
@@ -168,7 +160,7 @@ def save(kernel_name: str, configs_hash: str, best_config_path: str,
         "source_roots": source_roots,
         "source_models": source_models,
     }
-    _atomic_write(path, store)
+    assets.save("best_config", payload, entry, override)
     return key, path
 
 
@@ -205,6 +197,7 @@ def ingest_best_config_tree(root: str, *, source_model: Optional[str] = None,
         "saved": 0,
         "missing_configs_hash": 0,
         "missing_kernel_name": 0,
+        "missing_signature": 0,
         "errors": 0,
     }
     if not rootp.exists():
@@ -221,6 +214,10 @@ def ingest_best_config_tree(root: str, *, source_model: Optional[str] = None,
         if not configs_hash:
             stats["missing_configs_hash"] += 1
             continue
+        signature = data.get("signature")
+        if not signature:
+            stats["missing_signature"] += 1
+            continue
         kernel_names = extract_kernel_names_from_dir(best_path.parent)
         if not kernel_names:
             stats["missing_kernel_name"] += 1
@@ -228,6 +225,6 @@ def ingest_best_config_tree(root: str, *, source_model: Optional[str] = None,
         for kernel_name in kernel_names:
             save(kernel_name, configs_hash, str(best_path), data,
                  source_root=str(rootp), source_model=source_model,
-                 device=device)
+                 device=device, signature=signature)
             stats["saved"] += 1
     return stats

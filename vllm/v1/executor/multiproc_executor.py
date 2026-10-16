@@ -40,6 +40,110 @@ logger = init_logger(__name__)
 
 class MultiprocExecutor(Executor):
 
+    @classmethod
+    def supports_deferred_startup(cls) -> bool:
+        """Enable the experimental distributed startup DAG explicitly.
+
+        The default multiprocessing startup remains byte-for-byte compatible
+        with vLLM.  The staged lifecycle is only selected by EngineCore when
+        this flag is set, so the validated single-GPU path is unaffected.
+        """
+        return os.environ.get(
+            "VLLM_ENABLE_DISTRIBUTED_STARTUP_DAG", ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _initialize_executor_shell(self) -> None:
+        if getattr(self, "_multiproc_shell_initialized", False):
+            return
+        self._finalizer = weakref.finalize(self, self.shutdown)
+        self.is_failed = False
+        self.shutdown_event = threading.Event()
+        self.failure_callback: Optional[FailureCallback] = getattr(
+            self, "failure_callback", None)
+        self.io_thread_pool: Optional[ThreadPoolExecutor] = None
+
+        self.world_size = self.parallel_config.world_size
+        tensor_parallel_size = self.parallel_config.tensor_parallel_size
+        pp_parallel_size = self.parallel_config.pipeline_parallel_size
+        assert self.world_size == tensor_parallel_size * pp_parallel_size, (
+            f"world_size ({self.world_size}) must be equal to the "
+            f"tensor_parallel_size ({tensor_parallel_size}) x pipeline"
+            f"_parallel_size ({pp_parallel_size}). ")
+
+        set_multiprocessing_worker_envs(self.parallel_config)
+        self.distributed_init_method = get_distributed_init_method(
+            "127.0.0.1", get_open_port())
+        max_chunk_bytes = envs.VLLM_MQ_MAX_CHUNK_BYTES_MB * 1024 * 1024
+        self.rpc_broadcast_mq = MessageQueue(
+            self.world_size, self.world_size,
+            max_chunk_bytes=max_chunk_bytes)
+        self.scheduler_output_handle = self.rpc_broadcast_mq.export_handle()
+        self._multiproc_shell_initialized = True
+
+    def initialize_worker_wrapper(self) -> None:
+        """Create parent-side RPC resources without starting CUDA workers."""
+        self._initialize_executor_shell()
+
+    def prepare_worker(self) -> None:
+        """Spawn workers and resolve classes without touching CUDA."""
+        self.initialize_worker_wrapper()
+        if getattr(self, "workers", None):
+            return
+        unready_workers: list[UnreadyWorkerProcHandle] = []
+        success = False
+        try:
+            for rank in range(self.world_size):
+                unready_workers.append(WorkerProc.make_worker_process(
+                    vllm_config=self.vllm_config,
+                    local_rank=rank,
+                    rank=rank,
+                    distributed_init_method=self.distributed_init_method,
+                    input_shm_handle=self.scheduler_output_handle,
+                    deferred_startup=True,
+                ))
+            self.workers = WorkerProc.wait_for_ready(unready_workers)
+            self.rpc_broadcast_mq.wait_until_ready()
+            for worker in self.workers:
+                worker.worker_response_mq.wait_until_ready()
+            self.start_worker_monitor()
+            if self.max_concurrent_batches > 1:
+                self.io_thread_pool = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="mp_exec_io")
+            self.output_rank = self._get_output_rank()
+            success = True
+        finally:
+            if not success:
+                self._ensure_worker_termination(
+                    [worker.proc for worker in unready_workers])
+
+    def construct_worker(self) -> None:
+        self.prepare_worker()
+        if getattr(self, "_workers_constructed", False):
+            return
+        self.collective_rpc("construct_worker")
+        self._workers_constructed = True
+
+    def initialize_cuda_device(self) -> None:
+        self.construct_worker()
+        self.collective_rpc("initialize_cuda_device")
+
+    def initialize_distributed_environment(self) -> None:
+        self.construct_worker()
+        self.collective_rpc("initialize_distributed_environment")
+
+    def initialize_compile_worker_prewarm(self) -> None:
+        self.construct_worker()
+        self.collective_rpc("initialize_compile_worker_prewarm")
+
+    def initialize_model_runner(self) -> None:
+        self.construct_worker()
+        self.collective_rpc("initialize_model_runner")
+
+    def initialize_usage_reporting(self) -> None:
+        self.construct_worker()
+        self.collective_rpc("initialize_usage_reporting")
+        self._executor_initialized = True
+
     def _init_executor(self) -> None:
         # Call self.shutdown at exit to clean up
         # and ensure workers will be terminated.
@@ -146,7 +250,7 @@ class MultiprocExecutor(Executor):
                name="MultiprocWorkerMonitor").start()
 
     def register_failure_callback(self, callback: FailureCallback):
-        if self.is_failed:
+        if getattr(self, "is_failed", False):
             callback()
         else:
             self.failure_callback = callback
@@ -323,6 +427,7 @@ class WorkerProc:
         rank: int,
         distributed_init_method: str,
         input_shm_handle: Handle,
+        deferred_startup: bool = False,
     ):
         self.rank = rank
         wrapper = WorkerWrapperBase(vllm_config=vllm_config, rpc_rank=rank)
@@ -339,7 +444,10 @@ class WorkerProc:
             "distributed_init_method": distributed_init_method,
             "is_driver_worker": is_driver_worker,
         }
-        wrapper.init_worker(all_kwargs)
+        if deferred_startup:
+            wrapper.prepare_worker(all_kwargs)
+        else:
+            wrapper.init_worker(all_kwargs)
         self.worker = wrapper
 
         pid = os.getpid()
@@ -348,14 +456,16 @@ class WorkerProc:
 
         # Initialize MessageQueue for receiving SchedulerOutput
         self.rpc_broadcast_mq = MessageQueue.create_from_handle(
-            input_shm_handle, self.worker.rank)
+            input_shm_handle, rank)
 
         # Initializes a message queue for sending the model output
         self.worker_response_mq = MessageQueue(1, 1)
 
-        # Initialize device and loads weights
-        self.worker.init_device()
-        self.worker.load_model()
+        # The experimental startup DAG calls these as explicit collective
+        # stages after every rank has entered the RPC loop.
+        if not deferred_startup:
+            self.worker.init_device()
+            self.worker.load_model()
 
     @staticmethod
     def make_worker_process(
@@ -364,6 +474,7 @@ class WorkerProc:
             rank: int,
             distributed_init_method: str,
             input_shm_handle,  # Receive SchedulerOutput
+            deferred_startup: bool = False,
     ) -> UnreadyWorkerProcHandle:
         context = get_mp_context()
         # (reader, writer)
@@ -375,6 +486,7 @@ class WorkerProc:
             "rank": rank,
             "distributed_init_method": distributed_init_method,
             "input_shm_handle": input_shm_handle,
+            "deferred_startup": deferred_startup,
             "ready_pipe": (reader, writer),
         }
         # Run EngineCore busy loop in background process.

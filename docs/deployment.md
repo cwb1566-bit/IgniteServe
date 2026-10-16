@@ -1,131 +1,189 @@
-# Deployment Guide
+# Deployment and Startup
 
-## Prerequisites
+[Overview](../README.md) | [Architecture and source guide](architecture.md)
 
-- Linux x86-64
-- NVIDIA driver compatible with CUDA 12.6
-- Python 3.10
-- Local or mounted Hugging Face model weights
-- Enough host memory for the selected model's page cache
-- `vmtouch` is optional; IgniteServe has a Python file-read fallback
+## Runtime and Build
 
-The project does not include model weights, generated startup resources, a modified PyTorch source tree, or private benchmark logs.
+The validated research environment uses Linux, Python 3.10, NVIDIA A100,
+CUDA 12.6 and a modified Torch 2.7 runtime. Full-FX process compilation and
+concurrent capture require that runtime; its sources/wheels are **not bundled
+here**. A public release needs a corresponding pinned runtime distribution or
+patch set. A version string alone is not a compatibility check.
 
-## Build From Source
+After installing the compatible runtime into an isolated environment, build
+this checkout against it:
 
 ```bash
-git clone git@github.com:cwb1566-bit/IgniteServe.git
-cd IgniteServe
-
-conda create -n igniteserve python=3.10 -y
-conda activate igniteserve
-
-pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 \
-  --index-url https://download.pytorch.org/whl/cu126
 python use_existing_torch.py
-pip install -r requirements/build.txt
-pip install -r requirements/cuda.txt
-pip install -e . --no-build-isolation
+python -m pip install -r requirements/build.txt -r requirements/cuda.txt
+python -m pip install -e . --no-build-isolation
 ```
 
-Verify the active source tree:
+`use_existing_torch.py` edits dependency files to remove Torch pins; it does not
+install the patched runtime. Review that build-local diff rather than committing
+it unintentionally. Check which source/runtime the environment actually imports:
 
 ```bash
-python -c 'import vllm, pathlib; print(vllm.__version__); print(pathlib.Path(vllm.__file__).resolve())'
+PYTHONPATH="$PWD" python - <<'PY'
+import inspect
+import torch
+import vllm
+from torch._inductor.compile_fx_full_subproc import FullFxCompilePool
+print('vLLM:', vllm.__file__)
+print('Torch:', torch.__version__, torch.__file__)
+for name in ('prewarm_workers', 'all_prewarm_futures', 'submit',
+             'begin_shutdown_pool', 'wait_for_shutdown_pool', 'shutdown_pool'):
+    assert hasattr(FullFxCompilePool, name), name
+required = {'synchronize_before_capture', 'collect_before_capture',
+            'empty_cache_before_capture', 'manage_default_generator'}
+assert required <= set(inspect.signature(torch.cuda.graph).parameters)
+PY
 ```
 
-The printed package path should point into the IgniteServe checkout. Setting `PYTHONPATH=$PWD` is recommended for research runs because it removes ambiguity when another vLLM installation exists in the same environment.
+This is an API check, not a replacement for model tests. Stock Torch can disable
+or fall back from unsupported paths; that is not evidence of process-parallel
+compilation or concurrent capture. `PYTHONPATH` does not replace native extension
+builds. For a second local checkout with identical native sources and a compatible
+ABI, `python tools/prepare_local_runtime.py --from-checkout /path/to/built-checkout`
+can attach existing artifacts. It is a development helper, not a release installer.
 
-## Single-Model API Server
+## Launch and Request
+
+Run from the repository root on an available GPU:
 
 ```bash
-export IGNITESERVE_ROOT=/opt/IgniteServe
-export MODEL_PATH=/models/Qwen3-4B
-export RESOURCE_ROOT=/var/lib/igniteserve/startup_resources
-
-mkdir -p "$RESOURCE_ROOT/cuda_graph_hotspots/qwen3-4b-default"
-
-CUDA_VISIBLE_DEVICES=0 \
-PYTHONPATH=$IGNITESERVE_ROOT \
-VLLM_USE_V1=1 \
-VLLM_ENABLE_STARTUP_OPTIMIZATIONS=1 \
-VLLM_STARTUP_COMPILE_MODE=s4 \
-VLLM_STARTUP_DAG_MODE=execute \
-VLLM_ENABLE_WEIGHT_PAGECACHE_PREWARM=1 \
-VLLM_ENABLE_ADAPTIVE_CUDAGRAPH=1 \
-VLLM_STARTUP_RESOURCE_ROOT=$RESOURCE_ROOT \
-VLLM_CUDA_GRAPH_HOTSPOT_DIR=$RESOURCE_ROOT/cuda_graph_hotspots/qwen3-4b-default \
+PYTHONPATH="$PWD" CUDA_VISIBLE_DEVICES=0 VLLM_ENABLE_STARTUP_OPTIMIZATIONS=1 \
 python -m vllm.entrypoints.openai.api_server \
-  --host 0.0.0.0 \
-  --port 8000 \
-  --model "$MODEL_PATH" \
-  --served-model-name Qwen3-4B \
-  --max-model-len 2048 \
-  --gpu-memory-utilization 0.9
+  --model /path/to/Qwen3-4B --served-model-name model \
+  --max-model-len 2048 --host 127.0.0.1 --port 8000
 ```
-
-For a first correctness check, omit `VLLM_ENABLE_ADAPTIVE_CUDAGRAPH` until an offline hotspot profile has been generated. The engine safely falls back on resource misses, but the first run is expected to perform compilation, profiling, and profile generation work.
-
-## On-Demand Multi-Model Server
-
-`multi_model_server.py` starts an engine when a request names a model that is not resident, keeps it alive for a configurable interval, and evicts the least recently used model when the resident limit is reached.
 
 ```bash
-export IGNITESERVE_ROOT=/opt/IgniteServe
-export RESOURCE_ROOT=/var/lib/igniteserve/startup_resources
-
-CUDA_VISIBLE_DEVICES=0 \
-PYTHONPATH=$IGNITESERVE_ROOT \
-VLLM_USE_V1=1 \
-VLLM_ENABLE_STARTUP_OPTIMIZATIONS=1 \
-VLLM_STARTUP_COMPILE_MODE=s4 \
-VLLM_STARTUP_DAG_MODE=execute \
-VLLM_ENABLE_WEIGHT_PAGECACHE_PREWARM=1 \
-VLLM_STARTUP_RESOURCE_ROOT=$RESOURCE_ROOT \
-VLLM_CUDA_GRAPH_HOTSPOT_ROOT=$RESOURCE_ROOT/cuda_graph_hotspots \
-python multi_model_server.py \
-  --host 0.0.0.0 \
-  --port 8089 \
-  --keepalive 30 \
-  --max-concurrent-models 1 \
-  --model /models/Qwen3-4B \
-  --max-model-len 2048 \
-  --gpu-memory-utilization 0.9
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"model","messages":[{"role":"user","content":"Hello"}],"max_tokens":32}'
 ```
 
-The `--model` value initializes the shared vLLM argument template. Requests may name another local model path. Do not expose this research endpoint to untrusted clients: model names are interpreted as loadable model identifiers.
+On the existing development server, the environment is `vllm_concurrent_capture`
+and the checkout is `/home/wenbiao/data/igniteserve_declarative_startup`
+(a view of `/data/wenbiao/igniteserve_declarative_startup`). These paths are not
+requirements for other machines. Do not expose the unauthenticated test endpoint
+to untrusted networks.
 
-## Workload-Specific Hotspot Profiles
+## Defaults and Overrides
 
-Benchmark clients send a logical key in `X-VLLM-HOTSPOT-KEY`. The server appends settings that only it knows:
+The master switch fills **unset** settings at `VllmConfig` construction:
 
-```text
-<client-key>__len<max-model-len>__gpuutil<gpu-memory-utilization>
+| Function | Setting supplied by the master switch |
+|---|---|
+| Packaged declarative DAG | `VLLM_STARTUP_DAG_MODE=execute` |
+| Frontend reuse / process compilation | `VLLM_ENABLE_DYNAMO_FRONTEND_CACHE=1`, `VLLM_ENABLE_SUBPROCESS_COMPILE=1` |
+| Adaptive graph management | `VLLM_ENABLE_ADAPTIVE_CUDAGRAPH=1` |
+| Fast compiler shutdown | `TORCHINDUCTOR_FULL_FX_FAST_SHUTDOWN=1` |
+| Weight prefetch / compile overlap | `VLLM_ENABLE_WEIGHT_SHARD_PIPELINE=1`, `VLLM_ENABLE_WEIGHT_COMPILE_OVERLAP=1` |
+| Compiler prewarm | `VLLM_ENABLE_TWO_PHASE_FULL_FX_PREWARM=1`, `VLLM_ENABLE_ASYNC_COMPILER_HASH_PREWARM=1` |
+
+S4 semantic caches, structural/global reuse, page-cache prewarm and cost-gated
+splitting also consult the master policy at their consumers. Explicit overrides
+win, including `=0`; a dirty shell can therefore change the minimal command's
+behavior. Configuration is process-wide: use fresh processes for different
+profiles. Turning the master off alone does not erase prior overrides, select
+pristine upstream vLLM, or necessarily disable adaptive capture.
+
+| Common override | Purpose |
+|---|---|
+| `VLLM_STARTUP_RESOURCE_ROOT=/path` | Read and write assets in that repository. |
+| `VLLM_STARTUP_DAG_MODE=off` | Use this fork's sequential startup; not an upstream performance baseline. |
+| `VLLM_STARTUP_CONTRACT_PATH`, `VLLM_STARTUP_ADAPTER_PATH` | Select a trusted declaration/adapter pair; both are validated. |
+| `VLLM_STARTUP_DAG_MAX_WORKERS=1` | Serialize DAG scheduling for diagnosis, not internal compiler/capture work. |
+| `TORCHINDUCTOR_FULL_FX_COMPILE_WORKERS` | Size of the modified Torch compiler pool. |
+| `VLLM_ENABLE_ADAPTIVE_CUDAGRAPH=0` | Keep static precapture/replay, disable adaptive on-demand capture. |
+| `VLLM_ENABLE_CONCURRENT_PIECEWISE_CUDAGRAPH_CAPTURE=0` | Disable background capture; safe-point maintenance may still run. |
+| `VLLM_ENABLE_CUDAGRAPH_SPLIT=0` | Disable splitting without disabling ordinary graph replay. |
+| `VLLM_CUDA_GRAPH_HOTSPOT_DIR=/path` | Select a compatible frozen workload profile. |
+| `VLLM_ADAPTIVE_CUDAGRAPH_MIN_HITS` | Online trigger threshold, default `1`. |
+| `VLLM_CUDA_GRAPH_PRECAPTURE_MIN_HITS` | Offline hit filter, default `10`. |
+| `VLLM_FORCE_FULL_CUDAGRAPH_PRECAPTURE=1` | Select all registered capture shapes. |
+| `VLLM_LOGGING_LEVEL=DEBUG` | Expand internal timings and progress. Default INFO keeps major summaries. |
+
+V1 is already the default for supported configurations. `VLLM_WORKER_MULTIPROC_METHOD`
+selects worker creation (`spawn` versus other methods), not compile parallelism.
+The retired `VLLM_DISABLE_DYNAMIC_CUDA_GRAPH_CAPTURE`,
+`VLLM_DYNAMIC_CUDA_GRAPH_CAPTURE_NO_REPLAY` and `VLLM_CUDAGRAPH_SPLIT_SHADOW`
+flags no longer control the unified path; do not use them to disable capture.
+
+## Assets and Hotspots
+
+Root precedence is `VLLM_STARTUP_RESOURCE_ROOT`, then
+`$XDG_CONFIG_HOME/igniteserve/config.json` (normally `~/.config/igniteserve/config.json`),
+then `$XDG_CACHE_HOME/igniteserve/assets` (normally `~/.cache/igniteserve/assets`).
+To choose `~/igniteserve_assets` when the environment variable is absent, set:
+
+```json
+{"startup_resource_root": "~/igniteserve_assets"}
 ```
 
-For example, the client key:
+That user setting already exists on the development server; it is not a hardcoded
+default on every machine. Stage-specific explicit file/directory settings can
+override the common root and are outside its export boundary. See the
+[asset layout and validation table](architecture.md#asset-repository).
 
-```text
-Qwen3-4B__rps__hot__req2000__rps10
+```bash
+python tools/startup_assets.py inspect
+python tools/startup_assets.py verify
+python tools/startup_assets.py export /tmp/startup_assets.zip
+VLLM_STARTUP_RESOURCE_ROOT=/new/assets \
+  python tools/startup_assets.py import /tmp/startup_assets.zip --trusted
+python tools/startup_assets.py publish-hotspots /path/to/offline_profile
 ```
 
-becomes:
+Import only trusted executable assets. Export excludes `runs/`; checksums detect
+corruption, not malicious code. Move the complete repository: global subgraph
+entries may reference producer launch directories. Hardware/compiler/guard
+validation still applies after migration. Weights, page cache, KV tensors and
+live CUDA graphs are not serialized startup assets.
 
-```text
-$VLLM_CUDA_GRAPH_HOTSPOT_ROOT/
-  Qwen3-4B__rps__hot__req2000__rps10__len2048__gpuutil0.9/
-    cuda_graph_hits.csv
-    cuda_graph_hits_top99.csv
-    cuda_graph_profile_manifest.json
-    cuda_graph_cost_table.csv          # when cost profiling is enabled
+Offline hotspot selection takes the cumulative 99% prefix, filters hits below
+10 and unsupported shapes, then adds registered shapes 1 and 2. It does not
+refill the discarded tail. An explicit Top-K override changes that selection.
+Missing/incompatible profiles use the full registered set, not a guaranteed
+67 shapes on every configuration. Publish a compatible offline profile and use
+the returned directory as `VLLM_CUDA_GRAPH_HOTSPOT_DIR`. Online observations go
+to `runs/` without mutating the frozen profile; separate workloads/RPS explicitly.
+
+## Validation and Debugging
+
+INFO retains major completion times, reuse/fallback evidence and graph publication;
+DEBUG retains fine-grained timing. JSON timing records and DAG cost measurements
+are unaffected by verbosity. The fused weight/compile time includes both tasks;
+a later readiness marker is not a second compilation. KV Profile includes any
+reported `deferred_shutdown_wait_s`; do not call that entire interval cache I/O.
+Overlapping and nested phase times must not be added as total latency.
+
+Run focused CPU tests with the repository's test dependencies installed:
+
+```bash
+PYTHONPATH=. python -m pytest --noconftest -q tests/startup_runtime \
+  tests/compile/test_startup_defaults.py tests/compile/test_startup_assets.py \
+  tests/compile/test_compile_organization.py tests/compile/test_hierarchical_reuse.py \
+  tests/compile/test_frontend_metadata.py tests/v1/worker/test_cuda_graph_manager.py \
+  tests/v1/worker/test_cudagraph_adaptation.py tests/v1/worker/test_composite_cudagraph.py
 ```
 
-The same root controls both export and later loading. Stop the server gracefully so the analyzer can export final CSVs.
+For GPU acceptance, use `tools/validate_startup_contract.py` as described in the
+[contract workflow](architecture.md#offline-contract-workflow).
+`tools/verify_cudagraph_manager.py --model MODEL --gpu ID --phase mixed`
+checks warmup, publication, actual replay and eager-reference outputs; repeat
+with `prefill` and `decode`. `tools/profile_cudagraph_adaptation.py` calibrates
+qualified cost rows. `tools/verify_online_composite.py --model MODEL --gpu ID
+--batch 7 --publish` validates/publishes a measured composite profile; a fresh
+`--policy-only --costs PATH` run verifies policy admission without synthetic
+prices. Consult each tool's `--help`; choose an idle GPU and verify release after
+testing. Forced-admission tests are correctness tests, not performance evidence.
 
-## Operational Checks
-
-- Logs containing `[TIMER]` report the seven EngineCore phases and `Total Init`.
-- A startup resource hit is always accompanied by a hit/compatibility log; do not infer a hit only from elapsed time.
-- Use one resource root per trust domain and protect it from untrusted writes. Generated Python/compiler artifacts are executable inputs.
-- Keep `VLLM_STARTUP_DAG_MODE=off` for distributed configurations until that topology has been validated.
-- Keep `VLLM_ENABLE_SUBPROCESS_COMPILE` unset unless the external PyTorch integration is installed and tested.
+Use actual token IDs, matched requests/arrival schedules and isolated cache
+states for benchmarks. Separate cold composite construction from warm replay
+and exclude startup when measuring steady-state latency. A successful request
+or enabled switch does not prove background capture/reuse occurred. The packaged
+contract's `validation` records its bounded acceptance, not universal model or
+performance guarantees. Historical experiment tables are not current baselines.

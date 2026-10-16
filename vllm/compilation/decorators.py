@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import cProfile
 import inspect
+import os
+from pathlib import Path
+import time
 from typing import Callable, Optional, TypeVar, Union, overload
 from unittest.mock import patch
 
@@ -204,6 +208,20 @@ def _support_torch_compile(
             start_monitoring_torch_compile(self.vllm_config)
             logger.debug("Start compiling function %s",
                          self.original_code_object)
+            if (os.getenv("VLLM_DYNAMO_FRONTEND_CACHE_DIR")
+                    or os.getenv("VLLM_DYNAMO_FRONTEND_REPLAY_DIR")
+                    or os.getenv("VLLM_ENABLE_DYNAMO_FRONTEND_CACHE", "").lower()
+                    in {"1", "true", "yes", "on"}):
+                timer.start("Tracing")
+                from .input_contract import input_contract
+                try:
+                    self._frontend_entry_contract = input_contract((args, kwargs))
+                except (ValueError, TypeError, AttributeError):
+                    self._frontend_entry_contract = None
+                if self.try_restore_dynamo_frontend():
+                    with self.dispatch_to_code(0):
+                        return self.forward(*args, **kwargs)
+                timer.end("Tracing")
         # if we don't use custom dispatcher, we can directly call the
         # compiled function and let torch.compile handle the dispatching,
         # with the overhead of guard evaluation and recompilation.
@@ -228,16 +246,54 @@ def _support_torch_compile(
             # we hijack this function to know all the functions called
             # during Dynamo tracing, and their corresponding files
             inline_call = InliningInstructionTranslator.inline_call
+            profile_inline_calls = os.environ.get(
+                "VLLM_DYNAMO_INLINE_PROFILE", "0").lower() in {
+                    "1", "true", "yes", "on"
+                }
+            inline_stats: dict[tuple[str, int, str], list[float]] = {}
 
             def patched_inline_call(parent, func, args, kwargs):
                 code = func.get_code()
                 self.vllm_config.compilation_config.traced_files.add(
                     code.co_filename)
-                return inline_call(parent, func, args, kwargs)
+                if not profile_inline_calls:
+                    return inline_call(parent, func, args, kwargs)
+                started = time.perf_counter()
+                try:
+                    return inline_call(parent, func, args, kwargs)
+                finally:
+                    key = (code.co_filename, code.co_firstlineno, code.co_name)
+                    stat = inline_stats.setdefault(key, [0.0, 0.0])
+                    stat[0] += time.perf_counter() - started
+                    stat[1] += 1
 
+            profile_dir = os.environ.get("VLLM_DYNAMO_CPROFILE_DIR")
+            profiler = cProfile.Profile() if profile_dir else None
             with patch.object(InliningInstructionTranslator, 'inline_call',
                               patched_inline_call):
-                output = self.compiled_callable(*args, **kwargs)
+                if profiler is not None:
+                    profiler.enable()
+                try:
+                    output = self.compiled_callable(*args, **kwargs)
+                finally:
+                    if profiler is not None:
+                        profiler.disable()
+                        output_dir = Path(profile_dir)
+                        output_dir.mkdir(parents=True, exist_ok=True)
+                        rank = self.vllm_config.parallel_config.rank
+                        dp_rank = self.vllm_config.parallel_config.data_parallel_rank
+                        profile_path = output_dir / (
+                            f"dynamo_rank_{rank}_{dp_rank}_{os.getpid()}.pstats")
+                        profiler.dump_stats(profile_path)
+                        logger.info("Dynamo cProfile saved to %s", profile_path)
+            if profile_inline_calls:
+                for (filename, firstlineno, name), (elapsed, calls) in sorted(
+                        inline_stats.items(), key=lambda item: item[1][0],
+                        reverse=True)[:40]:
+                    logger.info(
+                        "Dynamo inline profile inclusive_s=%.6f calls=%d "
+                        "function=%s:%d:%s", elapsed, int(calls), filename,
+                        firstlineno, name)
             return output
 
         # usually, capturing the model once is enough, and then we can
