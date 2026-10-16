@@ -23,8 +23,10 @@ EngineCore._initialize_engine_core()
 | Reviewed node declarations | [startup_contract.json](../vllm/v1/engine/startup_contract.json) |
 | Engine actions, no graph construction | [vllm_startup_adapter.py](../vllm/v1/engine/vllm_startup_adapter.py): `build_action_registry`, `build_runtime_actions` |
 
-`execute` loads the packaged 26-node v3 contract for qualified single-GPU CUDA
-startup. It covers bootstrap, model/weights/compilation, KV allocation, precapture
+`execute` loads a packaged 26-node v3 contract for CUDA startup, selecting
+`startup_contract.distributed.json` for TP/PP. The distributed declaration uses
+one ordered worker-RPC resource to avoid mismatched replies and collective order.
+It covers bootstrap, model/weights/compilation, KV allocation, precapture
 and serving-manager readiness, not API-server binding. The `prewarm` and `standard`
 variants express initialization ordering, not user-asserted cache temperature.
 `off` uses sequential startup; `shadow` retains legacy planning without execution;
@@ -120,6 +122,14 @@ VllmBackend: split FX and assemble callable
 | Backend and process transport | [compiler_interface.py](../vllm/compilation/compiler_interface.py), [fx_transport.py](../vllm/compilation/fx_transport.py) |
 | Dynamo frontend restoration | [wrapper.py](../vllm/compilation/wrapper.py), [frontend_metadata.py](../vllm/compilation/frontend_metadata.py) |
 
+Readable `transformed_code.py` is diagnostic text, not executable frontend
+state. On a text-cache miss, `transformed_code_cache.save_in_background()`
+exports it in a low-priority CPU subprocess, without blocking single-GPU or
+distributed startup. Publication is atomic and best-effort; shutdown cancels
+unfinished exports, so short-lived engines may leave no diagnostic text.
+Executable bytecode/frontend assets and CUDA-graph safety checks remain on the
+normal path. This removes a startup wait, not the CPU cost of decompilation.
+
 Stage-separated startup compiles before KV profiling. Validated input metadata
 reconstructs FakeTensor inputs in the current symbolic context, preserving
 supported shape, stride, layout, alias/offset and constant contracts. Unknown
@@ -167,8 +177,15 @@ may use qualified adaptation. Formal capture uses private state and a dedicated
 stream; the registry exposes only completely published graphs. It is not a
 mirror that records each foreground kernel as it executes. Without concurrent
 runtime support, coordinated safe-point maintenance remains a different path.
-Decode, prefill and mixed triggers require capability checks; single-GPU,
-text-only piecewise support does not imply full-graph, LoRA or distributed support.
+Decode, prefill and mixed triggers require capability checks. Distributed capture
+is opt-in: `distributed_capture.py` supplies thread-local communication-free
+recording and private boundary inputs; real collectives stay outside pieces.
+The same stable-input rule applies to precaptured graphs. EngineCore publishes
+the intersection of completed rank-local shapes only after pipeline work drains.
+Precapture sizes are broadcast by the first rank. Rank-local cost adaptation is
+disabled in distributed execution; eager and graph paths use the same registered
+padding size, independent of capture progress or local cost measurements.
+This does not imply full-graph, LoRA, DP or multi-host support.
 
 Exact matches use normal replay. Padding requires a compatible measured cost
 advantage and a default maximum ratio of 0.2, reduced under memory pressure.
@@ -231,8 +248,9 @@ an external wrapper cannot safely infer internal parallelism. Synthetic tests
 cover this portable boundary. Compilation and CUDA components remain Torch/FX
 and engine-buffer dependent and need their own adapters and validation.
 
-Legacy shadow/rebind builders and TP/PP paths remain for compatibility, not as
-proof that the packaged cold-start contract supports them. Optional
+Legacy shadow/rebind builders remain for compatibility, not as proof of rebind
+qualification. The distributed cold-start contract has separate acceptance;
+see deployment for tested topologies and capture restrictions. Optional
 [multi_model_server.py](../multi_model_server.py) implements on-demand models and
 persistent-shell routing; consult `--help`. A general rebind drains requests and
 capture, keeps fixed-topology process/runtime infrastructure, and reconstructs

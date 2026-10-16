@@ -1410,6 +1410,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_input_tokens,
             )
         execution_mode = "split" if split_parts else "graph" if graph_execution else "eager"
+        shadow_graph = (os.environ.get("VLLM_MIXED_CAPTURE_SHADOW_VALIDATE") == "1"
+                        and graph_execution
+                        and num_input_tokens in self.cuda_graph_manager.registry.dynamic_shapes)
+        shadow_intermediate = intermediate_tensors
+        if shadow_graph and intermediate_tensors is not None:
+            shadow_intermediate = IntermediateTensors({
+                name: value.clone() for name, value in intermediate_tensors.tensors.items()})
         if (self.cuda_graph_manager.enabled
                 and self.cuda_graph_manager.reserve_gpu_sample(
                     phase, execution_mode, num_input_tokens)):
@@ -1466,32 +1473,43 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         else:
             hidden_states = model_output
             aux_hidden_states = None
-        if (os.environ.get("VLLM_MIXED_CAPTURE_SHADOW_VALIDATE") == "1"
-                and graph_execution
-                and num_input_tokens in self.cuda_graph_manager.registry.dynamic_shapes):
+        if shadow_graph:
             # Diagnostic only: replay and compiled-eager see the same tokens,
             # positions, attention metadata and KV slots in this scheduler step.
-            # Restricted to stateless Llama attention; not a performance run.
-            if (self.model_config.hf_config.model_type != "llama"
-                    or self.full_cuda_graph or self.use_aux_hidden_state_outputs
-                    or self.parallel_config.tensor_parallel_size != 1
-                    or self.parallel_config.pipeline_parallel_size != 1):
-                raise RuntimeError("Shadow validation supports single-GPU Llama only")
-            hidden_states = hidden_states.clone()
+            # Diagnostic re-execution is limited to stateless attention models.
+            # TP ranks enter both forwards in the same collective order.
+            if (self.model_config.hf_config.model_type not in ("llama", "qwen3")
+                    or self.full_cuda_graph or self.use_aux_hidden_state_outputs):
+                raise RuntimeError("Shadow validation supports stateless Llama/Qwen3 only")
+            if isinstance(hidden_states, IntermediateTensors):
+                hidden_states = IntermediateTensors({
+                    name: value.clone() for name, value in hidden_states.tensors.items()})
+            else:
+                hidden_states = hidden_states.clone()
             with set_forward_context(attn_metadata, self.vllm_config,
                                      num_tokens=num_input_tokens,
                                      skip_cuda_graphs=True):
                 reference = self.model(input_ids=input_ids, positions=positions,
-                                       intermediate_tensors=intermediate_tensors,
+                                       intermediate_tensors=shadow_intermediate,
                                        inputs_embeds=inputs_embeds)
-            actual_logits = self.model.compute_logits(hidden_states[logits_indices], None)
-            reference_logits = self.model.compute_logits(reference[logits_indices], None)
-            torch.testing.assert_close(actual_logits, reference_logits, rtol=1e-3, atol=1e-3)
-            if not torch.equal(actual_logits.argmax(-1), reference_logits.argmax(-1)):
-                raise RuntimeError("Same-step graph/eager greedy token mismatch")
-            logger.info("Mixed capture shadow verified: phase=%s shape=%d max_logit_error=%g",
-                        phase, num_input_tokens,
-                        (actual_logits - reference_logits).abs().max().item())
+            if isinstance(hidden_states, IntermediateTensors):
+                actual_values, expected_values = hidden_states.tensors, reference.tensors
+            else:
+                actual_values = {'hidden': hidden_states}
+                expected_values = {'hidden': reference}
+            for name, value in actual_values.items():
+                torch.testing.assert_close(value, expected_values[name], rtol=1e-3, atol=1e-3)
+            if get_pp_group().is_last_rank:
+                actual_logits = self.model.compute_logits(hidden_states[logits_indices], None)
+                reference_logits = self.model.compute_logits(reference[logits_indices], None)
+                torch.testing.assert_close(actual_logits, reference_logits, rtol=1e-3, atol=1e-3)
+                if not torch.equal(actual_logits.argmax(-1), reference_logits.argmax(-1)):
+                    raise RuntimeError("Same-step graph/eager greedy token mismatch")
+            self.capture_shadow_checks = getattr(self, 'capture_shadow_checks', 0) + 1
+            logger.info("Mixed capture shadow verified: phase=%s shape=%d max_hidden_error=%g",
+                        phase, num_input_tokens, max(
+                            (value - expected_values[name]).abs().max().item()
+                            for name, value in actual_values.items()))
         # Broadcast PP output for external_launcher (torchrun)
         # to make sure we are synced across pp ranks
         # TODO: Support overlapping mirco-batches
@@ -2293,6 +2311,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         input_ids = self.input_ids[:num_tokens]
         positions = (self.mrope_positions[:, :num_tokens]
                      if self.uses_mrope else self.positions[:num_tokens])
+        intermediate_tensors = None
+        if not get_pp_group().is_first_rank:
+            intermediate_tensors = model.make_empty_intermediate_tensors(
+                batch_size=num_tokens, dtype=self.model_config.dtype,
+                device=self.device)
         with set_forward_context(
                 None,
                 self.vllm_config,
@@ -2301,7 +2324,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return model(
                 input_ids=input_ids,
                 positions=positions,
-                intermediate_tensors=None,
+                intermediate_tensors=intermediate_tensors,
                 inputs_embeds=None,
             )
 

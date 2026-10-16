@@ -64,6 +64,44 @@ def test_instances_do_not_share_hotspots_or_state():
     assert not b.registry.published
 
 
+def test_distributed_policy_keeps_collective_shapes_identical():
+    waiting, warming = manager(min_hits=10), manager(min_hits=1)
+    for m in (waiting, warming):
+        m.runner.parallel_config.world_size = 2
+        m.adapter.find_best_match = Mock(side_effect=AssertionError('rank-local cost policy'))
+    a, parts_a = select(waiting)
+    b, parts_b = select(warming)
+    assert a.execution_shape == b.execution_shape == 8
+    assert not a.mark_runtime_warmup and b.mark_runtime_warmup
+    assert not parts_a and not parts_b
+    warming.mark_capture_failed('decode', 8, RuntimeError('test failure'))
+    failed, parts = select(warming, 'mixed')
+    assert failed.execution_shape == 8 and not parts
+    waiting.adapter.plan.assert_not_called()
+    warming.adapter.plan.assert_not_called()
+
+
+def test_distributed_disabled_adaptive_still_uses_common_shape():
+    m = manager(enabled=False)
+    m.runner.parallel_config.world_size = 2
+    d, parts = select(m)
+    assert d.skip_cudagraph and d.execution_shape == 8 and not parts
+
+
+def test_distributed_precapture_uses_leader_shapes(monkeypatch):
+    from vllm.distributed import parallel_state
+    m = manager()
+    m.runner.parallel_config = NS(world_size=2, data_parallel_size=1)
+    m.profile_dir = m.profile_manifest = None
+    m.hotspots.select_precapture = Mock(return_value=[2])
+    world = NS(broadcast_object=Mock(return_value=[1, 2]))
+    monkeypatch.setattr(parallel_state, 'get_world_group', lambda: world)
+    m.capture.precapture = Mock()
+    m.precapture()
+    world.broadcast_object.assert_called_once_with([2], src=0)
+    m.capture.precapture.assert_called_once_with([1, 2])
+
+
 def test_disabled_adaptive_has_no_hidden_legacy_capture():
     m = manager(enabled=False)
     d, parts = select(m)

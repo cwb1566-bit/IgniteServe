@@ -10,10 +10,12 @@ startup and graph-execution overhead:
 | Compilation | Restore validated subgraph inputs, compile in isolated processes, and reuse compatible artifacts within and across launches. |
 | CUDA graphs | Select hotspot precapture shapes, capture missing decode/prefill/mixed shapes in the background, and apply cost-qualified padding or splitting. |
 
-This branch is `IgniteServe/declarative-startup-runtime`. Its packaged startup
+This branch is `IgniteServe/distributed-declarative`. Its packaged startup
 contract has 26 nodes covering EngineCore initialization through engine ready,
-not the entire HTTP service. Single-GPU CUDA is the qualified contract scope;
-other configurations retain the existing startup path. A switch enables a
+not the entire HTTP service. Separate contracts cover single-GPU CUDA and
+single-host TP/PP startup. Distributed background capture is opt-in; see the
+bounded validation and restrictions in [deployment](docs/deployment.md#distributed-startup-and-capture).
+A switch enables a
 policy, not a guarantee that every model or workload qualifies for it.
 
 ## Start Here

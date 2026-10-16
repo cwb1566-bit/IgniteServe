@@ -1155,13 +1155,14 @@ def find_nccl_library() -> str:
 
 prev_set_stream = torch.cuda.set_stream
 
-_current_stream = None
+_current_stream_state = threading.local()
 
 
 def _patched_set_stream(stream: torch.cuda.Stream) -> None:
-    global _current_stream
-    _current_stream = stream
     prev_set_stream(stream)
+    # CUDA current streams are thread-local; capture must not redirect NCCL
+    # submissions made by the foreground inference thread.
+    _current_stream_state.stream = stream
 
 
 torch.cuda.set_stream = _patched_set_stream
@@ -1179,7 +1180,7 @@ def current_stream() -> torch.cuda.Stream:
     from C/C++ code.
     """
     from vllm.platforms import current_platform
-    global _current_stream
+    _current_stream = getattr(_current_stream_state, "stream", None)
     if _current_stream is None:
         # when this function is called before any stream is set,
         # we return the default stream.
@@ -1188,6 +1189,7 @@ def current_stream() -> torch.cuda.Stream:
         # per process
         _current_stream = torch.cuda.Stream() if current_platform.is_rocm(
         ) else torch.cuda.current_stream()
+        _current_stream_state.stream = _current_stream
     return _current_stream
 
 

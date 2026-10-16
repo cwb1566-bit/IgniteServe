@@ -103,6 +103,9 @@ def _register_group(group: "GroupCoordinator") -> None:
 
 
 def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
+    from vllm.v1.worker.distributed_capture import recording
+    if recording():
+        return all_reduce_fake(tensor, group_name)
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
     if group is None:
@@ -116,6 +119,9 @@ def all_reduce_fake(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
 
 def reduce_scatter(tensor: torch.Tensor, dim: int, world_size: int,
                    group_name: str) -> torch.Tensor:
+    from vllm.v1.worker.distributed_capture import recording
+    if recording():
+        return reduce_scatter_fake(tensor, dim, world_size, group_name)
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
     if group is None:
@@ -132,6 +138,9 @@ def reduce_scatter_fake(tensor: torch.Tensor, dim: int, world_size: int,
 
 def all_gather(tensor: torch.Tensor, dim: int, world_size: int,
                group_name: str) -> torch.Tensor:
+    from vllm.v1.worker.distributed_capture import recording
+    if recording():
+        return all_gather_fake(tensor, dim, world_size, group_name)
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
     if group is None:

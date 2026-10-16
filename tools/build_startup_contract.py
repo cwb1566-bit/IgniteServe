@@ -12,7 +12,7 @@ from igniteserve_startup.contract import digest
 from igniteserve_startup.offline import analyze
 
 
-def build(root, output):
+def build(root, output, distributed=False):
     root, output = Path(root), Path(output)
     directory = root / "vllm/v1/engine"
     discovery = analyze(directory / "core.py", "EngineCore", "_initialize_engine_core")
@@ -64,6 +64,8 @@ def build(root, output):
         "vllm/v1/worker/HotspotAnalyzer.py", "vllm/v1/worker/piecewise_graph_registry.py",
         "vllm/v1/worker/composite_cudagraph.py",
         "vllm/v1/worker/concurrent_piecewise_cudagraph.py",
+        "vllm/v1/worker/distributed_capture.py", "vllm/distributed/parallel_state.py",
+        "vllm/config.py", "vllm/utils/__init__.py",
         "vllm/v1/attention/backends/flash_attn.py",
     ]
     variants = []
@@ -111,7 +113,7 @@ def build(root, output):
         for base, alt in zip(common, alternate)
         if base["required_state"] != alt["required_state"]}
     payload = dict(schema="igniteserve-startup-v3", status="candidate", nodes=common,
-        compatibility={"engine": "vllm-v1-deferred"}, initial_state=[],
+        compatibility={"engine": "vllm-v1-deferred", "distributed": distributed}, initial_state=[],
         adapter_sha256=digest(directory / "vllm_startup_adapter.py"),
         sources={name: digest(root / name) for name in source_names},
         resource_capacities=dict(cpu=2, worker_rpc=2, compiler_cpu=1,
@@ -120,6 +122,11 @@ def build(root, output):
                    "regions": len(discovery["regions"]),
                    "boundary_policy": "reviewed deferred API; conservative opaque manager actions"},
         variants=variants)
+    if distributed:
+        # One ordered RPC lane fans each action out to all ranks. Never allow
+        # independent DAG actions to interleave collectives on worker queues.
+        payload["resource_capacities"]["worker_rpc"] = 1
+        payload["compatibility"]["distributed"] = True
     output.write_text(json.dumps(payload, indent=2) + "\n")
 
 
@@ -127,5 +134,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", default=".")
     parser.add_argument("--output", required=True)
+    parser.add_argument("--distributed", action="store_true")
     args = parser.parse_args()
-    build(args.root, args.output)
+    build(args.root, args.output, args.distributed)

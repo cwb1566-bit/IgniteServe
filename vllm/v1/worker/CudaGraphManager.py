@@ -276,6 +276,12 @@ class CUDAGraphManager:
             self.profile_manifest,
             adaptive=self.enabled,
         )
+        if (self.runner.parallel_config.world_size > 1
+                and self.runner.parallel_config.data_parallel_size == 1):
+            from vllm.distributed.parallel_state import get_world_group
+            shapes = get_world_group().broadcast_object(shapes, src=0)
+            if not set(shapes) <= set(self.runner.cudagraph_batch_sizes):
+                raise RuntimeError('Rank disagrees with distributed precapture shapes')
         self.capture.precapture(shapes)
         self.register_ready_shapes(shapes)
 
@@ -307,11 +313,20 @@ class CUDAGraphManager:
                 phase,
                 raw,
                 target,
-                target if replay else raw,
+                target if replay or r.parallel_config.world_size > 1 else raw,
                 not replay,
                 False,
                 "static-replay" if replay else "eager",
             ), ()
+        if r.parallel_config.world_size > 1:
+            # Rank-local timing or memory pressure must never select different
+            # collective sizes or split counts. Use the shared scheduler shape
+            # even for eager fallback; distributed cost adaptation needs a
+            # separate coordinated admission protocol.
+            return self.plan_runtime(
+                phase, raw, target, capturable=capturable,
+                already_captured=target in self.registry.published,
+                eager_shape=target), ()
         match = self.adapter.find_best_match(
             raw,
             phase=phase,
@@ -476,7 +491,9 @@ class CUDAGraphManager:
         already_captured: bool,
         allow_replay: bool = True,
         adapted: bool = False,
+        eager_shape: Optional[int] = None,
     ) -> RuntimeDecision:
+        fallback_shape = raw_shape if eager_shape is None else eager_shape
         if not self.enabled:
             return RuntimeDecision(
                 phase,
@@ -516,7 +533,7 @@ class CUDAGraphManager:
                         phase,
                         raw_shape,
                         target_shape,
-                        raw_shape,
+                        fallback_shape,
                         True,
                         False,
                         "split-reuse" if adapted else "cost-policy-eager",
@@ -529,7 +546,7 @@ class CUDAGraphManager:
                     phase,
                     raw_shape,
                     target_shape,
-                    raw_shape,
+                    fallback_shape,
                     True,
                     False,
                     "split-reuse" if adapted else "phase-not-yet-supported",
@@ -542,7 +559,7 @@ class CUDAGraphManager:
                     phase,
                     raw_shape,
                     target_shape,
-                    raw_shape,
+                    fallback_shape,
                     True,
                     False,
                     "split-reuse" if adapted else "shape-not-capturable",
@@ -569,7 +586,7 @@ class CUDAGraphManager:
                         phase,
                         raw_shape,
                         target_shape,
-                        raw_shape,
+                        fallback_shape,
                         True,
                         False,
                         "split-reuse" if adapted else "shared-capture-pending",
@@ -600,7 +617,7 @@ class CUDAGraphManager:
                 phase,
                 raw_shape,
                 target_shape,
-                raw_shape,
+                fallback_shape,
                 True,
                 False,
                 "split-reuse" if adapted else record.state.value,

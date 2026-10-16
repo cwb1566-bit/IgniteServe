@@ -55,11 +55,12 @@ class CaptureExecutor:
         self._stopping = False
         self._scheduled_shapes: set[int] = set()
         self._graph_pools: dict[int, Any] = {}
+        self._unpublished: dict[int, tuple] = {}
         self._worker_runtime_initialized = False
         if self.enabled:
             logger.warning(
                 "Experimental concurrent piecewise CUDA graph capture is "
-                "enabled for single-GPU inference."
+                "enabled for this worker."
             )
         elif _env_flag(
             "VLLM_ENABLE_CONCURRENT_PIECEWISE_CUDAGRAPH_CAPTURE", True
@@ -85,12 +86,14 @@ class CaptureExecutor:
         if getattr(runner, "full_cuda_graph", False):
             return False, "full CUDA graphs are not piecewise graphs"
         parallel = runner.parallel_config
-        if (
-            parallel.tensor_parallel_size != 1
-            or parallel.pipeline_parallel_size != 1
-            or parallel.data_parallel_size != 1
-        ):
-            return False, "only TP=PP=DP=1 is supported"
+        if parallel.data_parallel_size != 1:
+            return False, "DP background capture is not supported"
+        if parallel.tensor_parallel_size * parallel.pipeline_parallel_size > 1:
+            if not _env_flag('VLLM_ENABLE_DISTRIBUTED_BACKGROUND_CAPTURE'):
+                return False, "distributed background capture is not enabled"
+            from vllm.v1.worker.distributed_capture import COLLECTIVE_OPS
+            if not set(COLLECTIVE_OPS) <= set(runner.compilation_config.splitting_ops):
+                return False, "collectives must be eager graph boundaries"
         if getattr(runner, "is_multimodal_model", False):
             return False, "multimodal input buffers are not isolated"
         if getattr(runner.model_config, "is_hybrid", False):
@@ -176,9 +179,23 @@ class CaptureExecutor:
     def _piecewise_backends(self) -> list[Any]:
         return self.manager.registry.backends()
 
+    def _prepare_distributed_backends(self, backends):
+        if self.runner.parallel_config.world_size == 1:
+            return
+        from vllm.v1.worker.distributed_capture import COLLECTIVE_OPS
+        static = {t.untyped_storage().data_ptr() for t in
+                  list(self.runner.model.parameters()) + list(self.runner.model.buffers())}
+        for backend in backends:
+            for node in backend.graph.graph.nodes:
+                target = str(node.target)
+                if any(op in target for op in COLLECTIVE_OPS) or any(
+                        term in target for term in ('c10d', 'nccl', 'custom_all_reduce')):
+                    raise RuntimeError(f'Communication inside capture piece: {target}')
+            backend.capture_static_storages = static
+
     def enqueue_auxiliary(self, capture) -> bool:
         """Serialize private composite capture with ordinary shape capture."""
-        if not self.enabled:
+        if not self.enabled or self.runner.parallel_config.world_size > 1:
             return False
         if not self._ensure_thread():
             return False
@@ -224,6 +241,7 @@ class CaptureExecutor:
             )
         armed: list[Any] = []
         try:
+            self._prepare_distributed_backends(backends)
             for backend in backends:
                 if not backend.prepare_concurrent_capture(
                     shape, graph_pool, capture_stream, capture_gate
@@ -263,6 +281,19 @@ class CaptureExecutor:
         )
         self.manager.settle_shared_capture(phase, shape)
 
+    def completed_distributed_shapes(self):
+        with self._lock:
+            return sorted(self._unpublished)
+
+    def publish_distributed(self, shape):
+        # EngineCore calls this on every rank at an inference-step boundary.
+        with self._lock:
+            payload = self._unpublished.pop(shape, None)
+        if payload is None:
+            raise RuntimeError(f'Rank has no completed capture for shape {shape}')
+        self._publish(*payload)
+        logger.info('Distributed background graph published: shape=%d', shape)
+
     def _capture_one(self, request: _CaptureRequest) -> None:
         shape = request.shape
         started = time.perf_counter()
@@ -278,7 +309,11 @@ class CaptureExecutor:
             graph_pool = torch.cuda.graph_pool_handle()
             capture_gate = threading.Event()
             context_started = time.perf_counter()
-            with graph_capture(device=self.runner.device) as capture_context:
+            context = graph_capture
+            if self.runner.parallel_config.world_size > 1:
+                from vllm.v1.worker.distributed_capture import capture_stream
+                context = capture_stream
+            with context(device=self.runner.device) as capture_context:
                 body_started = time.perf_counter()
                 backends = self._arm_entries(
                     shape, graph_pool, capture_context.stream, capture_gate
@@ -287,7 +322,7 @@ class CaptureExecutor:
                 body_finished = time.perf_counter()
             finished = time.perf_counter()
             self._graph_pools[shape] = graph_pool
-            self._publish(
+            publication = (
                 request.phase,
                 shape,
                 backends,
@@ -297,8 +332,13 @@ class CaptureExecutor:
                 body_finished - body_started,
                 finished - body_finished,
             )
+            if self.runner.parallel_config.world_size > 1:
+                with self._lock:
+                    self._unpublished[shape] = publication
+            else:
+                self._publish(*publication)
             logger.info(
-                "Concurrent CUDA graph ready: phase=%s shape=%d capture_seconds=%.6f",
+                "Concurrent CUDA graph recorded: phase=%s shape=%d capture_seconds=%.6f",
                 request.phase, shape, finished - started,
             )
             logger.debug(
@@ -358,6 +398,10 @@ class CaptureExecutor:
         if thread is not None:
             self._queue.put(None)
             thread.join()
+        for shape in self._unpublished:
+            for backend in self._piecewise_backends():
+                backend.abort_concurrent_capture(shape)
+        self._unpublished.clear()
 
     def precapture(self, shapes):
         from vllm.compilation.counter import compilation_counter
@@ -365,6 +409,8 @@ class CaptureExecutor:
         from tqdm import tqdm
 
         r = self.runner
+        if os.environ.get('VLLM_ENABLE_DISTRIBUTED_BACKGROUND_CAPTURE') == '1':
+            self._prepare_distributed_backends(self._piecewise_backends())
         compilation_counter.num_gpu_runner_capture_triggers += 1
         started = time.perf_counter()
         free_before = torch.cuda.mem_get_info()[0]

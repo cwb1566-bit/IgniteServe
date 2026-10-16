@@ -1382,6 +1382,12 @@ class Worker(WorkerBase):
             return []
         return self.model_runner.cuda_graph_manager.pending_shapes()
 
+    def get_completed_background_captures(self) -> list[int]:
+        return self.model_runner.cuda_graph_manager.capture.completed_distributed_shapes()
+
+    def publish_background_capture(self, shape: int) -> None:
+        self.model_runner.cuda_graph_manager.capture.publish_distributed(shape)
+
     def plan_pending_cudagraph_capture(
         self,
         slack_ms: float,

@@ -22,18 +22,20 @@ def run(engine, config, executor_class, log_stats, fail_callback):
     from vllm.v1.engine.startup_analysis.recorder import get_startup_recorder
     logger = init_logger(__name__)
     if (str(config.device_config.device).split(":")[0] != "cuda"
-            or config.parallel_config.world_size != 1
             or config.parallel_config.data_parallel_size != 1):
-        logger.warning("Packaged startup contract is qualified for single-GPU CUDA; "
+        logger.warning("Startup contract requires CUDA and DP=1; "
                        "using the existing sequential/distributed path")
         return False
     directory = Path(__file__).parent
+    distributed = config.parallel_config.world_size > 1
+    contract_name = ("startup_contract.distributed.json" if distributed
+                     else "startup_contract.json")
     contract = Path(os.environ.get("VLLM_STARTUP_CONTRACT_PATH",
-                                   str(directory / "startup_contract.json")))
+                                   str(directory / contract_name)))
     adapter = Path(os.environ.get("VLLM_STARTUP_ADAPTER_PATH",
                                   str(contract.parent / "vllm_startup_adapter.py")))
     host = (engine, config, executor_class, log_stats, fail_callback)
-    facts = {"engine": "vllm-v1-deferred",
+    facts = {"engine": "vllm-v1-deferred", "distributed": distributed,
              "two_phase_prewarm": os.environ.get(
                  "VLLM_ENABLE_TWO_PHASE_FULL_FX_PREWARM", "0") == "1"}
     try:

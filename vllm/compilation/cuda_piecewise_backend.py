@@ -49,6 +49,7 @@ class ConcreteSizeEntry:
     warmup_signature: Optional[Any] = None
     concurrent_signature: Optional[Any] = None
     replay_verified: bool = False
+    private_capture_inputs: Optional[Any] = None
 
 
 def _input_signature(args: tuple[Any, ...]) -> tuple:
@@ -184,6 +185,7 @@ class CUDAPiecewiseBackend:
         entry.concurrent_capture_stream = None
         entry.concurrent_signature = None
         entry.replay_verified = False
+        entry.private_capture_inputs = None
 
     def _run(self, mode: str, runnable: Callable, args: tuple[Any, ...]) -> Any:
         label = f"piece.{self.piecewise_compile_index}.{mode}"
@@ -229,9 +231,9 @@ class CUDAPiecewiseBackend:
             timer.start("compile_cache_save_to_file")
             self.vllm_backend.compiler_manager.save_to_file()
             timer.end("compile_cache_save_to_file")
-            timer.start("compile_monitor_end")
+            # timer.start("compile_monitor_end")
             end_monitoring_torch_compile(self.vllm_config)
-            timer.end("compile_monitor_end")
+            # timer.end("compile_monitor_end")
             timer.start("after_last_piecewise_until_model_forward_end")
 
     def __call__(self, *args) -> Any:
@@ -352,6 +354,13 @@ class CUDAPiecewiseBackend:
                 logger.debug("Capturing a cudagraph for shape %s",
                              runtime_shape)
 
+            if (self.vllm_config.parallel_config.world_size > 1
+                    and os.environ.get('VLLM_ENABLE_DISTRIBUTED_BACKGROUND_CAPTURE') == '1'):
+                from vllm.v1.worker.distributed_capture import private_inputs
+                static_storages = getattr(self, 'capture_static_storages', set())
+                args = private_inputs(args, static_storages)
+                entry.private_capture_inputs = args
+                entry.concurrent_signature = _input_signature(args)
             input_addresses = [
                 x.data_ptr() for x in args if isinstance(x, torch.Tensor)
             ]
@@ -384,6 +393,11 @@ class CUDAPiecewiseBackend:
                 graph_pool = (entry.concurrent_capture_pool
                               if forward_context.concurrent_cudagraph_capture
                               else self.graph_pool)
+                if entry.private_capture_inputs is not None:
+                    # Private boundary copies change the capture-time lifetimes.
+                    # Separate pools prevent later pieces from recycling live
+                    # residual outputs of an earlier piece during replay.
+                    graph_pool = torch.cuda.graph_pool_handle()
                 graph_kwargs = {}
                 if forward_context.concurrent_cudagraph_capture:
                     graph_kwargs = {
@@ -435,8 +449,15 @@ class CUDAPiecewiseBackend:
             # manage the memory during cuda graph capture
             return output
 
+        original_inputs = None
         if entry.concurrent_signature is not None:
             signature = _input_signature(args)
+            if (entry.private_capture_inputs is not None
+                    and signature == entry.concurrent_signature):
+                from vllm.v1.worker.distributed_capture import copy_inputs
+                original_inputs = args
+                copy_inputs(entry.private_capture_inputs, args)
+                args = entry.private_capture_inputs
             addresses = [x.data_ptr() for x in args if isinstance(x, torch.Tensor)]
             if signature != entry.concurrent_signature or addresses != entry.input_addresses:
                 # A fallback piece may allocate new outputs. Its suffix must
@@ -463,6 +484,10 @@ class CUDAPiecewiseBackend:
         with operator_pipeline_range(
                 f"piece.{self.piecewise_compile_index}.replay"):
             entry.cudagraph.replay()
+            if original_inputs is not None:
+                # Compiled pieces can mutate residual inputs in place. Preserve
+                # those writes for the surrounding FX graph, not only outputs.
+                copy_inputs(original_inputs, entry.private_capture_inputs)
         if adaptation_stats is not None:
             adaptation_stats['replays'] = adaptation_stats.get('replays', 0) + 1
         return entry.output

@@ -42,14 +42,14 @@ class MultiprocExecutor(Executor):
 
     @classmethod
     def supports_deferred_startup(cls) -> bool:
-        """Enable the experimental distributed startup DAG explicitly.
+        """Use staged workers with startup optimizations; honor explicit opt-out.
 
-        The default multiprocessing startup remains byte-for-byte compatible
-        with vLLM.  The staged lifecycle is only selected by EngineCore when
-        this flag is set, so the validated single-GPU path is unaffected.
+        The declarative loader still verifies the distributed contract before
+        constructing workers. An absent/unqualified contract falls back safely.
         """
         return os.environ.get(
-            "VLLM_ENABLE_DISTRIBUTED_STARTUP_DAG", ""
+            "VLLM_ENABLE_DISTRIBUTED_STARTUP_DAG",
+            os.environ.get("VLLM_ENABLE_STARTUP_OPTIMIZATIONS", "0")
         ).strip().lower() in {"1", "true", "yes", "on"}
 
     def _initialize_executor_shell(self) -> None:

@@ -477,18 +477,19 @@
     }
   ],
   "compatibility": {
-    "engine": "vllm-v1-deferred"
+    "engine": "vllm-v1-deferred",
+    "distributed": false
   },
   "initial_state": [],
   "adapter_sha256": "268e17e4cf857cdcc77a870ebe5d4d9754809e4d354ac13c687af8d08d4832b8",
   "sources": {
-    "vllm/v1/engine/core.py": "35d528d470dc47841d3757abbff3bde63446f57e16f2fe0f2fe259ba3cbd4421",
-    "vllm/v1/engine/declarative_startup.py": "72efae437e2cb7d4ded115683d7d1a9bb7fe5f0230bdd5195238a6283644a823",
-    "vllm/v1/worker/gpu_worker.py": "afdcb7acc32feedfaffd5fef014d66067d6cd556cdb4174f947349e0b2ea92eb",
-    "vllm/v1/worker/gpu_model_runner.py": "81bd8348a24055e299708e689789224cee9e818ac21e56a467a302921fe95bda",
+    "vllm/v1/engine/core.py": "ff15592786a86ad5f9fdaa5b119fab1a0beece7e85e066fb49b2d2bb9e512074",
+    "vllm/v1/engine/declarative_startup.py": "89b92d9d999cb196db5276bcd267e37bb60e57aa95026d77649264a400f69322",
+    "vllm/v1/worker/gpu_worker.py": "6e3af4f6ace6668ced88393135fd976dc075e1a27e788a695c74800c22936afc",
+    "vllm/v1/worker/gpu_model_runner.py": "df8621fda60d9cc38411b009adccd6f305165809817c63f02b6cb33c14431419",
     "vllm/v1/executor/abstract.py": "0d9c9e3d4e0f3f3bf4538f6f1b67225a8b68696229e5912ab2876f35676fef46",
     "vllm/executor/uniproc_executor.py": "ee4ba1e6cc3e762eb1373c19bb46a9462787ec6687cc017586177eadec657701",
-    "vllm/v1/executor/multiproc_executor.py": "27cadf6950fb8f722b117415844264a6e3932d6e916885b742839859495c5665",
+    "vllm/v1/executor/multiproc_executor.py": "7128cc0392be6bfde22252c646c7617d6efb8546da2594c2a793367029d2826a",
     "vllm/worker/worker_base.py": "0db5afa1c0abf2e29576a08349f3058d8e4c8a7a873e10e0393c5567b9f0a2f8",
     "igniteserve_startup/runtime.py": "80b0b3e7fdf693b9de7872017d0599669b4f70570a1a3a885a5828922d306e45",
     "igniteserve_startup/contract.py": "7f1e318c9fd275602a1868ecbd52d3e3ec50cb6cbeee14acd125dcf9461424d2",
@@ -504,14 +505,18 @@
     "vllm/compilation/fx_transport.py": "644af4ca1f2bb85865440fad1f8b58daadf0c4f62a347e91bffa4f8e971126c5",
     "vllm/compilation/input_contract.py": "444cad1ed397f960187b000f023bf001cf3823b00cbcabf158938c1eeee12856",
     "vllm/forward_context.py": "fa4182524eefe907102e85231505bbb6f150c9c2fadfcb0ecc9d80d70b01aebc",
-    "vllm/compilation/cuda_piecewise_backend.py": "555ef6a3f442403c94dc3349589a824d28bbab0e6aadb8ca303011c72df392f0",
+    "vllm/compilation/cuda_piecewise_backend.py": "d19a5aa7801b6e2167e76700bc89f1deabb4dee07388afcdc6af32fd19d57cba",
     "vllm/v1/worker/cudagraph_adaptation.py": "71f7942d9e9fbb9893cb2700cc32eaf58d37e03afacba32eb0adb7747d866017",
     "vllm/v1/worker/cudagraph_profile.py": "6f91ca15f9a65d5741acc97391ab51626f7b2be0edae7ac579f557ea75292d74",
-    "vllm/v1/worker/CudaGraphManager.py": "ad8d0b3806f59244a0e9f25e1b26bcfd2deb709a18741aadd2f416e5325cb7d3",
+    "vllm/v1/worker/CudaGraphManager.py": "462c22ac340663c4f3664c155ab6bfe3099f30d422997fd474f0ba412f7b241b",
     "vllm/v1/worker/HotspotAnalyzer.py": "e5ae79aa7d84a9e8910210f34961f8bafd3c51d25369489d6e1fed40084208e9",
     "vllm/v1/worker/piecewise_graph_registry.py": "953111152705ea5fdb4e3860b6219b1c514bd6378bdf7595c1a067acdacda944",
     "vllm/v1/worker/composite_cudagraph.py": "a97f716bba792fc69a3b8cc73f80b465acd4d8a4e958af170c4852a35e648ca9",
-    "vllm/v1/worker/concurrent_piecewise_cudagraph.py": "1a68b6a7fe55990c13c79b47aa07297ecfb53f3f60dfe69b7735dac77b80834e",
+    "vllm/v1/worker/concurrent_piecewise_cudagraph.py": "cfa2776fa7bcc62997ec920c5ef556fc1e39afeec1f892bcc8dae34eac4619d6",
+    "vllm/v1/worker/distributed_capture.py": "c98b236d8052f94364dc6d1fa71eecac8a4947bbb136048985d60af516199cb3",
+    "vllm/distributed/parallel_state.py": "f1419af4e472671f14b813d80d83b7592d434eff2d90f816dd143562c393d5b9",
+    "vllm/config.py": "8d3b266ff4c3dbafcb532bc0818a751643941723d6b57b2219762ddcf766b59b",
+    "vllm/utils/__init__.py": "e4bfe5514e38d6d285d45fda13919ff4115ebec1812872fdfc48a675550fd4a7",
     "vllm/v1/attention/backends/flash_attn.py": "feadd18b454ee762a38179b8cf0aefe8dbeacc3c6d5ae92ef41a63bad199bc3c"
   },
   "resource_capacities": {
@@ -525,7 +530,7 @@
   },
   "discovery": {
     "entry": "EngineCore._initialize_engine_core",
-    "source_sha256": "35d528d470dc47841d3757abbff3bde63446f57e16f2fe0f2fe259ba3cbd4421",
+    "source_sha256": "ff15592786a86ad5f9fdaa5b119fab1a0beece7e85e066fb49b2d2bb9e512074",
     "regions": 49,
     "boundary_policy": "reviewed deferred API; conservative opaque manager actions"
   },
@@ -556,10 +561,11 @@
     }
   ],
   "validation": {
-    "identity": "d24501d1617e46e8037b933e7d60d9d481dbcdee3a8201424919dba9f3ec45ac",
+    "identity": "56a5549417bc7419dd5a7d4f1af0a3c0bdd7279a186b203cbd5239a3d8783fcb",
     "review": {
-      "identity": "d24501d1617e46e8037b933e7d60d9d481dbcdee3a8201424919dba9f3ec45ac",
-      "reviewer": "Codex source review",
+      "identity": "56a5549417bc7419dd5a7d4f1af0a3c0bdd7279a186b203cbd5239a3d8783fcb",
+      "constraints": "approved",
+      "rationale": "Source-reviewed existing single-worker adapter and deferred startup ordering. Distributed-only buffer handling is guarded by world size and the opt-in flag. Worker affinity serializes calls on the single executor; state producers preserve CUDA/group/model, compilation/KV, scheduler and readiness ordering. The fused weight/compile action joins before publishing completion. Single-GPU acceptance must revalidate both prewarm variants, serial and scheduled execution, cold and cached assets, global reuse and disabled overlap against this exact source identity.",
       "actions": {
         "engine_core_construct": "approved",
         "plugins": "approved",
@@ -587,12 +593,10 @@
         "scheduler": "approved",
         "batch_queue": "approved",
         "ready": "approved"
-      },
-      "constraints": "approved",
-      "rationale": "Readability cleanup preserves the reviewed deferred engine interfaces. Cold startup and persistent rebind share runtime action implementations; only cold startup probes and releases prepared assets. The fused weight/compile call joins before publishing readiness; the compile marker does not compile again. State producers, dependencies, resource reservations and worker affinity are unchanged. Removed private bootstrap builders and file-based process launch helpers have no internal callers. Active Torch pool submission, FX transport constants, validated reuse and serial fallback are retained. Compiler timings are isolated by manager and shape. Real Qwen3-4B single-GPU validation covers both variants, serial/scheduled execution, cold/warm assets, global reuse and disabled weight overlap. This is not a new performance comparison or arbitrary/distributed-model proof. Logging-only review: timer measurements, exported fields, dependencies, routes, affinity, resource capacities and capture synchronization are unchanged. Main completions remain INFO, internal timings use DEBUG; the fused compile readiness marker is not reported as compilation work. Fresh serial/scheduled generated-adapter evidence is required."
+      }
     },
     "verification": {
-      "identity": "d24501d1617e46e8037b933e7d60d9d481dbcdee3a8201424919dba9f3ec45ac",
+      "identity": "56a5549417bc7419dd5a7d4f1af0a3c0bdd7279a186b203cbd5239a3d8783fcb",
       "serial_equivalence": true,
       "scheduled_equivalence": true,
       "variants": [
@@ -617,7 +621,7 @@
           ],
           "reused_reads": 5,
           "global_subgraph_hits": 0,
-          "elapsed": 13.04367814026773
+          "elapsed": 13.097437932156026
         },
         {
           "case": "prewarm-4",
@@ -634,7 +638,7 @@
           ],
           "reused_reads": 5,
           "global_subgraph_hits": 0,
-          "elapsed": 12.679332718253136
+          "elapsed": 12.635265129152685
         },
         {
           "case": "standard-1",
@@ -651,7 +655,7 @@
           ],
           "reused_reads": 5,
           "global_subgraph_hits": 0,
-          "elapsed": 13.247992468066514
+          "elapsed": 12.093266305979341
         },
         {
           "case": "standard-4",
@@ -668,7 +672,7 @@
           ],
           "reused_reads": 5,
           "global_subgraph_hits": 0,
-          "elapsed": 12.568047907203436
+          "elapsed": 12.451336185913533
         },
         {
           "case": "cold",
@@ -685,7 +689,7 @@
           ],
           "reused_reads": 0,
           "global_subgraph_hits": 0,
-          "elapsed": 38.604703564196825
+          "elapsed": 41.204210033174604
         },
         {
           "case": "global-reuse",
@@ -702,7 +706,7 @@
           ],
           "reused_reads": 17,
           "global_subgraph_hits": 3,
-          "elapsed": 14.437709511257708
+          "elapsed": 14.965402160771191
         },
         {
           "case": "no-weight-overlap",
@@ -719,7 +723,7 @@
           ],
           "reused_reads": 5,
           "global_subgraph_hits": 0,
-          "elapsed": 15.461212008725852
+          "elapsed": 15.629787267185748
         }
       ]
     }

@@ -153,6 +153,60 @@ to `runs/` without mutating the frozen profile; separate workloads/RPS explicitl
 
 ## Validation and Debugging
 
+### Distributed Startup and Capture
+
+On this branch, the master startup switch selects a separate distributed
+declaration when TP or PP exceeds one. Its worker-RPC capacity is one: each
+action fans out to all ranks and waits for all replies before dependent actions.
+Weight/compile overlap remains inside the fused worker action.
+
+```bash
+PYTHONPATH="$PWD" CUDA_VISIBLE_DEVICES=0,1 \
+VLLM_ENABLE_STARTUP_OPTIMIZATIONS=1 \
+VLLM_ENABLE_DISTRIBUTED_BACKGROUND_CAPTURE=1 \
+python -m vllm.entrypoints.openai.api_server \
+  --model /path/to/Qwen3-4B --tensor-parallel-size 2 \
+  --disable-custom-all-reduce --max-model-len 512 \
+  --max-num-seqs 8 --max-num-batched-tokens 64 \
+  --enable-chunked-prefill --gpu-memory-utilization 0.45
+```
+
+For PP, replace `--tensor-parallel-size 2` with `--pipeline-parallel-size 2`.
+The capture flag separates supported TP collectives from recorded pieces;
+communication executes only on the foreground inference path. Both startup
+and background graphs use stable private activation buffers. Completed graphs
+become visible only after all ranks acknowledge them at a drained step boundary.
+This publication path requires the default multiprocess EngineCore client.
+With PP, continuous traffic may delay publication until the pipeline drains;
+the implementation does not interrupt foreground work to force publication.
+CUDA stream caching is thread-local. This requires the same modified Torch
+runtime as single-GPU concurrent capture; no new Torch patch is required here.
+
+Validation targets Qwen3-4B FP16, single-host TP=2/4 or PP=2/4 with NCCL, not DP,
+multi-host, TP+PP combinations, arbitrary models, or a throughput improvement.
+Custom all-reduce is not qualified by this acceptance. Rank-local cost-based
+padding/splitting and whole-forward composite background capture are disabled
+for distributed execution. Ranks use the same registered scheduler padding size
+even while falling back to eager; local capture progress cannot change collective
+sizes. LoRA, multimodal and hybrid-state restrictions remain.
+Private activation buffers and per-piece pools consume additional memory. The
+example deliberately reserves headroom and bounds batch sizes; large capture
+sets and production memory-utilization settings require separate memory and
+performance qualification. This branch does not claim throughput improvement.
+Use `tools/validate_distributed_startup.py` for contract acceptance and
+`tools/verify_distributed_capture.py --phase mixed` for real capture/replay checks.
+The latter accepts `decode` and `prefill` for additional qualification. Shadow
+validation is diagnostic only and must be disabled for performance measurements.
+The packaged contract includes the two-rank acceptance matrix; four-rank checks
+add cold DAG off/on equivalence and decode/prefill/mixed capture/replay checks.
+`tools/validate_distributed_startup.py --model MODEL --gpus 0,1,2,3
+--cold-timing --output PATH` compares the same optimized runtime with DAG off/on,
+not native vLLM. Each case uses empty artifact/compiler caches, unchanged OS page
+cache, and initial capture sizes `[1,2]`. It records LLM construction time and
+stage timings; it does not measure API frontend startup or full 67-graph capture.
+
+### Timing and Acceptance
+
 INFO retains major completion times, reuse/fallback evidence and graph publication;
 DEBUG retains fine-grained timing. JSON timing records and DAG cost measurements
 are unaffected by verbosity. The fused weight/compile time includes both tasks;
@@ -167,6 +221,7 @@ PYTHONPATH=. python -m pytest --noconftest -q tests/startup_runtime \
   tests/compile/test_startup_defaults.py tests/compile/test_startup_assets.py \
   tests/compile/test_compile_organization.py tests/compile/test_hierarchical_reuse.py \
   tests/compile/test_frontend_metadata.py tests/v1/worker/test_cuda_graph_manager.py \
+  tests/v1/worker/test_distributed_capture.py \
   tests/v1/worker/test_cudagraph_adaptation.py tests/v1/worker/test_composite_cudagraph.py
 ```
 

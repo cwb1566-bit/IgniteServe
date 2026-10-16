@@ -667,6 +667,7 @@ package_data = {
     "vllm": [
         "py.typed",
         "v1/engine/startup_contract.json",
+        "v1/engine/startup_contract.distributed.json",
         "model_executor/layers/fused_moe/configs/*.json",
         "model_executor/layers/quantization/utils/configs/*.json",
     ]

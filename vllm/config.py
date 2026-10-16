@@ -3,6 +3,7 @@
 
 import ast
 import copy
+import os
 import enum
 import hashlib
 import inspect
@@ -4585,6 +4586,13 @@ class VllmConfig:
             self.compilation_config.cudagraph_num_of_warmups = 1
             self.compilation_config.level = CompilationLevel.PIECEWISE
             self.compilation_config.set_splitting_ops_for_v1()
+            if (self.parallel_config.world_size > 1
+                    and os.environ.get('VLLM_ENABLE_DISTRIBUTED_BACKGROUND_CAPTURE') == '1'
+                    and not self.compilation_config.full_cuda_graph):
+                from vllm.v1.worker.distributed_capture import COLLECTIVE_OPS
+                for op in COLLECTIVE_OPS:
+                    if op not in self.compilation_config.splitting_ops:
+                        self.compilation_config.splitting_ops.append(op)
 
         self._set_cudagraph_sizes()
 

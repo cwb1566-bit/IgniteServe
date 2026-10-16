@@ -158,8 +158,17 @@ def test_shutdown_prevents_new_capture_thread():
     manager._lock = threading.Lock()
     manager._thread = None
     manager.enabled = True
+    manager.runner = NS(parallel_config=NS(world_size=1))
     assert not manager.enqueue_auxiliary(lambda: None)
     assert manager._thread is None
+
+
+def test_distributed_composite_does_not_start_capture_thread():
+    from vllm.v1.worker.concurrent_piecewise_cudagraph import CaptureExecutor
+    manager = object.__new__(CaptureExecutor)
+    manager.enabled = True
+    manager.runner = NS(parallel_config=NS(world_size=2))
+    assert not manager.enqueue_auxiliary(lambda: None)
 
 
 def test_shutdown_between_worker_start_and_enqueue_does_not_claim(monkeypatch):

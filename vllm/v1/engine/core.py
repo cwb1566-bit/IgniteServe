@@ -271,12 +271,19 @@ class EngineCore:
                 else:
                     if weight_compile_sync is not None:
                         weight_compile_sync.mark_weights_ready()
-            self._weight_loading_thread = threading.Thread(
-                target=_load_weights_target,
-                daemon=True,
-                name="WeightLoadingThread"
-            )
-            self._weight_loading_thread.start()
+            if self.vllm_config.parallel_config.world_size > 1:
+                # Multiproc RPC replies have no request IDs. Concurrent host
+                # threads can consume each other's replies (including KV
+                # profile results). The legacy fallback uses ordered calls;
+                # the DAG's fused action overlaps work inside each worker.
+                _load_weights_target()
+            else:
+                self._weight_loading_thread = threading.Thread(
+                    target=_load_weights_target,
+                    daemon=True,
+                    name="WeightLoadingThread"
+                )
+                self._weight_loading_thread.start()
 
             timer.start("Model Compilation")
             self.model_executor.run_to_trigger_compile()
@@ -1397,10 +1404,32 @@ class EngineCoreProc(EngineCore):
         for output in (outputs.items() if outputs else ()):
             self.output_queue.put_nowait(output)
 
+        self._publish_distributed_background_captures()
         if model_executed:
             self._maybe_capture_cudagraph_with_slo_slack()
 
         return model_executed
+
+    def _publish_distributed_background_captures(self):
+        if (self.vllm_config.parallel_config.world_size == 1
+                or os.environ.get('VLLM_ENABLE_DISTRIBUTED_BACKGROUND_CAPTURE') != '1'):
+            return
+        # Drain pipeline work before issuing ordered utility RPCs. Never
+        # interleave publication with an outstanding pipeline batch.
+        if self.batch_queue is not None and not self.batch_queue.empty():
+            return
+        now = time.monotonic()
+        if (self.scheduler.has_unfinished_requests()
+                and now < getattr(self, '_next_distributed_capture_poll', 0)):
+            return
+        self._next_distributed_capture_poll = now + 0.1
+        ready = self.model_executor.collective_rpc('get_completed_background_captures')
+        if len(ready) != self.vllm_config.parallel_config.world_size:
+            raise RuntimeError('Incomplete rank response during graph publication')
+        common = set(ready[0]).intersection(*map(set, ready[1:]))
+        for shape in sorted(common):
+            self.model_executor.collective_rpc('publish_background_capture', args=(shape,))
+            logger.info('Distributed background graph committed on all ranks: shape=%d', shape)
 
     def _capture_pending_cudagraphs_coordinated(
         self,
