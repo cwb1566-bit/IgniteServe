@@ -120,6 +120,14 @@ VllmBackend: split FX and assemble callable
 | Backend and process transport | [compiler_interface.py](../vllm/compilation/compiler_interface.py), [fx_transport.py](../vllm/compilation/fx_transport.py) |
 | Dynamo frontend restoration | [wrapper.py](../vllm/compilation/wrapper.py), [frontend_metadata.py](../vllm/compilation/frontend_metadata.py) |
 
+Readable `transformed_code.py` is diagnostic text, not executable frontend
+state. On a text-cache miss, `transformed_code_cache.save_in_background()`
+exports it in a low-priority CPU subprocess without blocking startup.
+Publication is atomic and best-effort; shutdown cancels unfinished exports,
+so short-lived engines may leave no diagnostic text. Executable bytecode,
+frontend assets and CUDA-graph safety checks remain on the normal path.
+This removes a startup wait, not the CPU cost of decompilation.
+
 Stage-separated startup compiles before KV profiling. Validated input metadata
 reconstructs FakeTensor inputs in the current symbolic context, preserving
 supported shape, stride, layout, alias/offset and constant contracts. Unknown

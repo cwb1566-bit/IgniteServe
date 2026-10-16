@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import atexit
 import hashlib
 import json
+import marshal
 import os
 import platform
+import subprocess
+import sys
 import tempfile
+import threading
 from pathlib import Path
 from types import CodeType
 from typing import Any, Optional
@@ -24,6 +29,87 @@ from . import startup_assets as assets
 logger = init_logger(__name__)
 
 _SCHEMA = "dynamo-transformed-code-cache-v1"
+
+_jobs_lock = threading.Lock()
+_jobs: set[subprocess.Popen] = set()
+_closing = False
+_decompile_slot = threading.Lock()
+
+
+def _stop_decompilers() -> None:
+    global _closing
+    with _jobs_lock:
+        _closing = True
+        jobs = list(_jobs)
+    for job in jobs:
+        try:
+            job.kill()
+            job.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
+atexit.register(_stop_decompilers)
+
+
+def save_in_background(old_code: CodeType, new_code: CodeType,
+                       target_file: str, wrapper_class: type) -> threading.Thread:
+    """Publish optional diagnostic source without blocking executable assets.
+
+    A separate, CPU-only interpreter avoids contending for the engine's GIL.
+    At most one decompiler runs per rank; shutdown cancels outstanding work.
+    """
+    def run() -> None:
+        job = None
+        temporary = None
+        try:
+            with _decompile_slot:
+                with _jobs_lock:
+                    if _closing:
+                        return
+                    env = dict(os.environ, CUDA_VISIBLE_DEVICES="",
+                               OMP_NUM_THREADS="1", MKL_NUM_THREADS="1")
+                    job = subprocess.Popen(
+                        [sys.executable, str(Path(__file__).with_name(
+                            "decompile_worker.py")), str(os.getpid())],
+                        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, env=env)
+                    _jobs.add(job)
+                source, error = job.communicate(marshal.dumps(new_code),
+                                                timeout=120)
+                if job.returncode:
+                    raise RuntimeError(error.decode(errors="replace")[-2000:])
+                with _jobs_lock:
+                    if _closing:
+                        return
+                target = Path(target_file)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with tempfile.NamedTemporaryFile("wb", delete=False,
+                                                 dir=target.parent) as f:
+                    temporary = f.name
+                    f.write(source)
+                os.replace(temporary, target)
+                temporary = None
+                save(old_code, new_code, target_file, wrapper_class)
+                logger.debug("Background Dynamo diagnostic source saved to %s",
+                             target_file)
+        except Exception:
+            logger.debug("Background Dynamo diagnostic export failed",
+                         exc_info=True)
+        finally:
+            if temporary is not None:
+                Path(temporary).unlink(missing_ok=True)
+            if job is not None:
+                if job.poll() is None:
+                    job.kill()
+                    job.wait()
+                with _jobs_lock:
+                    _jobs.discard(job)
+
+    thread = threading.Thread(target=run, name="dynamo-source-export",
+                              daemon=True)
+    thread.start()
+    return thread
 
 
 def enabled() -> bool:

@@ -393,22 +393,10 @@ class TorchCompileWrapperWithCustomDispatcher:
                             "cache key=%s into %s", cache_key[:12],
                             decompiled_file)
                     else:
-                        # Usually the decompilation will succeed for most
-                        # models, as we guarantee a full-graph compilation in
-                        # Dynamo. There is no 100% guarantee, since
-                        # decompilation is not a reversible process.
-                        import depyf
-                        src = depyf.decompile(new_code)
-                        with open(decompiled_file, "w") as f:
-                            f.write(src)
-                        transformed_code_cache.save(
-                            old_code,
-                            new_code,
-                            decompiled_file,
-                            self.__class__,
-                            local_cache_dir=local_cache_dir)
-                        logger.debug("Dynamo transformed code saved to %s",
-                                     decompiled_file)
+                        # Execution uses compiled_codes, not this diagnostic
+                        # text. Keep source export off the startup path.
+                        transformed_code_cache.save_in_background(
+                            old_code, new_code, decompiled_file, self.__class__)
             except Exception:
                 pass
 
